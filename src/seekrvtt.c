@@ -80,7 +80,7 @@ static long tirarT(const char *url, size_t n, char *dst, size_t tam) {
     if (f - i > 2 && url[i] == 't' && url[i + 1] == '=') {
       long v = 0; size_t j = i + 2; int ok = 1;
       for (; j < f; j++) {
-        if (url[j] < '0' || url[j] > '9' || v > 100000000000L) { ok = 0; break; }
+        if (url[j] < '0' || url[j] > '9' || v > 100000000L) { ok = 0; break; }
         v = v * 10 + (url[j] - '0');
       }
       if (ok) t = v;
