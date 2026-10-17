@@ -73,6 +73,7 @@
 #include "rede.h"
 #include "debrid.h"
 #include "seekr.h"
+#include "openseek.h"
 #include "selospacote.h"
 #include "fonteregra.h"
 #include "fontefalha.h"
@@ -640,6 +641,13 @@ typedef enum {
   AJ_VIDRO_QUALIDADE,  // glass quality: 0 Automatica (frost + governor), 1 Desempenho (smoked, no blur), 2 Alta (frost); local, append-only
   AJ_FUNDO_DIN,        // #205: fundo da Dinamica, 0 = Cinza (padrao), 1 = Cor, 2 = Imersivo; local, append-only
   AJ_FUNDO_DIN_COR,    // #205: a cor do fundo "Cor" (indice de FUNDO_DIN_TEMA); local, append-only
+  // MINIATURAS: QUEM as fornece (seekr.h / openseek.h). 0 = Seekr.tv (o de
+  // sempre: instalacoes antigas nao mudam), 1 = OpenSeek, servidor proprio da
+  // pessoa. Ligar/desligar continua sendo AJ_SEEKR_LIGADO. LOCAL, append-only.
+  AJ_PREVIA_PROVEDOR,
+  // OpenSeek: endereco, pareamento (OSP1) e a linha de estado. Acoes; o que
+  // guardam mora em openseek.txt (dados), so desta TV, como o seekr.txt.
+  AJ_OPENSEEK_SERVIDOR, AJ_OPENSEEK_PAREAR, AJ_OPENSEEK_ESTADO,
   AJ_N
 } OpcaoId;
 _Static_assert(DEBRID_RD == 0 && DEBRID_TB == 1 && DEBRID_PM == 2 && DEBRID_AD == 3,
@@ -1230,6 +1238,7 @@ static const char *JF_ALFA_URL =
 static const char *JF_ALFA_SENHA =
   "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-@!#$%&*+=?/ ";
 
+static const char *V_PREVIA_PROV[] = { "Seekr.tv", "OpenSeek (servidor próprio)" };
 static const char *V_MANTER_PRAZO[] = { "2 min", "5 min", "10 min", "30 min", "Sem limite" };
 static const char *V_AMIGOS_ESTILO[] = { "Feed de cartões", "Ao vivo em destaque", "Histórias com cartaz", "Faixa de presença", "Cartaz primeiro", "Rostos clássicos" };
 static const Opcao OPCOES[AJ_N] = {
@@ -1673,6 +1682,10 @@ static const Opcao OPCOES[AJ_N] = {
   ESC("Qualidade do vidro", V_VIDRO_QUALIDADE, 3),   // local: vidroQualidadeLocal
   ESC("Fundo da Dinâmica", V_FUNDO_DIN, 3),                  // local: fundoDinamicaLocal
   ESC("Cor do fundo", V_FUNDO_DIN_COR, 17),                  // local: fundoDinamicaCorLocal
+  ESC("Provedor das miniaturas", V_PREVIA_PROV, 2),          // local: previaProvedorLocal
+  ACAO("Servidor OpenSeek"),
+  ACAO("Parear com o OpenSeek"),
+  ACAO("Estado do OpenSeek"),
 };
 
 // Nome de cada opcao no arquivo. O formato era POSICIONAL — uma linha por
@@ -1968,6 +1981,10 @@ static const char *CHAVE[] = {
   "vidroQualidadeLocal",
   "fundoDinamicaLocal",
   "fundoDinamicaCorLocal",
+  // LOCAL (sem "-"): o web nao tem. O resto e acao; endereco, pino e token
+  // moram em openseek.txt (dados), nunca no ajustes.txt nem na conta.
+  "previaProvedorLocal",
+  "-openseekServidor", "-openseekParear", "-openseekEstado",
 };
 // QUATRO VETORES PARALELOS indexados pelo mesmo enum AJ_*: OPCOES, CHAVE,
 // valor e as secoes. OPCOES ja e declarado [AJ_N], e `valor` aceita inicializacao
@@ -2428,9 +2445,29 @@ static void hcAbrir(void);
 static void desenhaFolhaHeroCat(void);
 
 static char seekrChave[96];
+// O provedor das miniaturas e o OpenSeek? (No web nao ha OpenSeek: rede_pedir
+// nao tem TLS fixado ali.)
+static int previaOpenSeek(void) {
+#ifdef __EMSCRIPTEN__
+  return 0;
+#else
+  return valor[AJ_PREVIA_PROVEDOR] == 1;
+#endif
+}
+// "Tem credencial" do provedor ativo: a chave do Seekr ou o pareamento.
+static int previaCredencial(void) { return previaOpenSeek() ? openseek_pareado() : seekrChave[0] != 0; }
 static int lig(int op) {
   if (op == AJ_FALHA_PROVEDORES || op == AJ_FALHA_ADDONS) return ajFalhaValor(op) == 0;
-  return valor[op] == 0 && (op != AJ_SEEKR_LIGADO || seekrChave[0]);
+  return valor[op] == 0 && (op != AJ_SEEKR_LIGADO || previaCredencial());
+}
+// Registra (ou tira) o OpenSeek no seekr.c. So chama quando MUDA: com o Seekr
+// (o padrao, NULL no seekr.c) nada de novo e tocado.
+static void previaAplicar(void) {
+  static int aplicado;
+  int quer = previaOpenSeek();
+  if (quer == aplicado) return;
+  aplicado = quer;
+  seekr_usar_provedor(quer ? openseek_provedor() : NULL);
 }
 // #311: "Buscar no Cinemeta" so governa a BUSCA (o add-on Cinemeta e a reserva
 // do catalogo do Nuvio). Sem o add-on instalado e com o ajuste no padrao ele nao
@@ -3617,6 +3654,28 @@ static const char *fanartMascarada(void) {
 static const char *seekrPedirChave(void) {
   return i18n("Use sua própria chave do Seekr, gratuita em seekr.tv.");
 }
+// OPENSEEK (openseek.h): o que falta para ligar as miniaturas por ele.
+static const char *previaPedirCredencial(void) {
+  if (!previaOpenSeek()) return seekrPedirChave();
+  return openseek_endereco()[0] ? i18n("Pareie com o OpenSeek para ligar as miniaturas.")
+                                : i18n("Informe o endereço do servidor OpenSeek.");
+}
+// Alfabeto do codigo OSP1 (CONTRACT-v1): sem 0/1/I/L/O; o hifen e opcional.
+static const char *OS_ALFA_CODIGO = "23456789ABCDEFGHJKMNPQRSTUVWXYZ-";
+static const char *openseekTexto(int op) {
+  static char buf[192];
+  char host[128];
+  int st;
+  if (!previaOpenSeek()) return "";   // escondidas com o Seekr
+  if (op == AJ_OPENSEEK_SERVIDOR) return openseek_endereco()[0] ? openseek_endereco() + 8 : i18n("Não configurado");
+  st = openseek_status(host, sizeof host);
+  if (op == AJ_OPENSEEK_PAREAR) {
+    if (st == OSU_PAREANDO) return i18n(openseek_status_rotulo(OSU_PAREANDO));
+    return openseek_pareado() ? i18n("OK pareia de novo") : i18n("OK pareia");
+  }
+  if (st == OSU_PAREADO) { snprintf(buf, sizeof buf, i18n("Pareado com %s"), host); return buf; }
+  return i18n(openseek_status_rotulo(st));
+}
 static int seekrSalvarFalhou;
 static const char *SEEKR_ALFA =
   "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
@@ -3657,7 +3716,7 @@ static const char *seekrMascarada(void) {
 int ajustes_seekr_habilitado(void) { return valor[AJ_SEEKR_LIGADO] == 0; }
 int ajustes_seekr_ligado(void) { return lig(AJ_SEEKR_LIGADO); }
 int ajustes_seekr_fita(void)   { return lig(AJ_SEEKR_FITA); }
-int ajustes_seekr_ajuste_s(void) { return valor[AJ_SEEKR_AJUSTE]; }
+int ajustes_seekr_ajuste_s(void) { return previaOpenSeek() ? 0 : valor[AJ_SEEKR_AJUSTE]; }
 
 // ENDERECO DO SERVIDOR P2P (p2p.h). Mora em p2p.txt na pasta de dados, por
 // aparelho: e o IP de um PC/NAS da casa desta TV, sem sentido em outra.
@@ -4511,6 +4570,7 @@ void ajustes_dir(const char *dir) {
   pstAplicar();
   legenda2_atualizar_offset_manual(ajustes_leg2_atraso());
   ppReconciliar();
+  previaAplicar();
   ajSombraSync();   // o que veio do disco nao e mudanca de ninguem
 }
 
@@ -5407,6 +5467,7 @@ static int somenteDesteAparelho(int op) {
     case AJ_REACAO_CREDITOS: /* o web nao tem a pergunta */
     case AJ_PULAR_ABERTURA: case AJ_PULAR_RESUMO: case AJ_PROXIMO_AUTO: case AJ_PULAR_CREDITOS: case AJ_PROXIMO_CONTAGEM: /* idem: local desta TV */
     case AJ_SEEKR_LIGADO: case AJ_SEEKR_FITA: case AJ_SEEKR_AJUSTE: /* o web nao tem o Seekr */
+    case AJ_PREVIA_PROVEDOR: /* idem: o servidor proprio e da casa desta TV */
     case AJ_MENU_EXPLORAR: case AJ_MENU_GUIA: case AJ_MENU_AGENDA: case AJ_MENU_PERFIL:
     // Linha do titulo: o web nao tem, e nenhuma conta pode desliga-las aqui.
     case AJ_NT_IMDB: case AJ_NT_TOMATES: case AJ_NT_AUDIENCIA: case AJ_NT_META:
@@ -5770,6 +5831,8 @@ static int foraDestaPlataforma(int op) {
 #endif
 #ifdef __EMSCRIPTEN__
   if (op == AJ_P2P_LIGADO || op == AJ_P2P_URL || op == AJ_P2P_TESTAR || op == AJ_P2P_LIMITE || op == AJ_P2P_DESTINO) return 1;
+  // Sem rede_pedir com pino no WASM: nada de OpenSeek (SR-3/SR-4).
+  if (op == AJ_PREVIA_PROVEDOR || (op >= AJ_OPENSEEK_SERVIDOR && op <= AJ_OPENSEEK_ESTADO)) return 1;
 #endif
   return 0;
 }
@@ -6186,6 +6249,7 @@ static const char *textoLeitura(int op) {
   if (op == AJ_FANART_CHAVE) return fanartMascarada();
   if (op == AJ_SEEKR_CHAVE) return seekrMascarada();
   if (op == AJ_SEEKR_TESTAR) return skTesteTexto();
+  if (op >= AJ_OPENSEEK_SERVIDOR && op <= AJ_OPENSEEK_ESTADO) return openseekTexto(op);
   if (op == AJ_SELOS_PACOTE_ADD) return spAddTexto();
   if (op == AJ_SELOS_PACOTE_REM) {
     int a = selospacote_ativo();
@@ -6397,6 +6461,7 @@ static int inativa(int op) {
     case AJ_CW_BLUR_PROX: return !ajustes_cw_ligado() || !ajustes_cw_thumb_episodio();
     case AJ_EXPANDIR_ATRASO: return !ajustes_expandir_poster();
     case AJ_SEEKR_FITA: case AJ_SEEKR_AJUSTE: return !lig(AJ_SEEKR_LIGADO);
+    case AJ_OPENSEEK_PAREAR: case AJ_OPENSEEK_ESTADO: return !previaOpenSeek() || !openseek_endereco()[0];
     // Remover so vale para o pacote escolhido que foi posto nesta TV.
     case AJ_SELOS_PACOTE_REM: return selospacote_ativo() < 0 || !selospacote_da_tv(selospacote_ativo());
     // Sem o relogio nao ha ilha para onde minimizar: sai para a pagina, como antes.
@@ -6515,6 +6580,10 @@ static int visivel(int i) {
     if (!ajOpcaoDisponivel(op)) return 0;
     // #205: o fundo so existe no layout Dinamica; a cor, so com o fundo "Cor".
     if ((op == AJ_FUNDO_DIN || op == AJ_FUNDO_DIN_COR) && ajustes_home_layout() != HOME_LAYOUT_DINAMICA) return 0;
+    // Miniaturas: so as opcoes do provedor escolhido. A sincronia manual existe
+    // para a folha do Seekr tirada de OUTRA versao; a do OpenSeek e do proprio video.
+    if ((op == AJ_SEEKR_CHAVE || op == AJ_SEEKR_TESTAR || op == AJ_SEEKR_AJUSTE) && previaOpenSeek()) return 0;
+    if (op >= AJ_OPENSEEK_SERVIDOR && op <= AJ_OPENSEEK_ESTADO && !previaOpenSeek()) return 0;
     if (op == AJ_FUNDO_DIN_COR && ajustes_fundo_din() != 1) return 0;
     if ((op == AJ_PERFIL_PESQ || op == AJ_PERFIL_EDITAR) && !recomenda_ativo()) return 0;
     if (op == AJ_BUSCA_CINEMETA && valor[op] == 0 && !cinemetaInstalado()) return 0;
@@ -7040,6 +7109,10 @@ static const char *ajudaOpcaoBase(int op) {
     case AJ_SEEKR_FITA: return "Mostra o quadro anterior e o seguinte ao lado da miniatura, com o tempo de cada um. Deixa claro que há um quadro a cada 10 segundos.";
     case AJ_SEEKR_AJUSTE: return "Use quando a miniatura mostra sempre a cena de alguns segundos antes ou depois. Acontece quando a sua versão do título é diferente da usada pelo Seekr (outro corte, abertura mais longa). Vale para todos os títulos; volte a 0 ao trocar de filme.";
     case AJ_SEEKR_TESTAR: return seekrAjuda(op);
+    case AJ_PREVIA_PROVEDOR: return "Quem faz as miniaturas. Seekr.tv: um serviço na internet, por título. OpenSeek: um servidor seu na rede de casa, que tira os quadros do próprio vídeo que está tocando. O endereço do vídeo vai só para ele, por conexão segura fixada no pareamento.";
+    case AJ_OPENSEEK_SERVIDOR: return "Endereço do computador ou NAS com o OpenSeek na sua rede, por exemplo 192.168.1.5:8787. Fica só nesta TV. Trocar o endereço desfaz o pareamento.";
+    case AJ_OPENSEEK_PAREAR: return "Abra o pareamento no OpenSeek (openseek pair, ou a página de administração no próprio computador) e digite o código de 8 letras que aparece. O cálculo do pareamento leva alguns segundos.";
+    case AJ_OPENSEEK_ESTADO: return "OK confere a conexão com o servidor agora. Se aparecer que o certificado mudou, o servidor foi reinstalado ou há algo no meio da rede: pareie de novo só se você reinstalou o OpenSeek.";
     case AJ_FANART_CHAVE: return "Sua chave pessoal do fanart.tv, gratuita em fanart.tv/get-an-api-key. Com ela a fonte fanart.tv entra no Background do hero. Fica só nesta TV e aparece mascarada.";
     case AJ_MDB_TRAKT: case AJ_MDB_IMDB: case AJ_MDB_TMDB:
     case AJ_MDB_LETTER: case AJ_MDB_TOMATES: case AJ_MDB_AUDIENCIA:
@@ -8406,8 +8479,8 @@ static int definirValorDireto(int op, int novo) {
   novo = limita(op, novo);
   if (ajLegendaPrincipal(op)) return ajLegendaDefinir(op, novo);
   if (ajFalhaBackend(op)) return ajFalhaDefinir(op, novo);
-  if (op == AJ_SEEKR_LIGADO && novo == 0 && !seekrChave[0]) {
-    uxNotificar(seekrPedirChave());
+  if (op == AJ_SEEKR_LIGADO && novo == 0 && !previaCredencial()) {
+    uxNotificar(previaPedirCredencial());
     return 0;
   }
   if (op == AJ_PROVEDORES_ESCOPO) {
@@ -8437,6 +8510,7 @@ static int definirValorDireto(int op, int novo) {
   if (op == AJ_LEG_LINGUA || op == AJ_LEG_LINGUA2 || op == AJ_AUD_LINGUA || op == AJ_AUD_LINGUA2) aplicarIdioma(op);
   if (op == AJ_IDIOMA) { idiomaEscolhido(); desc_repetir(); }
   if (op == AJ_FONTE_UI) txt_definir_fonte_interface((TxtFamilia)novo);
+  if (op == AJ_PREVIA_PROVEDOR) previaAplicar();
   if (op == AJ_TAMANHO_UI) gfx_escala_ui_definir(ajustes_tamanho_ui());
   if (op == AJ_INTERFACE_MODO) {
     interfaceAplicar();
@@ -8681,6 +8755,23 @@ static void eventoTela(const SDL_Event *e) {
       return;
     }
     if (focoOp == AJ_SEEKR_TESTAR) { skTesteIniciar(); return; }
+    if (focoOp == AJ_OPENSEEK_SERVIDOR) {
+      // O endereco volta para o campo (corrigir um digito nao obriga a redigitar).
+      stCampo = focoOp;
+      teclado_abrir_com("Endereço do servidor OpenSeek", "IP e porta na sua rede: 192.168.1.5:8787. Vazio apaga.",
+                        64, ST_ALFA_PORTAL, openseek_endereco()[0] ? openseek_endereco() + 8 : NULL);
+      return;
+    }
+    if (focoOp == AJ_OPENSEEK_PAREAR) {
+      if (!openseek_endereco()[0]) { uxNotificar(previaPedirCredencial()); return; }
+      if (openseek_status(NULL, 0) == OSU_PAREANDO) return;
+      // O codigo NUNCA volta para o campo nem vai para log.
+      stCampo = focoOp;
+      teclado_abrir_com("Código de pareamento", "O código de 8 letras que o OpenSeek mostra (XXXX-XXXX).",
+                        9, OS_ALFA_CODIGO, NULL);
+      return;
+    }
+    if (focoOp == AJ_OPENSEEK_ESTADO) { openseek_verificar(); return; }
     if (focoOp == AJ_SELOS_PACOTE_ADD) {
       if (spFioVivo) return;
       stCampo = focoOp;
@@ -8800,6 +8891,11 @@ void ajustes_atualizar(float dt, Uint32 agora) {
       else if (stCampo == AJ_SEEKR_CHAVE)     { seekrDefinir(teclado_texto()); atomic_store_explicit(&skTeste, 0, memory_order_release); }
       else if (stCampo == AJ_SELOS_PACOTE_ADD) spAdicionar(teclado_texto());
       else if (stCampo == AJ_P2P_URL)         ajustes_definir_p2p_url(teclado_texto());
+      else if (stCampo == AJ_OPENSEEK_SERVIDOR) {
+        if (!openseek_definir_endereco(teclado_texto())) uxNotificar("endereço inválido");
+      } else if (stCampo == AJ_OPENSEEK_PAREAR) {
+        if (!openseek_parear(teclado_texto())) uxNotificar("código inválido");
+      }
       else if (stCampo == AJ_CURADORIA_URL) {
         int e = curadoria_definir_url(teclado_texto());
         uxNotificar(e ? "Ajuste salvo nesta TV." : "endereço inválido");
@@ -8967,7 +9063,7 @@ static const char *textoValor(int op) {
   }
   const Opcao *o = &OPCOES[op];
   if (o->tipo == OP_LEITURA || o->tipo == OP_ACAO) return textoLeitura(op);
-  if (op == AJ_SEEKR_LIGADO && !seekrChave[0]) return i18n("Desligado");
+  if (op == AJ_SEEKR_LIGADO && !previaCredencial()) return i18n("Desligado");
   if (op == AJ_HERO_TRAILER_ESPERA) {
     // Decimos de segundo: 22 le "2,2 s".
     int v = valor[op];
@@ -9505,6 +9601,7 @@ static AjPreview familiaPreviaOpcao(int op) {
     case AJ_STALKER_LIMPAR: case AJ_XTREAM_SERVIDOR: case AJ_XTREAM_USUARIO:
     case AJ_XTREAM_SENHA: case AJ_XTREAM_LIMPAR: case AJ_FANART_CHAVE:
     case AJ_SEEKR_CHAVE: case AJ_SEEKR_TESTAR:
+    case AJ_OPENSEEK_SERVIDOR: case AJ_OPENSEEK_PAREAR: case AJ_OPENSEEK_ESTADO:
     case AJ_SELOS_PACOTE_ADD: case AJ_SELOS_PACOTE_REM:
     case AJ_XTREAM_CONTA:
     case AJ_DIAGNOSTICO: case AJ_VELOCIDADE: case AJ_LIVETV_DIAG:

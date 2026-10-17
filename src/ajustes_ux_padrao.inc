@@ -314,3 +314,5 @@
   0, /* glass quality: Automatica */
   0, /* Dynamic layout background (#205): Gray */
   12, /* Dynamic layout background colour (#205): Ocean */
+  0, /* seek preview provider: Seekr.tv (existing installs unchanged) */
+  0, 0, 0, /* OpenSeek server / pair / status: actions */

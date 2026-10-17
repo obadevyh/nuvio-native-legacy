@@ -19,7 +19,7 @@ static int uxValorAtual(int op) {
   if (op < 0 || op >= AJ_N) return 0;
   if (ajLegendaPrincipal(op)) return ajLegendaValor(op);
   if (ajFalhaBackend(op)) return ajFalhaValor(op);
-  if (op == AJ_SEEKR_LIGADO && !seekrChave[0]) return 1;
+  if (op == AJ_SEEKR_LIGADO && !previaCredencial()) return 1;
   return op == AJ_FIL_LIMITE ? fil_limite_gravado() : valor[op];
 }
 
@@ -279,6 +279,8 @@ static const char *uxSinonimos(int op) {
       return "lento lenta lentidao travando trava falha erro desempenho diagnostico rede internet";
     case AJ_SEEKR_LIGADO: case AJ_SEEKR_FITA: case AJ_SEEKR_AJUSTE:
       return "seekr miniatura barra tempo previa avanco retrocesso";
+    case AJ_PREVIA_PROVEDOR: case AJ_OPENSEEK_SERVIDOR: case AJ_OPENSEEK_PAREAR: case AJ_OPENSEEK_ESTADO:
+      return "openseek seekr servidor proprio miniatura barra tempo previa parear pareamento nas";
     default: return "";
   }
 }
