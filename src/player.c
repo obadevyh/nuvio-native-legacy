@@ -4122,9 +4122,23 @@ void player_atualizar(float dt, Uint32 agora) {
     // da folha por ela) e uma vez por titulo — seekr_pedir ignora o repetido.
     if (d > 60.0 && video_pronto() && !ehCanal() && ajustes_seekr_ligado()) {
       const CatItem *cs = item();
-      if (cs && !strncmp(cs->imdb, "tt", 2))
-        seekr_pedir(cs->imdb, strcmp(cs->tipo, "series") ? 0 : epT,
-                    strcmp(cs->tipo, "series") ? 0 : epE, (long)(d * 1000.0));
+      if (!seekr_provedor_alternativo()) {
+        if (cs && !strncmp(cs->imdb, "tt", 2))
+          seekr_pedir(cs->imdb, strcmp(cs->tipo, "series") ? 0 : epT,
+                      strcmp(cs->tipo, "series") ? 0 : epE, (long)(d * 1000.0));
+      } else {
+        // OPENSEEK (servidor proprio): a URL e os cabecalhos do que esta
+        // tocando vao no corpo de um POST com TLS fixado (openseek.c). Barato a
+        // cada passo: so copia o que mudou; o trabalho e de outro fio.
+        const Stream *st = stream_item(stream_atual());
+        int serie = cs && !strcmp(cs->tipo, "series");
+        SeekrFonte f = { cs ? cs->imdb : "", serie ? epT : 0, serie ? epE : 0,
+                         (long)(d * 1000.0), video_url_atual(), video_cabecalhos(),
+                         st ? st->tamanhoBytes : 0, st ? st->videoHash : "",
+                         st ? st->arquivo : "", (long)(posSeg * 1000.0f),
+                         (long)(video_pos() * 1000.0), scrubbing };
+        seekr_pedir_fonte(&f);
+      }
     }
     // Retomada so com o pipeline ASSENTADO: pronto + tocando (ou 2,5 s depois
     // de pronto, para quem abre pausado). Seek logo no loadCompleted e o que o
@@ -4517,7 +4531,9 @@ static int seekrStatusLinhas(int est, const SeekrUso *uso, int temChave,
   if (est == SEEKR_PRONTO || est == SEEKR_BUSCANDO ||
       (est == SEEKR_DESLIGADO && temChave) ||
       est < SEEKR_DESLIGADO || est > SEEKR_RELOGIO_INDISPONIVEL) return 0;
-  if (est == SEEKR_DESLIGADO)
+  if (est == SEEKR_DESLIGADO && seekr_provedor_alternativo())   // OpenSeek nao pareado
+    snprintf(linhas[0], 192, "%s", i18n(seekr_estado_rotulo(est)));
+  else if (est == SEEKR_DESLIGADO)
     snprintf(linhas[0], 192, "Seekr · %s", i18n("sem chave"));
   else snprintf(linhas[0], 192, "%s", i18n(seekr_estado_rotulo(est)));
   if (est == SEEKR_LIMITE_LOCAL && uso) {
