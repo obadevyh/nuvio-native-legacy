@@ -207,6 +207,8 @@ static int chamar(const char *metodo, const char *url, const char *token, const 
   Parar pa = { fim };
   memset(r, 0, sizeof *r);
   if (!openseek_pedido(&o, metodo, url, token, pino, semPino, corpo, corpo ? strlen(corpo) : 0, prazo)) {
+    printf("[openseek] request refused locally (policy): pin=%s first_contact=%d body=%s\n",
+           pino && *pino ? "yes" : "no", semPino, corpo ? "yes" : "no"); fflush(stdout);
     r->erro = REDE_ENTRADA; return 0;
   }
   if (fim) { o.p.parar = pararFn; o.p.parar_usuario = &pa; }
@@ -239,7 +241,9 @@ static void *parearFio(void *u) {
   if (http != 200 || !r.corpo || !openseek_ler_start(r.corpo, &s)) {
     res = http == 429 ? OSU_LIMITE : (http == 409 && pp->forma == 2) ? OSU_CONVITE :
           http == 200 || http == 409 ? OSU_FALHOU : uiDeErro(&r);
-    printf("[openseek] pair step=start http=%d result=%d\n", http, res); fflush(stdout);
+    printf("[openseek] pair step=start http=%d result=%d rede_erro=%d curl_erro=%d (net/tls/pin/invite: %s)\n", http, res, (int)r.erro, (int)r.curl_erro,
+           res == OSU_CERTIFICADO ? "pin" : res == OSU_CONVITE ? "invite" : res == OSU_LIMITE ? "rate-limit" :
+           res == OSU_SEM_SUPORTE ? "local-policy-or-no-tls" : res == OSU_SEM_CONEXAO ? "net-or-tls" : "other"); fflush(stdout);
     rede_resposta_limpar(&r);
     goto fim;
   }

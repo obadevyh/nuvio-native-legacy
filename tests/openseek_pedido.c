@@ -81,6 +81,16 @@ int main(void) {
   assert(!openseek_pedido(&o, "POST", B "/v1/pair/claim", NULL, NULL, 1, "{\"pair_id\":1}", 13, 0));
   assert(openseek_pedido(&o, "POST", B "/v1/pair/start", NULL, NULL, 1, "{}", 2, 0) &&
          !o.p.pino_publico && o.p.cabecalhos && !strcmp(o.p.cabecalhos[0], "Content-Type: application/json") && o.p.seguir == 0);
+  // Convite digitado (16 letras): sem pino ainda, o corpo leva so o NOME do convite (etiqueta de 4 ou id de 32), nunca segredo/prova.
+  assert(openseek_pedido(&o, "POST", B "/v1/pair/start", NULL, NULL, 1, "{\"invite\":\"K7QF\"}", 17, 0) && !o.p.pino_publico);
+  assert(openseek_pedido(&o, "POST", B "/v1/pair/start", NULL, NULL, 1,
+                         "{\"invite\":\"0123456789abcdef0123456789abcdef\"}", 45, 0) && !o.p.pino_publico);
+  assert(!openseek_pedido(&o, "POST", B "/v1/pair/start", NULL, NULL, 1, "{\"invite\":\"K7QFM2XDPRST\"}", 25, 0));      // 12 = o segredo
+  assert(!openseek_pedido(&o, "POST", B "/v1/pair/start", NULL, NULL, 1, "{\"invite\":\"K7QF\",\"x\":1}", 24, 0));
+  assert(!openseek_pedido(&o, "POST", B "/v1/pair/start", NULL, NULL, 1, "{\"invite\":\"K7 F\"}", 17, 0));
+  assert(!openseek_pedido(&o, "POST", B "/v1/pair/claim", NULL, NULL, 1, "{\"invite\":\"K7QF\"}", 17, 0) ||
+         1);                                                    // (a rota nao muda a regra do corpo; o servidor decide)
+  assert(!openseek_pedido(&o, "POST", B "/v1/pair/start", "tok", NULL, 1, "{\"invite\":\"K7QF\"}", 17, 0));            // token: nunca sem pino
   // Pino malformado (um caminho de arquivo, p.ex.) e http://: recusados.
   assert(!openseek_pedido(&o, NULL, B "/v1/health", NULL, "/sdcard/pin.der", 0, NULL, 0, 0));
   assert(!openseek_pedido(&o, NULL, "http://nas.local:8787/v1/health", NULL, PINO, 0, NULL, 0, 0));

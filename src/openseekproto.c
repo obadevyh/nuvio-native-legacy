@@ -441,6 +441,25 @@ int openseek_mapear(int http, int redeErro, int curlErro, const OpenSeekPrevia *
   return e;
 }
 
+// Primeiro contato sem pino: o corpo so pode ser {} ou {"invite":"<id 32 hex | etiqueta de 4>"}: o NOME do convite
+// (publico), nunca o segredo nem a prova. Um codigo digitado de 16 nao traz pino, e o convite precisa nomear-se aqui.
+static int corpoPrimeiroContatoOk(const void *corpo, size_t n) {
+  const char *c = corpo;
+  static const char P[] = "{\"invite\":\"";
+  size_t i, k;
+  if (!c || n == 0) return 1;
+  if (n == 2 && !memcmp(c, "{}", 2)) return 1;
+  if (n < sizeof P - 1 + 4 + 2 || memcmp(c, P, sizeof P - 1)) return 0;
+  k = n - 2;                                              // termina com "}
+  if (c[k] != '"' || c[k + 1] != '}') return 0;
+  k -= sizeof P - 1;
+  if (k != 4 && k != 32) return 0;
+  for (i = 0; i < k; i++) {
+    char ch = c[sizeof P - 1 + i];
+    if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))) return 0;
+  }
+  return 1;
+}
 int openseek_pedido(OpenSeekPedido *o, const char *metodo, const char *url,
                     const char *token, const char *pino, int semPino,
                     const void *corpo, size_t nCorpo, unsigned prazoMs) {
@@ -450,7 +469,7 @@ int openseek_pedido(OpenSeekPedido *o, const char *metodo, const char *url,
   if (!url || strncmp(url, "https://", 8) || strlen(url) >= sizeof o->url) return 0;
   // SR-3: sem pino so o primeiro contato, que nao leva segredo algum.
   if (pino && *pino) { if (!rede_pino_valido(pino)) return 0; }
-  else if (!semPino || (token && *token) || (corpo && nCorpo > 2)) return 0;
+  else if (!semPino || (token && *token) || (corpo && nCorpo && !corpoPrimeiroContatoOk(corpo, nCorpo))) return 0;
   // SR-4: nada de URL de video em query/caminho; o unico caminho com query e
   // o long-poll de status, que so leva numeros.
   strcpy(o->url, url);
