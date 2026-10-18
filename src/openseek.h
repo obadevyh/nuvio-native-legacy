@@ -61,6 +61,9 @@ typedef struct {
 } OpenSeekCompartInfo;
 int  openseek_compart_info(OpenSeekCompartInfo *o);
 // Ajustes so deste aparelho (API de offset por aparelho). deslocaMs > 0: miniaturas mais tarde. Em fio proprio.
+// O player informa a saude da reproducao (buffer a frente, rebuffering) para o CONTRIBUINTE: o servidor segura a extracao
+// dele enquanto a reproducao dele sofre. Barato; so envia algo quando ha uma contribuicao em andamento.
+void openseek_contrib_telemetria(long bufferMs, int rebuffering);
 int  openseek_compart_ajustar(long deslocaMs);
 int  openseek_compart_zerar(void);
 int  openseek_compart_rejeitar(void);     // "video errado": esta fonte nao e mais oferecida a este aparelho

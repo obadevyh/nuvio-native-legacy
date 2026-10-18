@@ -883,6 +883,30 @@ static int baixarVtt(Sessao *s) {
 }
 
 static const char *rotaPrevia(const Sessao *s) { return s->contribuindo ? "contribute" : "previews"; }
+static struct { long bufMs; int rebuf, valida; } contribTel;
+void openseek_contrib_telemetria(long bufferMs, int rebuffering) {
+  pthread_mutex_lock(&trava);
+  contribTel.bufMs = bufferMs; contribTel.rebuf = rebuffering ? 1 : 0; contribTel.valida = 1;
+  pthread_mutex_unlock(&trava);
+}
+// Saude da reproducao do CONTRIBUINTE para o guarda do servidor (uma vez a cada ~1,5 s). Nunca leva URL, titulo nem id.
+static void contribTelemetria(Sessao *s, Uint32 *ultimo) {
+  char url[OS_BASE_MAX + 96], tb[256];
+  RedeResposta r;
+  long buf; int rebuf, ok;
+  Uint32 agora = SDL_GetTicks();
+  if (*ultimo && agora - *ultimo < 1500u) return;
+  pthread_mutex_lock(&trava);
+  ok = s->contribuindo && contribTel.valida && s->id[0];
+  buf = contribTel.bufMs; rebuf = contribTel.rebuf;
+  if (ok) snprintf(url, sizeof url, "%s/v1/contribute/%s/telemetry", s->base, s->id);
+  pthread_mutex_unlock(&trava);
+  if (!ok) return;
+  *ultimo = agora;
+  if (!openseek_json_telemetria(tb, sizeof tb, buf, rebuf, "", 1)) return;
+  chamar("POST", url, s->token, s->pino, 0, tb, OS_PRAZO_API_MS, &s->fim, &r);
+  rede_resposta_limpar(&r);
+}
 static void consultarStatus(Sessao *s, int longo) {
   char url[OS_BASE_MAX + 96];
   OpenSeekPrevia p;
@@ -921,6 +945,7 @@ static void *controleFio(void *u) {
   int falhas = 0;
   Uint32 ultimoStatus = 0;
   long ultimoVersaoPoll = -1;
+  Uint32 ultTelContrib = 0;
   pthread_mutex_lock(&trava);
   while (!s->fim && !s->iniciar) esperar(s, 1000);
   pthread_mutex_unlock(&trava);
@@ -958,6 +983,7 @@ static void *controleFio(void *u) {
       renovar = s->renovar || (s->exp && s->exp - agora < 120);
       pthread_mutex_unlock(&trava);
       if (renovar) break;               // volta ao POST: capacidades novas
+      if (!completo) contribTelemetria(s, &ultTelContrib);
       if (precisaVtt) {
         if (!baixarVtt(s)) {
           pthread_mutex_lock(&trava); esperarPrazo(s, 2000); pthread_mutex_unlock(&trava);
@@ -988,7 +1014,7 @@ static void *controleFio(void *u) {
       }
       else {
         pthread_mutex_lock(&trava);
-        Uint32 intervalo = (vtt.nCues < 180) ? 1500u : (vtt.nCues < 360) ? 3000u : 10000u;
+        Uint32 intervalo = s->contribuindo ? 1500u : (vtt.nCues < 180) ? 1500u : (vtt.nCues < 360) ? 3000u : 10000u;   // contribuinte: a telemetria nao pode ficar velha
         Uint32 ate = SDL_GetTicks() + intervalo;
         while (!s->fim && !s->scrubbing && !s->renovar && (Sint32)(ate - SDL_GetTicks()) > 0 &&
                s->versaoServidor <= s->versaoAplicada) esperar(s, 500);

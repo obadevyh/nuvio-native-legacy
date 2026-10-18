@@ -4226,6 +4226,9 @@ void player_atualizar(float dt, Uint32 agora) {
                          st ? st->arquivo : "", (long)(posSeg * 1000.0f),
                          (long)(video_pos() * 1000.0), scrubbing };
         if (cs) openseekAltPasso(cs->imdb, serie ? epT : 0, serie ? epE : 0, (long)(d * 1000.0), posSeg);
+        { double bf2 = video_buffer_fim(); long bm = bf2 > 0.5 ? (long)((bf2 - (double)posSeg) * 1000.0) : -1;
+          if (bm < 0 && bf2 > 0.5) bm = 0;
+          openseek_contrib_telemetria(bm, video_bufferando_ms() > 0); }      // saude da reproducao (so conta com uma contribuicao ativa)
         seekr_pedir_fonte(&f);
       }
     }
