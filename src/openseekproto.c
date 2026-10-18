@@ -211,6 +211,97 @@ size_t openseek_json_previa(char *dst, size_t n, const OpenSeekFonte *f) {
   return b.k;
 }
 
+// --- fonte alternativa (opcional) ---------------------------------------------
+static void bCabs(Buf *b, const char *cabs) {   // mesma allowlist do POST de criacao
+  int primeiro = 1;
+  bTxt(b, "{");
+  for (int k = 0; k < 3; k++) {
+    const char *l = cabs;
+    size_t nome = strlen(CABS_OK[k]);
+    while (l && *l) {
+      const char *fim = l + strcspn(l, "\n");
+      if ((size_t)(fim - l) > nome && !strncasecmp(l, CABS_OK[k], nome) && l[nome] == ':') {
+        const char *v = l + nome + 1, *vf = fim;
+        while (v < vf && (*v == ' ' || *v == '\t')) v++;
+        while (vf > v && (vf[-1] == '\r' || vf[-1] == ' ' || vf[-1] == '\t')) vf--;
+        if (vf > v) {
+          if (!primeiro) bTxt(b, ",");
+          bStr(b, CABS_OK[k], nome); bTxt(b, ":"); bStr(b, v, (size_t)(vf - v));
+          primeiro = 0;
+          break;
+        }
+      }
+      l = *fim ? fim + 1 : fim;
+    }
+  }
+  bTxt(b, "}");
+}
+
+static void bCand(Buf *b, const OpenSeekAltCand *c) {
+  size_t nome = c->nome ? strnlen(c->nome, 200) : 0;       // o servidor aceita ate 240
+  bTxt(b, "{\"cid\":"); bStr(b, c->cid, strnlen(c->cid, sizeof c->cid));
+  bTxt(b, ",\"title_key\":"); bStr(b, c->titleKey, strnlen(c->titleKey, sizeof c->titleKey));
+  bFmt(b, ",\"height\":%lld", c->altura > 0 && c->altura < 8192 ? c->altura : 0);
+  bFmt(b, ",\"duration_ms\":%lld", c->durMs > 0 && c->durMs < 43200000LL ? c->durMs : 0);
+  bFmt(b, ",\"size\":%lld", (long long)(c->tamanho > 0x7fffffffffffffffULL ? 0 : c->tamanho));
+  bTxt(b, ",\"codec\":"); bStr(b, c->codec ? c->codec : "", c->codec ? strnlen(c->codec, 32) : 0);
+  bTxt(b, ",\"container\":"); bStr(b, c->container ? c->container : "", c->container ? strnlen(c->container, 32) : 0);
+  bTxt(b, ",\"name\":"); bStr(b, c->nome ? c->nome : "", nome);
+  bTxt(b, c->emCache ? ",\"cached\":true" : ",\"cached\":false");
+  bTxt(b, c->resolvida ? ",\"resolved\":true}" : ",\"resolved\":false}");
+}
+
+size_t openseek_json_previa_alt(char *dst, size_t n, const OpenSeekFonte *f,
+                                const OpenSeekAltCand *play, const OpenSeekAltCand *c, int nc) {
+  size_t len = openseek_json_previa(dst, n, f);
+  if (!len || !play || !c || nc <= 0 || dst[len - 1] != '}') return len;   // sem candidatos: corpo de sempre
+  if (nc > OS_ALT_MAX) nc = OS_ALT_MAX;
+  Buf b = { dst, n, len - 1, 1 };                           // reabre antes do '}' final
+  dst[len - 1] = 0;
+  bTxt(&b, ",\"alt\":{\"play\":"); bCand(&b, play);
+  bTxt(&b, ",\"candidates\":[");
+  for (int i = 0; i < nc; i++) { if (i) bTxt(&b, ","); bCand(&b, &c[i]); }
+  bTxt(&b, "],\"telemetry\":true}}");
+  if (!b.ok) { dst[len - 1] = '}'; dst[len] = 0; return len; }   // nao coube: corpo sem o bloco
+  return b.k;
+}
+
+size_t openseek_json_alt_fonte(char *dst, size_t n, const char *cid, const char *url, const char *cabs) {
+  Buf b = { dst, n, 0, 1 };
+  if (!dst || n < 2 || !cid || !*cid || !url || strncmp(url, "http", 4)) return 0;
+  dst[0] = 0;
+  bTxt(&b, "{\"cid\":"); bStr(&b, cid, strnlen(cid, 24));
+  bTxt(&b, ",\"source\":{\"url\":"); bStr(&b, url, strlen(url));
+  bTxt(&b, ",\"headers\":"); bCabs(&b, cabs ? cabs : "");
+  bTxt(&b, "}}");
+  return b.ok ? b.k : 0;
+}
+
+size_t openseek_json_telemetria(char *dst, size_t n, long bufferMs, int rebuffering, const char *host, int conns) {
+  Buf b = { dst, n, 0, 1 };
+  if (!dst || n < 2) return 0;
+  dst[0] = 0;
+  bTxt(&b, "{");
+  if (bufferMs >= 0) bFmt(&b, "\"buffer_ms\":%lld,", bufferMs > 600000 ? 600000 : bufferMs);
+  bTxt(&b, rebuffering ? "\"rebuffering\":true" : "\"rebuffering\":false");
+  if (host && *host && strlen(host) < 255) { bTxt(&b, ",\"host\":"); bStr(&b, host, strlen(host)); }
+  bFmt(&b, ",\"conns\":%lld}", conns < 0 ? 0 : conns > 64 ? 64 : conns);
+  return b.ok ? b.k : 0;
+}
+
+int openseek_ler_alt(const char *json, char *estado, size_t nEstado, char *want, size_t nWant) {
+  const char *a, *fim;
+  if (estado && nEstado) estado[0] = 0;
+  if (want && nWant) want[0] = 0;
+  if (!json || !(a = strstr(json, "\"alt\":{"))) return 0;
+  a += 6;                                                  // no '{' do bloco (sem objetos aninhados)
+  fim = strchr(a, '}');
+  if (!fim) return 0;
+  if (estado && nEstado) js_texto(a, fim, "state", estado, nEstado);
+  if (want && nWant) js_texto(a, fim, "want", want, nWant);
+  return 1;
+}
+
 size_t openseek_json_prioridade(char *dst, size_t n, long atMs, long playheadMs) {
   Buf b = { dst, n, 0, 1 };
   if (!dst || n < 2) return 0;
@@ -384,12 +475,17 @@ void openseek_lru_ini(OsLru *l, int n) {
   memset(l, 0, sizeof *l);
   l->n = n < 1 ? 1 : n > OS_LRU_MAX ? OS_LRU_MAX : n;
 }
-int openseek_lru_achar(OsLru *l, const char *chave) {
+int openseek_lru_tem(const OsLru *l, const char *chave) {
   int i;
-  if (!chave || !*chave) return -1;
+  if (!l || !chave || !*chave) return -1;
   for (i = 0; i < l->n; i++)
-    if (l->it[i].ocupado && !strcmp(l->it[i].chave, chave)) { l->it[i].uso = ++l->relogio; return i; }
+    if (l->it[i].ocupado && !strcmp(l->it[i].chave, chave)) return i;
   return -1;
+}
+int openseek_lru_achar(OsLru *l, const char *chave) {
+  int i = openseek_lru_tem(l, chave);
+  if (i >= 0) l->it[i].uso = ++l->relogio;
+  return i;
 }
 int openseek_lru_lugar(OsLru *l, const char *chave, const char *const *prot, int np) {
   int i, k, melhor = -1;
@@ -407,5 +503,107 @@ int openseek_lru_lugar(OsLru *l, const char *chave, const char *const *prot, int
   snprintf(l->it[melhor].chave, sizeof l->it[melhor].chave, "%s", chave);
   l->it[melhor].ocupado = 1;
   l->it[melhor].uso = ++l->relogio;
+  return melhor;
+}
+
+static long cueCentroMs(const SeekrCue *q) {
+  return q->rotulo >= 0 ? q->rotulo : (q->ini + q->fim) / 2;
+}
+
+int openseek_cue_visivel(const SeekrVtt *v, long posMs, int *esparso) {
+  int c, lo, hi, melhor;
+  long distMelhor;
+  if (esparso) *esparso = 0;
+  if (!v || v->nCues <= 0 || posMs < 0) return -1;
+  c = seekr_vtt_cue_estrita(v, posMs);
+  if (c >= 0) return c;
+  lo = 0; hi = v->nCues - 1;
+  while (lo < hi) {
+    int m = (lo + hi + 1) / 2;
+    if (v->cues[m].ini <= posMs) lo = m; else hi = m - 1;
+  }
+  melhor = lo;
+  distMelhor = labs(cueCentroMs(&v->cues[lo]) - posMs);
+  if (lo + 1 < v->nCues) {
+    long d2 = labs(cueCentroMs(&v->cues[lo + 1]) - posMs);
+    if (d2 < distMelhor) { melhor = lo + 1; distMelhor = d2; }
+  }
+  if (distMelhor > OS_SPARSE_TOL_MS) return -1;
+  if (esparso) *esparso = 1;
+  return melhor;
+}
+
+static void filaAdd(const SeekrVtt *v, int c, int maxOut, int *out, int *n) {
+  if (c < 0 || c >= v->nCues || *n >= maxOut) return;
+  for (int k = 0; k < *n; k++) if (out[k] == c) return;
+  out[(*n)++] = c;
+}
+
+int openseek_fila_busca(const SeekrVtt *v, long posMs, long alvoMs, int dir,
+                        int maxOut, int *out) {
+  int n = 0, i, ia, base;
+  if (!v || v->nCues <= 0 || maxOut <= 0 || !out) return 0;
+  dir = dir < 0 ? -1 : 1;
+  i = openseek_cue_visivel(v, posMs, NULL);
+  if (i >= 0) {
+    filaAdd(v, i, maxOut, out, &n);
+    filaAdd(v, i + dir, maxOut, out, &n);
+    filaAdd(v, i - dir, maxOut, out, &n);
+  }
+  ia = alvoMs >= 0 ? openseek_cue_visivel(v, alvoMs, NULL) : -1;
+  if (ia >= 0 && ia != i) {
+    filaAdd(v, ia, maxOut, out, &n);
+    filaAdd(v, ia + dir, maxOut, out, &n);
+    filaAdd(v, ia - dir, maxOut, out, &n);
+  }
+  base = ia >= 0 ? ia : i >= 0 ? i : seekr_vtt_cue(v, alvoMs >= 0 ? alvoMs : posMs);
+  if (base >= 0) {
+    if (i < 0 && ia < 0) {
+      filaAdd(v, base, maxOut, out, &n);
+      filaAdd(v, base + dir, maxOut, out, &n);
+      filaAdd(v, base - dir, maxOut, out, &n);
+    }
+    for (int passo = 2; passo <= maxOut && n < maxOut; passo++) {
+      filaAdd(v, base + passo * dir, maxOut, out, &n);
+      if (passo <= 4) filaAdd(v, (i >= 0 ? i : base) - passo * dir, maxOut, out, &n);
+    }
+  }
+  return n;
+}
+
+int openseek_escolher_prefetch(const SeekrVtt *v, const char (*folhaChaves)[240],
+                               const OsLru *jl, const char (*falhas)[240], int nFalhas,
+                               long anchorMs, int dir) {
+  int melhor = -1, fUlt = -1, fUltOk = 0;
+  long long melhorScore = 0;
+  long anchor = anchorMs >= 0 ? anchorMs : 0;
+  if (!v || v->nCues <= 0 || v->nFolhas <= 0 || !jl) return -1;
+  dir = dir < 0 ? -1 : 1;
+  for (int c = 0; c < v->nCues; c++) {
+    const SeekrCue *q = &v->cues[c];
+    int f = q->folha, rel = 0;
+    long long dist = 0, score;
+    if (f < 0 || f >= v->nFolhas) continue;
+    if (anchor < q->ini) { dist = (long long)q->ini - anchor; rel = 1; }
+    else if (anchor >= q->fim) { dist = (long long)anchor - q->fim; rel = -1; }
+    score = (rel == 0 || rel == dir) ? dist : dist * 2 + 10000LL;
+    if (melhor >= 0 && score >= melhorScore) continue;
+    if (f != fUlt) {
+      char kBuf[240];
+      const char *k = folhaChaves ? folhaChaves[f] : NULL;
+      if (!k || !*k) {
+        if (!openseek_chave(v->folhas[f], kBuf, sizeof kBuf)) { fUlt = f; fUltOk = 0; continue; }
+        k = kBuf;
+      }
+      fUlt = f;
+      fUltOk = openseek_lru_tem(jl, k) < 0;
+      for (int j = 0; fUltOk && j < nFalhas; j++)
+        if (falhas[j][0] && !strcmp(falhas[j], k)) fUltOk = 0;
+    }
+    if (!fUltOk) continue;
+    melhor = f;
+    melhorScore = score;
+    if (melhorScore == 0) break;
+  }
   return melhor;
 }

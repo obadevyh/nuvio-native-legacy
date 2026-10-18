@@ -61,6 +61,31 @@ typedef struct {
 } OpenSeekFonte;
 // Corpos JSON. Devolvem o tamanho (0 = nao coube ou entrada invalida).
 size_t openseek_json_previa(char *dst, size_t n, const OpenSeekFonte *f);
+// --- FONTE ALTERNATIVA PARA MINIATURAS (opcional; desligada por padrao) ---------
+// So METADADOS dos candidatos vao no POST /v1/previews (bloco "alt"): nenhuma URL,
+// nenhum cabecalho. O servidor pede UM candidato (alt.want); so entao a URL dele
+// segue, uma vez, em POST /v1/previews/{id}/alt-source. O video em reproducao
+// nunca e trocado. Contrato: docs/api/CONTRACT-v1.md do OpenSeek (alt).
+#define OS_ALT_MAX 24
+typedef struct {
+  char cid[24];             // "s<indice na lista de fontes>"; opaco para o servidor
+  char titleKey[64];        // "tt123:temporada:episodio": igualdade decide "mesmo titulo"
+  int  altura;              // 2160, 1080, 720...
+  long long durMs;          // 0 = desconhecida
+  unsigned long long tamanho;
+  const char *codec, *container, *nome;   // nome = release (so le palavras de edicao no servidor)
+  int  emCache;             // debrid diz que ja esta pronto: nada a baixar
+  int  resolvida;           // o cliente ja tem um link utilizavel
+} OpenSeekAltCand;
+// Corpo do POST de criacao + bloco "alt" (a base e a de openseek_json_previa).
+size_t openseek_json_previa_alt(char *dst, size_t n, const OpenSeekFonte *f,
+                                const OpenSeekAltCand *play, const OpenSeekAltCand *c, int nc);
+// Corpo de POST /alt-source: o link do UNICO candidato pedido (mesma lista de cabecalhos permitidos).
+size_t openseek_json_alt_fonte(char *dst, size_t n, const char *cid, const char *url, const char *cabecalhos);
+// Corpo de POST /telemetry: saude da reproducao (bufferMs < 0 = desconhecido).
+size_t openseek_json_telemetria(char *dst, size_t n, long bufferMs, int rebuffering, const char *host, int conns);
+// Le o bloco "alt" da resposta de status. 1 se presente; want = cid pedido ("" = nada).
+int  openseek_ler_alt(const char *json, char *estado, size_t nEstado, char *want, size_t nWant);
 size_t openseek_json_prioridade(char *dst, size_t n, long atMs, long playheadMs);
 size_t openseek_json_claim(char *dst, size_t n, const char *pairId,
                            const char *device, const char *prova);
@@ -106,11 +131,37 @@ int  openseek_pedido(OpenSeekPedido *o, const char *metodo, const char *url,
                      const void *corpo, size_t nCorpo, unsigned prazoMs);
 
 // --- Cache LRU por chave (texturas e JPEGs) ----------------------------------
-#define OS_LRU_MAX 16
+#define OS_LRU_MAX 1024
 typedef struct { char chave[240]; unsigned uso; int ocupado; } OsLruItem;
 typedef struct { OsLruItem it[OS_LRU_MAX]; int n; unsigned relogio; } OsLru;
 void openseek_lru_ini(OsLru *l, int n);           // n <= OS_LRU_MAX
-int  openseek_lru_achar(OsLru *l, const char *chave);   // indice ou -1 (marca uso)
+int  openseek_lru_tem(const OsLru *l, const char *chave); // indice ou -1 (sem marcar uso)
+int  openseek_lru_achar(OsLru *l, const char *chave);     // indice ou -1 (marca uso)
 // Indice para guardar `chave` (o livre ou o menos usado fora de `proteger`).
 int  openseek_lru_lugar(OsLru *l, const char *chave, const char *const *proteger, int np);
+
+// Tolerancia maxima (ms) para exibir uma cue vizinha da grade esparsa (60s/30s)
+// enquanto o quadro exato (±5s) ainda esta sendo refinado: cobre metade do
+// passo de 60s (30s) + ±5s de jitter de keyframe. Acima disto devolve -1.
+#define OS_SPARSE_TOL_MS 35000L
+
+// Indice da cue visivel para `posMs`: prefere a cue estrita [ini, fim)
+// (*esparso = 0); nos buracos da grade hierarquica (60s -> 30s -> 10s), escolhe
+// a cue com rotulo/centro mais proximo de `posMs` ate OS_SPARSE_TOL_MS
+// (*esparso = 1). Fora desse alcance devolve -1 (*esparso = 0).
+int  openseek_cue_visivel(const SeekrVtt *v, long posMs, int *esparso);
+
+// Fila priorizada de indices de cues para busca/pre-recorte: a cue visivel em
+// `posMs` e vizinhas na direcao `dir` (+1/-1), seguidas da cue visivel em
+// `alvoMs` (quando o avanco visual ainda alcanca o alvo) e lookahead direcional.
+int  openseek_fila_busca(const SeekrVtt *v, long posMs, long alvoMs, int dir,
+                         int maxOut, int *out);
+
+// Escolhe a proxima folha (`0 .. v->nFolhas - 1`) ainda fora de `jl` para
+// prefetch em segundo plano, ordenada pela proximidade a `anchorMs` com vies
+// para a direcao `dir` (+1/-1). Devolve -1 quando todas as folhas validas ja
+// estao em cache.
+int  openseek_escolher_prefetch(const SeekrVtt *v, const char (*folhaChaves)[240],
+                                const OsLru *jl, const char (*falhas)[240], int nFalhas,
+                                long anchorMs, int dir);
 #endif

@@ -185,7 +185,92 @@ int main(void) {
       prot[0] = "k1";                        // mas e a atual na tela: protegida
       assert(openseek_lru_lugar(&l, "k12", prot, 1) == 2);
       assert(openseek_lru_achar(&l, "k1") == 1 && openseek_lru_achar(&l, "k2") < 0);
+      // openseek_lru_tem nao altera o relogio de uso.
+      unsigned uAntes = l.it[1].uso;
+      assert(openseek_lru_tem(&l, "k1") == 1 && l.it[1].uso == uAntes);
     }
+    // Capacidade expandida (ate 1024 JPEGs/folhas sem desalojamento).
+    {
+      openseek_lru_ini(&l, OS_LRU_MAX);
+      for (int i = 0; i < 600; i++) {
+        char ki[32]; snprintf(ki, sizeof ki, "tile_%d", i);
+        assert(openseek_lru_lugar(&l, ki, NULL, 0) == i);
+      }
+      assert(openseek_lru_tem(&l, "tile_0") == 0 && openseek_lru_tem(&l, "tile_599") == 599);
+    }
+  }
+
+  // --- fila de busca direcional e selecao de prefetch -------------------------------------
+  {
+    static const char *VTT_TEST =
+      "WEBVTT\n\n"
+      "00:00:00.000 --> 00:00:10.000\n"
+      B "/v1/c/CAP/0123456789abcdef0123456789abcdef/sheets/0.jpg?exp=100&t=5000#xywh=0,0,320,180\n\n"
+      "00:00:10.000 --> 00:00:20.000\n"
+      B "/v1/c/CAP/0123456789abcdef0123456789abcdef/sheets/0.jpg?exp=100&t=15000#xywh=320,0,320,180\n\n"
+      "00:00:20.000 --> 00:00:30.000\n"
+      B "/v1/c/CAP/0123456789abcdef0123456789abcdef/tiles/2.jpg?exp=100&t=25000#xywh=0,0,320,180\n\n"
+      "00:00:30.000 --> 00:00:40.000\n"
+      B "/v1/c/CAP/0123456789abcdef0123456789abcdef/tiles/3.jpg?exp=100&t=35000#xywh=0,0,320,180\n\n"
+      "00:00:40.000 --> 00:00:50.000\n"
+      B "/v1/c/CAP/0123456789abcdef0123456789abcdef/tiles/4.jpg?exp=100&t=45000#xywh=0,0,320,180\n\n"
+      "00:00:50.000 --> 00:01:00.000\n"
+      B "/v1/c/CAP/0123456789abcdef0123456789abcdef/sheets/1.jpg?exp=100&t=55000#xywh=0,0,320,180\n\n";
+    SeekrVtt v;
+    int fila[12], nf;
+    OsLru jl;
+    char fch[4][240], falhas[1][240] = {{0}};
+    assert(seekr_vtt_ler_openseek(VTT_TEST, B, &v) == 6 && v.nFolhas == 5);
+    for (int f = 0; f < v.nFolhas && f < 4; f++) openseek_chave(v.folhas[f], fch[f], sizeof fch[f]);
+
+    // Direcao +1 em cue 1 (15s), alvo em cue 4 (45s): [1, 2, 0] primeiro, depois [4, 5, 3].
+    nf = openseek_fila_busca(&v, 15000, 45000, 1, 12, fila);
+    assert(nf == 6);
+    assert(fila[0] == 1 && fila[1] == 2 && fila[2] == 0);
+    assert(fila[3] == 4 && fila[4] == 5 && fila[5] == 3);
+
+    // Direcao -1 em cue 3 (35s), sem alvo separado: [3, 2, 4] primeiro, depois lookahead para tras (1, 5, 0).
+    nf = openseek_fila_busca(&v, 35000, -1, -1, 12, fila);
+    assert(nf == 6 && fila[0] == 3 && fila[1] == 2 && fila[2] == 4 && fila[3] == 1);
+
+    // Prefetch: em anchor=15000 (folha 0), escolhe folha 0 primeiro; depois folha 1 (25s, +1) antes de tras.
+    openseek_lru_ini(&jl, 32);
+    assert(openseek_escolher_prefetch(&v, NULL, &jl, NULL, 0, 15000, 1) == 0);
+    openseek_chave(v.folhas[0], k, sizeof k);
+    openseek_lru_lugar(&jl, k, NULL, 0);
+    // Com folha 0 em cache e anchor=15000, dir=+1 prefere folha 1 (cues[2], 20..30s) logo a frente.
+    assert(openseek_escolher_prefetch(&v, NULL, &jl, NULL, 0, 15000, 1) == 1);
+    // Se folha 1 falhou recentemente, pula para folha 2 (cues[3], 30..40s).
+    openseek_chave(v.folhas[1], falhas[0], sizeof falhas[0]);
+    assert(openseek_escolher_prefetch(&v, NULL, &jl, falhas, 1, 15000, 1) == 2);
+    // Quando todas as folhas estao no cache, devolve -1.
+    for (int f = 0; f < v.nFolhas; f++) {
+      openseek_chave(v.folhas[f], k, sizeof k);
+      openseek_lru_lugar(&jl, k, NULL, 0);
+    }
+    assert(openseek_escolher_prefetch(&v, NULL, &jl, NULL, 0, 15000, 1) == -1);
+    seekr_vtt_liberar(&v);
+
+    // Grade esparsa de 60s: cues em t=5s (0..10s), t=65s (60..70s) e t=245s (240..250s).
+    static const char *VTT_SPARSE =
+      "WEBVTT\n\n"
+      "00:00:00.000 --> 00:00:10.000\n"
+      B "/v1/c/CAP/0123456789abcdef0123456789abcdef/tiles/0.jpg?exp=100&t=5000#xywh=0,0,320,180\n\n"
+      "00:01:00.000 --> 00:01:10.000\n"
+      B "/v1/c/CAP/0123456789abcdef0123456789abcdef/tiles/6.jpg?exp=100&t=65000#xywh=0,0,320,180\n\n"
+      "00:04:00.000 --> 00:04:10.000\n"
+      B "/v1/c/CAP/0123456789abcdef0123456789abcdef/tiles/24.jpg?exp=100&t=245000#xywh=0,0,320,180\n\n";
+    int esp = -1;
+    assert(seekr_vtt_ler_openseek(VTT_SPARSE, B, &v) == 3);
+    // Dentro da cue estrita [0..10s): esparso = 0
+    assert(openseek_cue_visivel(&v, 5000, &esp) == 0 && esp == 0);
+    // Em 20s (dist=15s de t=5s, dist=45s de t=65s): escolhe cue 0 com esparso = 1
+    assert(openseek_cue_visivel(&v, 20000, &esp) == 0 && esp == 1);
+    // Em 45s (dist=40s de t=5s, dist=20s de t=65s): escolhe cue 1 com esparso = 1
+    assert(openseek_cue_visivel(&v, 45000, &esp) == 1 && esp == 1);
+    // Em 150s (dist=85s de t=65s e dist=95s de t=245s, ambos > 35s): devolve -1 (sem previa enganosa)
+    assert(openseek_cue_visivel(&v, 150000, &esp) == -1 && esp == 0);
+    seekr_vtt_liberar(&v);
   }
   printf("openseek_pedido: ok\n");
   return 0;

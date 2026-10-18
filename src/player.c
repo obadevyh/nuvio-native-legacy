@@ -91,6 +91,7 @@ static void avisarCascaAberto(int v) { (void)v; }
 #include "credfonte.h"
 #include "credaprende.h"
 #include "seekr.h"
+#include "openseek.h"
 #include "visto.h"     /* fim de episodio/filme para Simkl e conta */
 #include "vistoep.h"   /* o check de "assistido" na lista de episodios (issue #100) */
 #include "pausao.h"
@@ -3945,6 +3946,93 @@ static void introTmdbTardio(Uint32 agora) {
   }
 }
 
+// OPENSEEK, fonte alternativa para miniaturas (desligada por padrao; ver openseek.h).
+// Metadados dos candidatos saem da lista de fontes que o app JA tem; nenhuma URL
+// vai junto, nenhuma chamada a API de debrid, nenhuma resolucao por miniatura. So
+// candidatos com link utilizavel, em cache no debrid e de ate 1080p entram. A URL
+// de UM candidato so segue se o servidor pedir aquele (openseek_alt_pedido).
+static void openseekAltCand(OpenSeekAltCand *o, const char *cid, const Stream *s, const char *chave, long long durMs) {
+  memset(o, 0, sizeof *o);
+  snprintf(o->cid, sizeof o->cid, "%s", cid);
+  snprintf(o->titleKey, sizeof o->titleKey, "%s", chave);
+  o->altura = s->altura; o->durMs = durMs; o->tamanho = s->tamanhoBytes;
+  o->nome = s->arquivo[0] ? s->arquivo : s->rotulo;
+  o->emCache = s->emCache || s->cacheNativo;
+  o->resolvida = s->url[0] != 0;
+}
+static void openseekAltPasso(const char *imdb, int temporada, int episodio, long durMs, float posSeg) {
+  static unsigned listaGeracao; static int atualAntes = -1; static char chaveAntes[64];
+  OpenSeekAltCand play, cands[OS_ALT_MAX];
+  const Stream *st = stream_item(stream_atual());
+  char chave[64], host[128] = "", cid[24];
+  double bf = video_buffer_fim();
+  long bufMs = bf > 0.5 ? (long)((bf - (double)posSeg) * 1000.0) : -1;
+  const char *u = video_url_atual();
+  int n = 0, nova;
+  if (!st || !openseek_alt_ligado()) return;
+  if (bufMs < 0 && bf > 0.5) bufMs = 0;
+  if (u && !strncmp(u, "http", 4)) {                 // so o host do CDN, nunca o caminho nem a consulta
+    const char *h = strstr(u, "://") + 3;
+    size_t k = strcspn(h, "/:?#");
+    if (k > 0 && k < sizeof host) { memcpy(host, h, k); host[k] = 0; }
+  }
+  snprintf(chave, sizeof chave, "%s:%d:%d", imdb ? imdb : "", temporada, episodio);
+  nova = stream_lista_geracao() != listaGeracao || stream_atual() != atualAntes || strcmp(chave, chaveAntes);
+  if (nova) {
+    openseekAltCand(&play, "play", st, chave, durMs);
+    int pulouUrl = 0, pulouRes = 0, pulouCache = 0, h720 = 0, h1080 = 0;
+    int t2160 = 0, t1440 = 0, t1080 = 0, t720 = 0, tOutro = 0, c1080 = 0, c720 = 0, cConf = 0, cNat = 0, total = 0;
+    for (int i = 0; i < stream_n(); i++) {            // contagem sobre a lista INTEIRA (so numeros)
+      const Stream *c = stream_item(i);
+      if (!c || i == stream_atual() || c->naoVideo || !c->url[0]) continue;
+      int emc = c->emCache || c->cacheNativo;
+      total++;
+      if (c->emCache) cConf++;
+      if (c->cacheNativo) cNat++;
+      if (c->altura == 2160) t2160++;
+      else if (c->altura == 1440) t1440++;
+      else if (c->altura == 1080) { t1080++; c1080 += emc; }
+      else if (c->altura == 720) { t720++; c720 += emc; }
+      else tOutro++;
+    }
+    // Primeiro os de ate 1080p (os unicos que podem servir), depois os demais so para diagnostico; o teto de
+    // OS_ALT_MAX nunca deixa um candidato util de fora por causa de fontes 4K antes dele na lista.
+    for (int passo = 0; passo < 2; passo++) {
+      for (int i = 0; i < stream_n() && n < OS_ALT_MAX; i++) {
+        const Stream *c = stream_item(i);
+        if (!c || i == stream_atual() || c->naoVideo) continue;
+        if (!c->url[0]) { if (passo == 0) pulouUrl++; continue; }
+        int baixa = c->altura > 0 && c->altura <= 1080;
+        if (passo == 0 ? !baixa : baixa) continue;
+        // Manda os candidatos com link (so metadados): quem decide a elegibilidade e o servidor, que sabe dizer
+        // o motivo de cada recusa (resolucao, cache, edicao...). Aqui so se contam, para o log.
+        if (!baixa) pulouRes++;
+        if (!(c->emCache || c->cacheNativo)) pulouCache++;
+        if (c->altura == 720) h720++; else if (c->altura == 1080) h1080++;
+        snprintf(cid, sizeof cid, "s%d", i);
+        openseekAltCand(&cands[n++], cid, c, chave, 0);
+      }
+    }
+    // So contagens (nada de URL, nome ou cabecalho): a lista inteira por resolucao e por cache, e o que foi enviado.
+    printf("[openseek] alt list: total_com_link=%d 2160p=%d 1440p=%d 1080p=%d(em_cache=%d) 720p=%d(em_cache=%d) outras=%d | "
+           "cache_confirmado=%d cache_nativo=%d\n", total, t2160, t1440, t1080, c1080, t720, c720, tOutro, cConf, cNat);
+    printf("[openseek] alt candidates: lista=%d enviados=%d (720p=%d 1080p=%d) pulados: sem_url=%d fora_de_1080p=%d sem_cache=%d\n",
+           stream_n(), n, h720, h1080, pulouUrl, pulouRes, pulouCache);
+    fflush(stdout);
+    listaGeracao = stream_lista_geracao(); atualAntes = stream_atual();
+    snprintf(chaveAntes, sizeof chaveAntes, "%s", chave);
+    openseek_alt_atualizar(&play, cands, n, bufMs, video_bufferando_ms() > 0, host);
+  } else {
+    openseek_alt_atualizar(NULL, NULL, 0, bufMs, video_bufferando_ms() > 0, host);
+  }
+  if (openseek_alt_pedido(cid, sizeof cid)) {         // o servidor pediu UM candidato: entrega a URL dele, uma vez
+    int i = cid[0] == 's' ? atoi(cid + 1) : -1;
+    const Stream *c = i >= 0 && i < stream_n() ? stream_item(i) : NULL;
+    if (c && c->url[0]) openseek_alt_entregar(cid, c->url, c->cabecalhos);
+    else openseek_alt_entregar(cid, "", "");         // sumiu da lista: o fio nao envia nada
+  }
+}
+
 void player_atualizar(float dt, Uint32 agora) {
 #ifdef NV_TOUCH_UI
   playerTelaAtualizar();
@@ -4137,6 +4225,7 @@ void player_atualizar(float dt, Uint32 agora) {
                          st ? st->tamanhoBytes : 0, st ? st->videoHash : "",
                          st ? st->arquivo : "", (long)(posSeg * 1000.0f),
                          (long)(video_pos() * 1000.0), scrubbing };
+        if (cs) openseekAltPasso(cs->imdb, serie ? epT : 0, serie ? epE : 0, (long)(d * 1000.0), posSeg);
         seekr_pedir_fonte(&f);
       }
     }

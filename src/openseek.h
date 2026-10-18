@@ -16,6 +16,7 @@
 #ifndef NV_OPENSEEK_H
 #define NV_OPENSEEK_H
 #include "seekr.h"
+#include "openseekproto.h"
 #include <stddef.h>
 
 // A tabela que o seekr.c usa quando o provedor e o OpenSeek.
@@ -43,4 +44,14 @@ enum {
 int  openseek_status(char *host, size_t n);
 // Rotulo (chave i18n em portugues) de um OSU_*.
 const char *openseek_status_rotulo(int st);
+// --- FONTE ALTERNATIVA PARA MINIATURAS (opcional; desligada por padrao) ---------
+// Liga com o arquivo "openseek-alt.txt" (conteudo 1) nos dados do app. Chamadas so da
+// thread do player. `atualizar` guarda a saude da reproducao e, quando `play`/`c` vem,
+// a lista de candidatos (SO metadados; a URL so segue se o servidor pedir aquele).
+int  openseek_alt_ligado(void);
+void openseek_alt_atualizar(const OpenSeekAltCand *play, const OpenSeekAltCand *c, int n,
+                            long bufferMs, int rebuffering, const char *host);
+// 1 quando o servidor pediu um candidato (cid) e ainda falta a URL; entregue-a UMA vez.
+int  openseek_alt_pedido(char *cid, size_t n);
+void openseek_alt_entregar(const char *cid, const char *url, const char *cabecalhos);
 #endif
