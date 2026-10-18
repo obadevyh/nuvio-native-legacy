@@ -96,6 +96,11 @@ if(NUVIO_ENV_CMAKE AND EXISTS "${NUVIO_ENV_CMAKE}")
   include("${NUVIO_ENV_CMAKE}")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${NUVIO_ENV_CMAKE}")
 endif()
+# A versao embutida (NV_VERSAO: o que o atualizador compara com a release) e SEMPRE a do appinfo.json, nunca a de um nuvio-env.cmake velho:
+# senao o app se acharia na versao anterior e ofereceria a si mesmo como atualizacao.
+if(NV_VERSAO_APP)
+  set(NV_VERSAO "${NV_VERSAO_APP}")
+endif()
 foreach(k ${NV_KEYS})
   # \" literal: o gerador de build escapa o resto.
   target_compile_definitions(main PRIVATE "${k}=\"${${k}}\"")

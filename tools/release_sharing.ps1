@@ -89,6 +89,15 @@ $sig = & (Join-Path $bt "apksigner.bat") verify --print-certs -v $asset 2>&1 | O
 if ($sig -notmatch "Verified using v2 scheme \(APK Signature Scheme v2\): true") { Fail "v2 signature not verified" }
 if ($sig -notmatch "Signer #1 certificate SHA-256 digest: $PinnedCert") { Fail "signing certificate is NOT the pinned one (would not update installed copies)" }
 if (([regex]::Matches($sig, "Signer #\d+ certificate DN")).Count -ne 1) { Fail "unexpected number of signers" }
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$zip = [IO.Compression.ZipFile]::OpenRead($asset)
+try {
+  $ent = $zip.GetEntry("lib/arm64-v8a/libmain.so")
+  $ms = New-Object IO.MemoryStream; $st = $ent.Open(); $st.CopyTo($ms); $st.Close()
+  $lib = [Text.Encoding]::GetEncoding(28591).GetString($ms.ToArray())
+} finally { $zip.Dispose() }
+if (-not $lib.Contains("[atualizacao] instalada %s")) { Fail "updater code not found in the library" }
+if (-not $lib.Contains([char]0 + $Version + [char]0)) { Fail "the library does not carry the version $Version (the updater would offer itself); check nuvio-env.cmake / NV_VERSAO_APP" }
 $sha = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
 Write-Host "  package $AppId, versionCode $code, v2 signature OK, certificate = pinned, not debuggable"
 Write-Host "  SHA-256 $sha ($([math]::Round((Get-Item $asset).Length / 1MB, 1)) MB)"
