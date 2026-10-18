@@ -140,6 +140,24 @@ int osp1_normalizar_codigo(const char *dig, char out[OSP1_CODE_LEN + 1]) {
   return 1;
 }
 
+int osp1_normalizar_convite(const char *dig, char tag[OSP1_CONVITE_TAG + 1], char segredo[OSP1_CONVITE_SEGREDO + 1]) {
+  static const char ALFA[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+  char todo[OSP1_CONVITE_TAG + OSP1_CONVITE_SEGREDO + 1];
+  int n = 0;
+  tag[0] = segredo[0] = 0;
+  if (!dig) return 0;
+  for (; *dig; dig++) {
+    char c = (char)toupper((unsigned char)*dig);
+    if (c == ' ' || c == '-') continue;
+    if (!strchr(ALFA, c) || n >= OSP1_CONVITE_TAG + OSP1_CONVITE_SEGREDO) return 0;
+    todo[n++] = c;
+  }
+  if (n != OSP1_CONVITE_TAG + OSP1_CONVITE_SEGREDO) return 0;
+  memcpy(tag, todo, OSP1_CONVITE_TAG); tag[OSP1_CONVITE_TAG] = 0;
+  memcpy(segredo, todo + OSP1_CONVITE_TAG, OSP1_CONVITE_SEGREDO); segredo[OSP1_CONVITE_SEGREDO] = 0;
+  return 1;
+}
+
 int osp1_derivar(const char *code, const char *pairId, const char *salt,
                  const char *pin, long iter, long iterMin,
                  unsigned char k[32], int (*parar)(void *), void *u) {

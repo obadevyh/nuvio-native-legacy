@@ -31,7 +31,8 @@ enum {
 // Por que (so para o rotulo; o estado de cima decide o desenho).
 enum {
   OSM_NENHUM = 0, OSM_REDE, OSM_PINO_MUDOU, OSM_SEM_PINO, OSM_RECUSADO,
-  OSM_OCUPADO, OSM_FONTE, OSM_EXPIRADO, OSM_PREPARANDO, OSM_NAO_PAREADO
+  OSM_OCUPADO, OSM_FONTE, OSM_EXPIRADO, OSM_PREPARANDO, OSM_NAO_PAREADO,
+  OSM_NAO_COMPARTILHADO, OSM_COMPARTILHAMENTO_OFF
 };
 enum { OS_PREPARANDO = 1, OS_PRONTO, OS_COMPLETO, OS_FALHOU };
 
@@ -93,7 +94,7 @@ size_t openseek_json_claim(char *dst, size_t n, const char *pairId,
 typedef struct { char pairId[33], salt[33], pino[OS_PINO_MAX]; long iter; } OpenSeekStart;
 // pair_id/salt 32 hex, spki_pin bem formado (rede_pino_valido), iterations.
 int  openseek_ler_start(const char *json, OpenSeekStart *s);
-typedef struct { char deviceId[17], token[OS_TOKEN_MAX], prova[65]; } OpenSeekClaim;
+typedef struct { char deviceId[17], token[OS_TOKEN_MAX], prova[65], papel[12]; } OpenSeekClaim;   // papel: owner | guest
 int  openseek_ler_claim(const char *json, OpenSeekClaim *c);
 
 typedef struct {
@@ -108,6 +109,49 @@ typedef struct {
 int  openseek_ler_previa(const char *json, const char *base, OpenSeekPrevia *p);
 // {"vtt_version":N,"state":"..."} do /priority. 1 se leu a versao.
 int  openseek_ler_versao(const char *json, long *versao, int *estado);
+
+// --- BIBLIOTECA COMPARTILHADA (convidado) -------------------------------------------
+// Um aparelho convidado NUNCA envia URL de video nem cria trabalho: ele pergunta ao servidor do dono
+// se ha miniaturas de OUTRA versao do mesmo titulo (POST /v1/lookup, so ids + duracao) e le o VTT
+// que o servidor ja tem. Toda correspondencia e APROXIMADA ate prova em contrario; o ajuste manual
+// e a rejeicao valem so para este aparelho. Contrato: docs/design/OPENSEEK-2.md do OpenSeek.
+enum { OS_PAPEL_DONO = 0, OS_PAPEL_CONVIDADO = 1 };
+int  openseek_papel_de(const char *texto);           // "guest" -> convidado; qualquer outra coisa -> dono
+// O que a pessoa colou/digitou ao entrar numa biblioteca. forma: 0 invalido, 1 codigo de 8 (janela do dono),
+// 2 convite (string openseek://join/1?... ou codigo digitado de 16).
+typedef struct {
+  int  forma;
+  char base[OS_BASE_MAX];       // "https://host:porta" quando a string de convite traz h=; senao ""
+  char pino[OS_PINO_MAX];       // p=, quando traz
+  char convite[40];             // i= (id de 32 hex) ou a etiqueta de 4 letras do codigo digitado
+  char segredo[16];             // o segredo de 12 (ou o codigo de 8 da janela do dono)
+} OpenSeekEntrada;
+int  openseek_ler_entrada(const char *texto, OpenSeekEntrada *e);
+// Corpo do POST /v1/pair/start: {} (janela do dono) ou {"invite":"<id|etiqueta>"}.
+size_t openseek_json_start(char *dst, size_t n, const char *convite);
+// Corpo do POST /v1/lookup. imdb "tt..." obrigatorio (0 sem ele: nada a procurar). tamanho 0 = omitido.
+size_t openseek_json_procura(char *dst, size_t n, const char *imdb, int temporada, int episodio,
+                             long durMs, unsigned long long tamanho);
+// Corpo de PUT /v1/previews/{id}/offset.
+size_t openseek_json_offset(char *dst, size_t n, long offsetMs);
+typedef struct {
+  char id[33];
+  char vtt[2300];           // so na origem pareada
+  long long exp;
+  char tipo[24];            // same_length | speed_adjusted | length_differs | user_adjusted
+  int  aproximado;          // SEMPRE 1 ate o servidor provar o contrario ("verified")
+  int  verificado;
+  double a, b;              // t_cache = a * t_convidado + b (ms)
+  long fonteMs, tiles, nTiles;
+  int  nCandidatos;
+} OpenSeekCompart;
+// Resposta 200 do POST /v1/lookup: o primeiro candidato. `aproximado` so e 0 quando verified=true E approximate=false.
+int  openseek_ler_procura(const char *json, const char *base, OpenSeekCompart *c);
+// Legenda curta, honesta, para a tela (nunca chama de "verificada" o que e so metadado).
+const char *openseek_rotulo_compart(const OpenSeekCompart *c);
+// Novo valor de b (ms) ao deslocar as miniaturas `deslocaMs` para MAIS TARDE na linha do tempo do convidado
+// (positivo = depois). Limitado a +-6 h.
+long openseek_offset_apos(double b, long deslocaMs);
 
 // Resultado de um pedido de API -> estado SEEKR_* (OS_SEEKR_*) e motivo.
 // -1 quando nao muda nada (cancelado/obsoleto). `p` so com 200/202 lido.

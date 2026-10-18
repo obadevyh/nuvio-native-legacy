@@ -18,6 +18,8 @@
 #define OSP1_ITER_MIN 200000L
 #define OSP1_ITER_MAX 5000000L   // teto anti-DoS da TV (PBKDF2 em CPU de TV)
 #define OSP1_CODE_LEN 8
+#define OSP1_CONVITE_TAG 4        // etiqueta publica do convite (nomeia o convite no servidor)
+#define OSP1_CONVITE_SEGREDO 12   // o segredo do convite (entra no PBKDF2 como o codigo de 8 entra)
 
 typedef struct {
   uint32_t h[8];
@@ -38,6 +40,8 @@ void osp1_hex(const unsigned char *b, size_t n, char *out); // out: 2n+1
 // "k7qf-m2xd" -> "K7QFM2XD". 1 quando sobram exatamente 8 simbolos do alfabeto
 // do contrato (23456789ABCDEFGHJKMNPQRSTUVWXYZ).
 int  osp1_normalizar_codigo(const char *digitado, char out[OSP1_CODE_LEN + 1]);
+// Codigo de convite digitado: etiqueta (4) + segredo (12), alfabeto do contrato, espacos/tracos ignorados.
+int  osp1_normalizar_convite(const char *digitado, char tag[OSP1_CONVITE_TAG + 1], char segredo[OSP1_CONVITE_SEGREDO + 1]);
 // K. 0 quando iter fora de [OSP1_ITER_MIN, OSP1_ITER_MAX] (recusa de
 // rebaixamento), entrada vazia ou cancelado. `iterMin` permite os vetores de
 // teste com poucas iteracoes; o app passa OSP1_ITER_MIN.

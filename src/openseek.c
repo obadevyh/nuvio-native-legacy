@@ -60,6 +60,7 @@ static pthread_cond_t  sinal = PTHREAD_COND_INITIALIZER;
 // --- configuracao (openseek.txt) -------------------------------------------------
 static int  carregado;
 static char cfgBase[OS_BASE_MAX], cfgPino[OS_PINO_MAX], cfgToken[OS_TOKEN_MAX], cfgDevice[20];
+static int  cfgPapel;                          // OS_PAPEL_*: vem do servidor no pareamento
 static int  uiEstado = OSU_NAO_CONFIGURADO;   // ultimo resultado de parear/verificar
 static int  pareando;                          // 1 com o fio de pareamento vivo
 static int  verificando;                       // 1 com o fio de conferencia vivo
@@ -67,10 +68,11 @@ static int  verificando;                       // 1 com o fio de conferencia viv
 static void zerar(void *p, size_t n) { volatile unsigned char *v = p; while (n--) *v++ = 0; }
 
 static void gravarCfg(void) {   // com a trava
-  char t[OS_BASE_MAX + OS_PINO_MAX + OS_TOKEN_MAX + 96];
+  char t[OS_BASE_MAX + OS_PINO_MAX + OS_TOKEN_MAX + 112];
   if (!cfgBase[0]) { dados_apagar("openseek.txt"); return; }
-  snprintf(t, sizeof t, "base=%s\npino=%s\ntoken=%s\ndevice=%s\n", cfgBase,
-           cfgToken[0] ? cfgPino : "", cfgToken, cfgToken[0] ? cfgDevice : "");
+  snprintf(t, sizeof t, "base=%s\npino=%s\ntoken=%s\ndevice=%s\nrole=%s\n", cfgBase,
+           cfgToken[0] ? cfgPino : "", cfgToken, cfgToken[0] ? cfgDevice : "",
+           cfgToken[0] && cfgPapel == OS_PAPEL_CONVIDADO ? "guest" : "owner");
   if (!dados_gravar("openseek.txt", t)) { printf("[openseek] config save=failed\n"); fflush(stdout); }
   zerar(t, sizeof t);
 }
@@ -101,8 +103,9 @@ void openseek_carregar(void) {
     linhaCfg(t, "pino", cfgPino, sizeof cfgPino);
     linhaCfg(t, "token", cfgToken, sizeof cfgToken);
     linhaCfg(t, "device", cfgDevice, sizeof cfgDevice);
+    { char papel[12]; linhaCfg(t, "role", papel, sizeof papel); cfgPapel = openseek_papel_de(papel); }
     if (!rede_pino_valido(cfgPino) || !cfgToken[0] || !cfgBase[0]) {
-      cfgPino[0] = cfgToken[0] = cfgDevice[0] = 0;
+      cfgPino[0] = cfgToken[0] = cfgDevice[0] = 0; cfgPapel = OS_PAPEL_DONO;
     }
     zerar(t, strlen(t)); free(t);
   }
@@ -113,6 +116,12 @@ const char *openseek_endereco(void) {
   openseek_carregar();
   return cfgBase;   // escrita so pelos Ajustes, no mesmo fio
 }
+int openseek_papel(void) {
+  int r;
+  openseek_carregar();
+  pthread_mutex_lock(&trava); r = cfgToken[0] ? cfgPapel : OS_PAPEL_DONO; pthread_mutex_unlock(&trava);
+  return r;
+}
 int openseek_pareado(void) {
   int r;
   openseek_carregar();
@@ -120,6 +129,13 @@ int openseek_pareado(void) {
   return r;
 }
 static void sessaoEncerrar(void);  // adiante
+// A previa compartilhada conhecida (a do video atual ou a ultima): so para a tela e para os ajustes.
+static struct {
+  int valido, aprox, verif;
+  char id[33], tipo[24];
+  double a, b;
+  int ultimo; char ultimoMsg[96];     // resultado da ultima acao (0 nada, 1 ok, 2 falhou)
+} compart;
 int openseek_definir_endereco(const char *dig) {
   char nova[OS_BASE_MAX];
   openseek_carregar();
@@ -129,7 +145,7 @@ int openseek_definir_endereco(const char *dig) {
   pthread_mutex_lock(&trava);
   if (strcmp(nova, cfgBase)) {
     snprintf(cfgBase, sizeof cfgBase, "%s", nova);
-    zerar(cfgPino, sizeof cfgPino); zerar(cfgToken, sizeof cfgToken); cfgDevice[0] = 0;
+    zerar(cfgPino, sizeof cfgPino); zerar(cfgToken, sizeof cfgToken); cfgDevice[0] = 0; cfgPapel = OS_PAPEL_DONO;
     uiEstado = cfgBase[0] ? OSU_NAO_PAREADO : OSU_NAO_CONFIGURADO;
     gravarCfg();
   }
@@ -140,8 +156,9 @@ void openseek_esquecer(void) {
   openseek_carregar();
   sessaoEncerrar();
   pthread_mutex_lock(&trava);
-  zerar(cfgPino, sizeof cfgPino); zerar(cfgToken, sizeof cfgToken); cfgDevice[0] = 0;
+  zerar(cfgPino, sizeof cfgPino); zerar(cfgToken, sizeof cfgToken); cfgDevice[0] = 0; cfgPapel = OS_PAPEL_DONO;
   uiEstado = cfgBase[0] ? OSU_NAO_PAREADO : OSU_NAO_CONFIGURADO;
+  compart.valido = 0;
   gravarCfg();
   pthread_mutex_unlock(&trava);
 }
@@ -167,6 +184,9 @@ const char *openseek_status_rotulo(int st) {
     case OSU_NAO_PAREADO: return "Não pareado";
     case OSU_PAREANDO: return "Pareando…";
     case OSU_VERIFICANDO: return "Conferindo o servidor…";
+    case OSU_CONVITE: return "Convite inválido, expirado ou já usado";
+    case OSU_REVOGADO: return "Acesso revogado ou expirado: peça um novo convite";
+    case OSU_LIMITE: return "Muitas tentativas: aguarde um minuto";
     case OSU_PAREADO: return "Pareado";
     case OSU_SEM_CONEXAO: return "Sem conexão com o servidor";
     case OSU_CERTIFICADO: return "O certificado do servidor mudou";
@@ -202,7 +222,7 @@ static int uiDeErro(const RedeResposta *r) {
 }
 
 // --- pareamento (OSP1) -----------------------------------------------------------
-typedef struct { char base[OS_BASE_MAX], codigo[OSP1_CODE_LEN + 1]; } Pareio;
+typedef struct { char base[OS_BASE_MAX], codigo[OSP1_CONVITE_SEGREDO + 4], convite[40], pino[OS_PINO_MAX]; int forma; } Pareio;
 static void *parearFio(void *u) {
   Pareio *pp = u;
   OpenSeekStart s;
@@ -213,15 +233,21 @@ static void *parearFio(void *u) {
   int res = OSU_FALHOU, http;
   const char *device = "Nuvio";
   snprintf(url, sizeof url, "%s/v1/pair/start", pp->base);
-  // Primeiro contato: TLS sem pino, sem segredo nenhum (CONTRACT-v1).
-  http = chamar("POST", url, NULL, NULL, 1, "{}", OS_PRAZO_API_MS, NULL, &r);
+  if (!openseek_json_start(corpo, sizeof corpo, pp->forma == 2 ? pp->convite : NULL)) goto fim;
+  // Primeiro contato: TLS sem pino, sem segredo nenhum (CONTRACT-v1). Um convite que traz o pino (p=) ja o usa aqui.
+  http = chamar("POST", url, NULL, pp->pino[0] ? pp->pino : NULL, pp->pino[0] ? 0 : 1, corpo, OS_PRAZO_API_MS, NULL, &r);
   if (http != 200 || !r.corpo || !openseek_ler_start(r.corpo, &s)) {
-    res = http == 200 || http == 409 || http == 429 ? OSU_FALHOU : uiDeErro(&r);
+    res = http == 429 ? OSU_LIMITE : (http == 409 && pp->forma == 2) ? OSU_CONVITE :
+          http == 200 || http == 409 ? OSU_FALHOU : uiDeErro(&r);
     printf("[openseek] pair step=start http=%d result=%d\n", http, res); fflush(stdout);
     rede_resposta_limpar(&r);
     goto fim;
   }
   rede_resposta_limpar(&r);
+  if (pp->pino[0] && strcmp(pp->pino, s.pino)) {   // o convite dizia outro certificado: nada segue
+    printf("[openseek] pair step=start result=pin_differs_from_invite\n"); fflush(stdout);
+    res = OSU_CERTIFICADO; goto fim;
+  }
   if (s.iter < OSP1_ITER_MIN) {            // rebaixamento: recusa
     printf("[openseek] pair step=kdf result=iterations_refused\n"); fflush(stdout);
     goto fim;
@@ -237,7 +263,8 @@ static void *parearFio(void *u) {
   // Daqui em diante: so com o pino que o start mostrou (SR-2.4).
   http = chamar("POST", url, NULL, s.pino, 0, corpo, OS_PRAZO_API_MS, NULL, &r);
   if (http != 200 || !r.corpo || !openseek_ler_claim(r.corpo, &c)) {
-    res = http == 403 || http == 200 ? OSU_FALHOU : uiDeErro(&r);
+    res = http == 429 ? OSU_LIMITE : (http == 403 && pp->forma == 2) ? OSU_CONVITE :
+          http == 403 || http == 200 ? OSU_FALHOU : uiDeErro(&r);
     printf("[openseek] pair step=claim http=%d result=%d\n", http, res); fflush(stdout);
     rede_resposta_limpar(&r);
     goto fim;
@@ -253,6 +280,8 @@ static void *parearFio(void *u) {
     snprintf(cfgPino, sizeof cfgPino, "%s", s.pino);
     snprintf(cfgToken, sizeof cfgToken, "%s", c.token);
     snprintf(cfgDevice, sizeof cfgDevice, "%s", c.deviceId);
+    cfgPapel = openseek_papel_de(c.papel);
+    compart.valido = 0;
     gravarCfg();
     res = OSU_PAREADO;
   }
@@ -270,10 +299,16 @@ fim:
 int openseek_parear(const char *codigo) {
   Pareio *pp;
   pthread_t fio;
+  OpenSeekEntrada ent;
   openseek_carregar();
   pp = calloc(1, sizeof *pp);
   if (!pp) return 0;
-  if (!osp1_normalizar_codigo(codigo, pp->codigo)) { free(pp); return 0; }
+  if (!openseek_ler_entrada(codigo, &ent)) { free(pp); return 0; }           // codigo de 8, convite ou codigo de 16
+  if (ent.forma == 2 && ent.base[0] && !openseek_definir_endereco(ent.base)) { free(pp); return 0; }
+  snprintf(pp->codigo, sizeof pp->codigo, "%s", ent.segredo);
+  snprintf(pp->convite, sizeof pp->convite, "%s", ent.convite);
+  snprintf(pp->pino, sizeof pp->pino, "%s", ent.pino);
+  pp->forma = ent.forma;
   sessaoEncerrar();
   pthread_mutex_lock(&trava);
   if (pareando || !cfgBase[0]) { pthread_mutex_unlock(&trava); zerar(pp, sizeof *pp); free(pp); return 0; }
@@ -294,7 +329,7 @@ static void *verificarFio(void *u) {
   int http, res;
   snprintf(url, sizeof url, "%s/v1/pair/status", cr->base);
   http = chamar(NULL, url, cr->token, cr->pino, 0, NULL, OS_PRAZO_API_MS, NULL, &r);
-  res = http == 200 ? OSU_PAREADO : http == 401 ? OSU_FALHOU : uiDeErro(&r);
+  res = http == 200 ? OSU_PAREADO : http == 401 ? OSU_REVOGADO : uiDeErro(&r);
   rede_resposta_limpar(&r);
   printf("[openseek] check http=%d result=%d\n", http, res); fflush(stdout);
   pthread_mutex_lock(&trava);
@@ -343,7 +378,7 @@ typedef struct Sessao {
   char *url, *cabs;         // SEGREDOS: so no corpo do POST
   long durMs;
   char imdb[32], hash[24], arquivo[256];
-  int t, e;
+  int t, e, convidado;      // convidado: nunca ha URL de video nem trabalho neste servidor
   unsigned long long tamanho;
   // dinamico (trava)
   long playheadMs, atMs, ultimoPlay, ultimoQuadrosMs;
@@ -696,6 +731,58 @@ static int criarTrabalho(Sessao *s) {
   return http == 401 || http == 400 || http == 413 ? -1 : 0;
 }
 
+// CONVIDADO: procura miniaturas de OUTRA versao do mesmo titulo na biblioteca do dono. So ids + duracao saem;
+// nunca a URL do video; o servidor nao cria trabalho nenhum. 1 = achou, 0 = tentar depois, -1 = parar.
+static int procurarCompart(Sessao *s) {
+  char url[OS_BASE_MAX + 32], corpo[512];
+  OpenSeekCompart p;
+  RedeResposta r;
+  int http, ok = 0, est, mot = OSM_NENHUM;
+  Uint32 t0 = SDL_GetTicks();
+  pthread_mutex_lock(&trava);
+  if (!openseek_json_procura(corpo, sizeof corpo, s->imdb, s->t, s->e, s->durMs, s->tamanho)) corpo[0] = 0;
+  pthread_mutex_unlock(&trava);
+  if (!corpo[0]) {                       // sem id de titulo nao ha o que procurar: segue sem miniaturas
+    pthread_mutex_lock(&trava); definirEstado(s, SEEKR_SEM_PREVIA, OSM_NAO_COMPARTILHADO); pthread_mutex_unlock(&trava);
+    return -1;
+  }
+  snprintf(url, sizeof url, "%s/v1/lookup", s->base);
+  http = chamar("POST", url, s->token, s->pino, 0, corpo, OS_PRAZO_API_MS, &s->fim, &r);
+  int leu = http == 200 && r.corpo && openseek_ler_procura(r.corpo, s->base, &p);
+  est = openseek_mapear(http, r.erro, r.curl_erro, NULL, 0, &mot);
+  pthread_mutex_lock(&trava);
+  ultimoHttp = http; ultimaLatencia = SDL_GetTicks() - t0;
+  notarUi(http, &r);
+  if (http == 401) uiEstado = OSU_REVOGADO;
+  if (s == atual) {
+    if (leu) {
+      snprintf(s->id, sizeof s->id, "%s", p.id);
+      if (strcmp(s->vttUrl, p.vtt)) { snprintf(s->vttUrl, sizeof s->vttUrl, "%s", p.vtt); s->temVtt = 0; }
+      s->exp = p.exp; s->jobEstado = OS_COMPLETO; s->renovar = 0;
+      compart.valido = 1; compart.aprox = p.aproximado; compart.verif = p.verificado;
+      snprintf(compart.id, sizeof compart.id, "%s", p.id); snprintf(compart.tipo, sizeof compart.tipo, "%s", p.tipo);
+      compart.a = p.a; compart.b = p.b;
+      ok = 1; retryUtc = 0;
+    } else if (http == 404) {            // nada compativel na biblioteca (ainda): a reproducao segue normal
+      compart.valido = 0;
+      definirEstado(s, SEEKR_SEM_PREVIA, OSM_NAO_COMPARTILHADO);
+      retryUtc = (long long)time(NULL) + 120;
+    } else if (http == 403) {            // compartilhamento desligado no servidor do dono
+      compart.valido = 0;
+      definirEstado(s, SEEKR_SEM_PREVIA, OSM_COMPARTILHAMENTO_OFF);
+      retryUtc = (long long)time(NULL) + 300;
+    } else {
+      definirEstado(s, est, mot);
+      retryUtc = (long long)time(NULL) + (r.retry_after_s > 0 ? r.retry_after_s : 30);
+    }
+  }
+  pthread_mutex_unlock(&trava);
+  printf("[openseek] shared lookup http=%d ok=%d latency_ms=%u\n", http, ok, ultimaLatencia); fflush(stdout);
+  rede_resposta_limpar(&r);
+  if (ok) return 1;
+  return http == 401 || http == 400 ? -1 : 0;
+}
+
 static int baixarVtt(Sessao *s) {
   char url[2300];
   long versao;
@@ -781,7 +868,7 @@ static void *controleFio(void *u) {
     s->ultimoCriar = SDL_GetTicks() | 1u;
     pthread_mutex_unlock(&trava);
     if (s->fim) break;
-    int r = criarTrabalho(s);
+    int r = s->convidado ? procurarCompart(s) : criarTrabalho(s);
     if (r < 0) break;
     if (r == 0) {
       unsigned espera = 30000;
@@ -815,7 +902,7 @@ static void *controleFio(void *u) {
       if (completo) {
         // Nada a consultar; acorda para renovar a capacidade antes do exp.
         pthread_mutex_lock(&trava);
-        while (!s->fim && !s->renovar && !(s->exp && s->exp - (long long)time(NULL) < 120)) esperar(s, 5000);
+        while (!s->fim && !s->renovar && s->temVtt && !(s->exp && s->exp - (long long)time(NULL) < 120)) esperar(s, 5000);
         pthread_mutex_unlock(&trava);
         continue;
       }
@@ -1256,6 +1343,97 @@ static void *buscaFio(void *u) {
   return NULL;
 }
 
+// --- BIBLIOTECA COMPARTILHADA: informacao e ajustes (so deste aparelho) ------------------------
+int openseek_compart_info(OpenSeekCompartInfo *o) {
+  OpenSeekCompart c;
+  int v;
+  if (!o) return 0;
+  memset(o, 0, sizeof *o);
+  pthread_mutex_lock(&trava);
+  v = compart.valido && cfgPapel == OS_PAPEL_CONVIDADO;
+  if (v) {
+    memset(&c, 0, sizeof c);
+    snprintf(c.id, sizeof c.id, "%s", compart.id); snprintf(c.tipo, sizeof c.tipo, "%s", compart.tipo);
+    c.aproximado = compart.aprox; c.verificado = compart.verif;
+    o->valido = 1; o->aproximado = compart.aprox; o->verificado = compart.verif;
+    snprintf(o->tipo, sizeof o->tipo, "%s", compart.tipo);
+    o->offsetMs = (long)(compart.b < 0 ? compart.b - 0.5 : compart.b + 0.5);
+    snprintf(o->rotulo, sizeof o->rotulo, "%s", openseek_rotulo_compart(&c));
+  }
+  pthread_mutex_unlock(&trava);
+  return v;
+}
+int openseek_compart_ultimo(char *msg, size_t n) {
+  int r;
+  pthread_mutex_lock(&trava);
+  r = compart.ultimo;
+  if (msg && n) snprintf(msg, n, "%s", compart.ultimoMsg);
+  compart.ultimo = 0;
+  pthread_mutex_unlock(&trava);
+  return r;
+}
+typedef struct { int op; long delta; char base[OS_BASE_MAX], pino[OS_PINO_MAX], token[OS_TOKEN_MAX], id[33]; double b; } CompartOp;
+static int compartOcupado;
+static void *compartFio(void *u) {
+  CompartOp *o = u;
+  char url[OS_BASE_MAX + 96], corpo[64];
+  RedeResposta r;
+  int http = 0, ok = 0;
+  long nb = 0;
+  snprintf(url, sizeof url, "%s/v1/previews/%s/%s", o->base, o->id, o->op == 3 ? "reject" : "offset");
+  if (o->op == 1) {
+    nb = openseek_offset_apos(o->b, o->delta);
+    if (!openseek_json_offset(corpo, sizeof corpo, nb)) goto fim;
+    http = chamar("PUT", url, o->token, o->pino, 0, corpo, OS_PRAZO_API_MS, NULL, &r);
+  } else if (o->op == 2) http = chamar("DELETE", url, o->token, o->pino, 0, NULL, OS_PRAZO_API_MS, NULL, &r);
+  else http = chamar("POST", url, o->token, o->pino, 0, "{}", OS_PRAZO_API_MS, NULL, &r);
+  ok = http == 200 || http == 204;
+  rede_resposta_limpar(&r);
+fim:
+  pthread_mutex_lock(&trava);
+  if (ok && !strcmp(compart.id, o->id)) {
+    if (o->op == 1) { compart.b = (double)nb; snprintf(compart.tipo, sizeof compart.tipo, "user_adjusted"); }
+    if (o->op == 3) compart.valido = 0;
+    if (atual && atual->convidado && !strcmp(atual->id, o->id)) {       // a barra passa a usar o VTT novo
+      atual->temVtt = 0;
+      if (o->op != 1) atual->renovar = 1;                              // zerar/rejeitar: procurar de novo (mapeamento e fonte)
+      pthread_cond_broadcast(&sinal);
+    }
+  }
+  compart.ultimo = ok ? 1 : 2;
+  snprintf(compart.ultimoMsg, sizeof compart.ultimoMsg, "%s",
+           ok ? (o->op == 1 ? "Miniaturas ajustadas" : o->op == 2 ? "Ajuste desfeito" : "Correspondência rejeitada")
+              : (http == 401 ? "Acesso revogado ou expirado" : http == 403 ? "Compartilhamento desligado no servidor" : "Não foi possível ajustar"));
+  compartOcupado = 0;
+  pthread_mutex_unlock(&trava);
+  printf("[openseek] shared op=%d http=%d\n", o->op, http); fflush(stdout);
+  zerar(o, sizeof *o); free(o);
+  return NULL;
+}
+static int compartIniciar(int op, long delta) {
+  CompartOp *o;
+  pthread_t fio;
+  openseek_carregar();
+  o = calloc(1, sizeof *o);
+  if (!o) return 0;
+  pthread_mutex_lock(&trava);
+  if (cfgPapel != OS_PAPEL_CONVIDADO || !compart.valido || compartOcupado || !cfgToken[0]) {
+    pthread_mutex_unlock(&trava); free(o); return 0;
+  }
+  o->op = op; o->delta = delta; o->b = compart.b;
+  snprintf(o->base, sizeof o->base, "%s", cfgBase); snprintf(o->pino, sizeof o->pino, "%s", cfgPino);
+  snprintf(o->token, sizeof o->token, "%s", cfgToken); snprintf(o->id, sizeof o->id, "%s", compart.id);
+  compartOcupado = 1;
+  pthread_mutex_unlock(&trava);
+  if (pthread_create(&fio, NULL, compartFio, o) == 0) { pthread_detach(fio); return 1; }
+  pthread_mutex_lock(&trava); compartOcupado = 0; pthread_mutex_unlock(&trava);
+  zerar(o, sizeof *o); free(o);
+  return 0;
+}
+int openseek_compart_ajustar(long deslocaMs) { return compartIniciar(1, deslocaMs); }
+int openseek_compart_zerar(void) { return compartIniciar(2, 0); }
+int openseek_compart_rejeitar(void) { return compartIniciar(3, 0); }
+
 // --- provedor (seekr.h) -------------------------------------------------------------
 static int pTemChave(void) { return openseek_pareado(); }
 static int pEstado(void) { int r; pthread_mutex_lock(&trava); r = estado; pthread_mutex_unlock(&trava); return r; }
@@ -1264,9 +1442,17 @@ static const char *pRotulo(int est) {
   pthread_mutex_lock(&trava); m = motivo; pthread_mutex_unlock(&trava);
   switch (est) {
     case SEEKR_BUSCANDO: return "Preparando miniaturas no OpenSeek";
-    case SEEKR_PRONTO: return "Miniaturas disponíveis";
+    case SEEKR_PRONTO:
+      if (openseek_papel() == OS_PAPEL_CONVIDADO) {
+        OpenSeekCompartInfo ci;
+        if (openseek_compart_info(&ci) && ci.rotulo[0]) return ci.rotulo;
+      }
+      return "Miniaturas disponíveis";
     case SEEKR_SEM_PREVIA:
-      return m == OSM_FONTE ? "O OpenSeek não conseguiu ler este vídeo" : "Este título não tem miniaturas";
+      return m == OSM_FONTE ? "O OpenSeek não conseguiu ler este vídeo" :
+             m == OSM_NAO_COMPARTILHADO ? "Este título não está na biblioteca compartilhada" :
+             m == OSM_COMPARTILHAMENTO_OFF ? "O compartilhamento está desligado no servidor" :
+             "Este título não tem miniaturas";
     case SEEKR_CHAVE_RECUSADA: return "O OpenSeek recusou este aparelho; pareie de novo";
     case SEEKR_LIMITE_PROVEDOR: return "Servidor OpenSeek ocupado";
     case SEEKR_REDE_INDISPONIVEL:
@@ -1303,13 +1489,16 @@ static void pPedir(const SeekrFonte *f) {
   int mesma, novo = 0;
   if (!f || !f->url || strncmp(f->url, "http", 4) || f->durMs <= 0) return;
   if (!openseek_pareado()) return;
+  int conv = openseek_papel() == OS_PAPEL_CONVIDADO;
   pthread_mutex_lock(&trava);
   s = atual;
-  mesma = s && !strcmp(s->url, f->url) && labs(s->durMs - f->durMs) < 2000;
+  mesma = s && (conv ? (s->convidado && !strcmp(s->imdb, f->imdb ? f->imdb : "") && s->t == f->t && s->e == f->e)
+                     : !strcmp(s->url, f->url))
+          && labs(s->durMs - f->durMs) < 2000;
   if (s && !mesma) { pthread_mutex_unlock(&trava); sessaoEncerrar(); pthread_mutex_lock(&trava); s = NULL; }
   if (!s) {
     s = calloc(1, sizeof *s);
-    if (!s || !(s->url = dup(f->url)) || !(s->cabs = dup(f->cabecalhos ? f->cabecalhos : ""))) {
+    if (!s || !(s->url = dup(conv ? "" : f->url)) || !(s->cabs = dup(conv && 1 ? "" : (f->cabecalhos ? f->cabecalhos : "")))) {
       if (s) { free(s->url); free(s); }
       pthread_mutex_unlock(&trava); return;
     }
@@ -1319,7 +1508,7 @@ static void pPedir(const SeekrFonte *f) {
     snprintf(s->imdb, sizeof s->imdb, "%s", f->imdb ? f->imdb : "");
     snprintf(s->hash, sizeof s->hash, "%s", f->videoHash ? f->videoHash : "");
     snprintf(s->arquivo, sizeof s->arquivo, "%s", f->arquivo ? f->arquivo : "");
-    s->durMs = f->durMs; s->t = f->t; s->e = f->e; s->tamanho = f->tamanho;
+    s->durMs = f->durMs; s->t = f->t; s->e = f->e; s->tamanho = f->tamanho; s->convidado = conv;
     s->atMs = -1; s->ultimoQuadrosMs = -1; s->scrubDir = 1;
     s->ultimoPlay = f->playheadMs; s->g = ++geracao;
     s->refs = 1;   // a de `atual`
@@ -1354,20 +1543,22 @@ static void pPedir(const SeekrFonte *f) {
     pthread_t a, b, c, d;
     int comAlt;
     altNovaSessao();
-    comAlt = alt.ligado;
-    s->refs += comAlt ? 4 : 3; s->prioPlayTick = SDL_GetTicks();
+    comAlt = alt.ligado && !conv;                      // convidado: nada de prioridade, telemetria nem fonte alternativa
+    s->refs += conv ? 2 : comAlt ? 4 : 3; s->prioPlayTick = SDL_GetTicks();
     pthread_mutex_unlock(&trava);
     if (pthread_create(&a, NULL, controleFio, s) == 0) pthread_detach(a);
     else { pthread_mutex_lock(&trava); soltarSessao(s); pthread_mutex_unlock(&trava); }
-    if (pthread_create(&b, NULL, prioridadeFio, s) == 0) pthread_detach(b);
-    else { pthread_mutex_lock(&trava); soltarSessao(s); pthread_mutex_unlock(&trava); }
+    if (!conv) {
+      if (pthread_create(&b, NULL, prioridadeFio, s) == 0) pthread_detach(b);
+      else { pthread_mutex_lock(&trava); soltarSessao(s); pthread_mutex_unlock(&trava); }
+    }
     if (pthread_create(&c, NULL, buscaFio, s) == 0) pthread_detach(c);
     else { pthread_mutex_lock(&trava); soltarSessao(s); pthread_mutex_unlock(&trava); }
     if (comAlt) {
       if (pthread_create(&d, NULL, altFio, s) == 0) pthread_detach(d);
       else { pthread_mutex_lock(&trava); soltarSessao(s); pthread_mutex_unlock(&trava); }
     }
-    printf("[openseek] session start\n"); fflush(stdout);
+    printf("[openseek] session start%s\n", conv ? " (shared library)" : ""); fflush(stdout);
     return;
   }
   pthread_mutex_unlock(&trava);

@@ -37,13 +37,35 @@ void openseek_verificar(void);
 void openseek_esquecer(void);
 enum {
   OSU_NAO_CONFIGURADO = 0, OSU_NAO_PAREADO, OSU_PAREANDO, OSU_PAREADO,
-  OSU_SEM_CONEXAO, OSU_FALHOU, OSU_CERTIFICADO, OSU_SEM_SUPORTE, OSU_VERIFICANDO
+  OSU_SEM_CONEXAO, OSU_FALHOU, OSU_CERTIFICADO, OSU_SEM_SUPORTE, OSU_VERIFICANDO,
+  OSU_CONVITE, OSU_REVOGADO, OSU_LIMITE
 };
 // Estado para a linha de status dos Ajustes. `host` recebe so o host (sem
 // porta nem esquema) para "Pareado com <host>".
 int  openseek_status(char *host, size_t n);
 // Rotulo (chave i18n em portugues) de um OSU_*.
 const char *openseek_status_rotulo(int st);
+// --- BIBLIOTECA COMPARTILHADA (aparelho convidado) ---------------------------------
+// `openseek_parear` tambem aceita um CONVITE: a string openseek://join/1?... ou o codigo digitado de 16
+// simbolos (o endereco vem do campo de servidor). O papel guardado vem do servidor ("guest"/"owner").
+// Convidado: o aparelho NUNCA envia a URL do video nem cria trabalho no servidor do dono; pergunta
+// (POST /v1/lookup, so ids + duracao) por miniaturas de outra versao do mesmo titulo e le o VTT pronto.
+// Sem correspondencia: a reproducao segue normal, sem miniaturas.
+int  openseek_papel(void);          // OS_PAPEL_DONO / OS_PAPEL_CONVIDADO
+typedef struct {
+  int  valido;                      // ha uma previa compartilhada conhecida (a do video atual ou a ultima)
+  int  aproximado, verificado;
+  char tipo[24];
+  long offsetMs;                    // b do mapeamento; negativo = miniaturas mais TARDE que o cache
+  char rotulo[112];                 // frase honesta para a tela
+} OpenSeekCompartInfo;
+int  openseek_compart_info(OpenSeekCompartInfo *o);
+// Ajustes so deste aparelho (API de offset por aparelho). deslocaMs > 0: miniaturas mais tarde. Em fio proprio.
+int  openseek_compart_ajustar(long deslocaMs);
+int  openseek_compart_zerar(void);
+int  openseek_compart_rejeitar(void);     // "video errado": esta fonte nao e mais oferecida a este aparelho
+// Resultado da ultima acao (para avisar a pessoa): 0 nada, 1 ok, 2 falhou. `msg` recebe o texto.
+int  openseek_compart_ultimo(char *msg, size_t n);
 // --- FONTE ALTERNATIVA PARA MINIATURAS (opcional; desligada por padrao) ---------
 // Liga com o arquivo "openseek-alt.txt" (conteudo 1) nos dados do app. Chamadas so da
 // thread do player. `atualizar` guarda a saude da reproducao e, quando `play`/`c` vem,

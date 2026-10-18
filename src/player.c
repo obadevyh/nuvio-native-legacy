@@ -4700,6 +4700,11 @@ static void seekrMiniatura(float bx, float bw, float frac, float yBarra, float a
   if (x + tot > bx + bw) x = bx + bw - tot;
   y = yBarra - 24.0f - (10.0f + h + linha);
   plrui_material((GfxRect){ x, y, tot, 10.0f + h + linha }, 26.0f, 0, a);
+  { OpenSeekCompartInfo ci;   // fonte emprestada de outra versao: sempre dizer que e aproximada
+    if (openseek_compart_info(&ci)) {
+      TxtLinha lb = txt_linha(TXT_G18M, ci.rotulo, 243, 242, 239, 200);
+      txt_desenhar_alpha(lb, x + (tot - (float)lb.w) * 0.5f, y - (float)lb.h - 6.0f, a);
+    } }
   if (fita) { xs[0] = x + 10.0f; xs[1] = xs[0] + ws + vao; xs[2] = xs[1] + w + vao; }
   else xs[0] = x + 10.0f;
   for (k = 0; k < n; k++) {

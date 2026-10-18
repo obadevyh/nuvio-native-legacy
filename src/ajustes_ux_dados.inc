@@ -280,7 +280,8 @@ static const char *uxSinonimos(int op) {
     case AJ_SEEKR_LIGADO: case AJ_SEEKR_FITA: case AJ_SEEKR_AJUSTE:
       return "seekr miniatura barra tempo previa avanco retrocesso";
     case AJ_PREVIA_PROVEDOR: case AJ_OPENSEEK_SERVIDOR: case AJ_OPENSEEK_PAREAR: case AJ_OPENSEEK_ESTADO:
-      return "openseek seekr servidor proprio miniatura barra tempo previa parear pareamento nas";
+    case AJ_OPENSEEK_COMPART: case AJ_OPENSEEK_AJ_M30: case AJ_OPENSEEK_AJ_M5: case AJ_OPENSEEK_AJ_M1: case AJ_OPENSEEK_AJ_P1: case AJ_OPENSEEK_AJ_P5: case AJ_OPENSEEK_AJ_P30: case AJ_OPENSEEK_DESFAZER: case AJ_OPENSEEK_REJEITAR:
+      return "openseek convite biblioteca compartilhada convidado ajuste seekr servidor proprio miniatura barra tempo previa parear pareamento nas";
     default: return "";
   }
 }

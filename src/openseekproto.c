@@ -1,4 +1,5 @@
 #include "openseekproto.h"
+#include "osp1.h"
 #include "js.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -354,6 +355,9 @@ int openseek_ler_claim(const char *json, OpenSeekClaim *c) {
       !js_texto_raiz(json, "server_proof", c->prova, sizeof c->prova) || !soHex(c->prova, 64)) {
     memset(c, 0, sizeof *c); return 0;
   }
+  snprintf(c->papel, sizeof c->papel, "owner");
+  js_texto_raiz(json, "role", c->papel, sizeof c->papel);               // ausente (servidor antigo) = dono
+  if (strcmp(c->papel, "owner") && strcmp(c->papel, "guest")) snprintf(c->papel, sizeof c->papel, "owner");
   n = strlen(c->token);
   if (n < 32 || n > 60) { memset(c, 0, sizeof *c); return 0; }
   for (i = 0; i < n; i++)
@@ -606,4 +610,193 @@ int openseek_escolher_prefetch(const SeekrVtt *v, const char (*folhaChaves)[240]
     if (melhorScore == 0) break;
   }
   return melhor;
+}
+
+
+// --- BIBLIOTECA COMPARTILHADA (convidado) ------------------------------------------------
+int openseek_papel_de(const char *t) { return t && !strcmp(t, "guest") ? OS_PAPEL_CONVIDADO : OS_PAPEL_DONO; }
+
+static int hexVal(int c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+// Valor de `chave` na query de uma string de convite, com %XX decodificado. 1 se achou e coube.
+static int queryValor(const char *q, const char *chave, char *dst, size_t n) {
+  size_t k = strlen(chave);
+  const char *p = q;
+  dst[0] = 0;
+  while (p && *p) {
+    const char *fim = strchr(p, '&');
+    size_t len = fim ? (size_t)(fim - p) : strlen(p), j = 0, i;
+    if (len > k && !strncmp(p, chave, k) && p[k] == '=') {
+      for (i = k + 1; i < len; i++) {
+        int c = (unsigned char)p[i];
+        if (c == '%' && i + 2 < len + 0 && hexVal(p[i + 1]) >= 0 && hexVal(p[i + 2]) >= 0) {
+          c = hexVal(p[i + 1]) * 16 + hexVal(p[i + 2]); i += 2;
+        }
+        if (j + 1 >= n) { dst[0] = 0; return 0; }
+        dst[j++] = (char)c;
+      }
+      dst[j] = 0;
+      return 1;
+    }
+    p = fim ? fim + 1 : NULL;
+  }
+  return 0;
+}
+int openseek_ler_entrada(const char *texto, OpenSeekEntrada *e) {
+  static const char PREF[] = "openseek://join/1?";
+  char tag[OSP1_CONVITE_TAG + 1], seg[OSP1_CONVITE_SEGREDO + 1], c8[OSP1_CODE_LEN + 1], h[OS_BASE_MAX], tmp[OS_BASE_MAX];
+  if (!e) return 0;
+  memset(e, 0, sizeof *e);
+  if (!texto) return 0;
+  while (*texto == ' ' || *texto == '\t') texto++;
+  if (!strncmp(texto, PREF, sizeof PREF - 1)) {
+    const char *q = texto + sizeof PREF - 1;
+    char id[64], c[40], p[OS_PINO_MAX + 8];
+    if (strlen(q) > 600) return 0;
+    if (!queryValor(q, "i", id, sizeof id) || !soHex(id, 32)) return 0;
+    if (!queryValor(q, "c", c, sizeof c)) return 0;
+    {                                                                          // o segredo da string tem 12 simbolos (com tracos)
+      char junto[48 + 8];
+      if (strlen(c) > 40) return 0;
+      snprintf(junto, sizeof junto, "AAAA%s", c);
+      if (!osp1_normalizar_convite(junto, tag, seg)) return 0;
+    }
+    if (queryValor(q, "h", h, sizeof h) && h[0]) {
+      if (!openseek_normalizar_endereco(h, tmp, sizeof tmp)) return 0;
+      snprintf(e->base, sizeof e->base, "%s", tmp);
+    }
+    if (queryValor(q, "p", p, sizeof p) && p[0]) {
+      if (strlen(p) >= sizeof e->pino || !rede_pino_valido(p) || strchr(p, ';')) return 0;
+      snprintf(e->pino, sizeof e->pino, "%s", p);
+    }
+    if (strlen(id) >= sizeof e->convite) return 0;
+    snprintf(e->convite, sizeof e->convite, "%s", id);
+    snprintf(e->segredo, sizeof e->segredo, "%s", seg);
+    e->forma = 2;
+    return 1;
+  }
+  if (osp1_normalizar_convite(texto, tag, seg)) {                              // codigo digitado: etiqueta + segredo
+    snprintf(e->convite, sizeof e->convite, "%s", tag);
+    snprintf(e->segredo, sizeof e->segredo, "%s", seg);
+    e->forma = 2;
+    return 1;
+  }
+  if (osp1_normalizar_codigo(texto, c8)) {                                     // codigo de 8 da janela do dono
+    snprintf(e->segredo, sizeof e->segredo, "%s", c8);
+    e->forma = 1;
+    return 1;
+  }
+  return 0;
+}
+
+size_t openseek_json_start(char *dst, size_t n, const char *convite) {
+  Buf b = { dst, n, 0, 1 };
+  if (!dst || n < 4) return 0;
+  if (!convite || !*convite) { bTxt(&b, "{}"); }
+  else {
+    size_t i;
+    for (i = 0; convite[i]; i++)
+      if (!isalnum((unsigned char)convite[i])) { dst[0] = 0; return 0; }     // so id hex ou etiqueta: nada a escapar
+    bTxt(&b, "{\"invite\":"); bStr(&b, convite, strlen(convite)); bTxt(&b, "}");
+  }
+  if (!b.ok) { dst[0] = 0; return 0; }
+  dst[b.k] = 0;
+  return b.k;
+}
+
+static int imdbValido(const char *s) {
+  size_t i, n;
+  if (!s || s[0] != 't' || s[1] != 't') return 0;
+  n = strlen(s);
+  if (n < 3 || n > 12) return 0;
+  for (i = 2; i < n; i++) if (s[i] < '0' || s[i] > '9') return 0;
+  return 1;
+}
+size_t openseek_json_procura(char *dst, size_t n, const char *imdb, int t, int e, long durMs,
+                             unsigned long long tamanho) {
+  Buf b = { dst, n, 0, 1 };
+  if (!dst || n < 8 || !imdbValido(imdb) || durMs <= 0) { if (dst && n) dst[0] = 0; return 0; }
+  bTxt(&b, "{\"imdb_id\":"); bStr(&b, imdb, strlen(imdb));
+  bFmt(&b, ",\"season\":%lld", t > 0 ? (long long)t : 0LL);
+  bFmt(&b, ",\"episode\":%lld", e > 0 ? (long long)e : 0LL);
+  bFmt(&b, ",\"duration_ms\":%lld", (long long)durMs);
+  if (tamanho > 0 && tamanho < 0x7fffffffffffffffULL) bFmt(&b, ",\"size_bytes\":%lld", (long long)tamanho);
+  bTxt(&b, ",\"layout\":\"hybrid\"}");
+  if (!b.ok) { dst[0] = 0; return 0; }
+  dst[b.k] = 0;
+  return b.k;
+}
+
+size_t openseek_json_offset(char *dst, size_t n, long offsetMs) {
+  Buf b = { dst, n, 0, 1 };
+  if (!dst || n < 8 || offsetMs < -21600000L || offsetMs > 21600000L) { if (dst && n) dst[0] = 0; return 0; }
+  bFmt(&b, "{\"offset_ms\":%lld}", (long long)offsetMs);
+  if (!b.ok) { dst[0] = 0; return 0; }
+  dst[b.k] = 0;
+  return b.k;
+}
+
+static int jsBooleano(const char *ini, const char *fim, const char *chave) {   // 1 so para true
+  char pad[48];
+  const char *p;
+  snprintf(pad, sizeof pad, "\"%s\":", chave);
+  p = strstr(ini, pad);
+  if (!p || (fim && p >= fim)) return 0;
+  p += strlen(pad);
+  while (*p == ' ') p++;
+  return !strncmp(p, "true", 4);
+}
+int openseek_ler_procura(const char *json, const char *base, OpenSeekCompart *c) {
+  const char *el, *fim;
+  char sub[200];
+  int n = 0;
+  double v;
+  if (!json || !base || !c) return 0;
+  memset(c, 0, sizeof *c);
+  el = js_array(json, NULL, "candidates");
+  if (!el || *el != '{') return 0;
+  fim = js_fim(el);
+  if (!fim) return 0;
+  for (const char *q = el; q; q = js_prox(js_fim(q))) { if (*q != '{') break; n++; if (n > 8) break; }
+  c->nCandidatos = n;
+  if (!js_texto(el, fim, "preview_id", c->id, sizeof c->id) || !soHex(c->id, 32)) { memset(c, 0, sizeof *c); return 0; }
+  if (!js_texto(el, fim, "vtt_url", c->vtt, sizeof c->vtt) || !openseek_na_origem(c->vtt, base)) {
+    memset(c, 0, sizeof *c); return 0;
+  }
+  c->exp = openseek_url_exp(c->vtt);
+  js_texto(el, fim, "kind", c->tipo, sizeof c->tipo);
+  c->verificado = jsBooleano(el, fim, "verified");
+  c->aproximado = !(c->verificado && !jsBooleano(el, fim, "approximate"));     // nunca "exato" por omissao
+  if (js_bruto(el, fim, "mapping", sub, sizeof sub)) {
+    c->a = js_num(sub, NULL, "a", 1.0);
+    c->b = js_num(sub, NULL, "b", 0.0);
+  } else c->a = 1.0;
+  if (!(c->a > 0.5 && c->a < 2.0) || c->b < -2.2e7 || c->b > 2.2e7) { memset(c, 0, sizeof *c); return 0; }
+  if (js_bruto(el, fim, "source", sub, sizeof sub)) {
+    v = js_num(sub, NULL, "duration_ms", 0); c->fonteMs = v > 0 && v < 1e10 ? (long)v : 0;
+    v = js_num(sub, NULL, "tiles", 0);       c->tiles = v > 0 && v < 1e7 ? (long)v : 0;
+    v = js_num(sub, NULL, "n_tiles", 0);     c->nTiles = v > 0 && v < 1e7 ? (long)v : 0;
+  }
+  return 1;
+}
+
+const char *openseek_rotulo_compart(const OpenSeekCompart *c) {
+  if (!c || !c->id[0]) return "";
+  if (!strcmp(c->tipo, "user_adjusted")) return "Miniaturas compartilhadas, ajustadas por você";
+  if (c->verificado && !c->aproximado) return "Miniaturas compartilhadas, verificadas";
+  if (!strcmp(c->tipo, "same_length")) return "Miniaturas compartilhadas de outra versão (aproximadas)";
+  if (!strcmp(c->tipo, "speed_adjusted")) return "Miniaturas compartilhadas, ajustadas à velocidade (aproximadas)";
+  return "Miniaturas compartilhadas de outra versão (aproximadas; pode ser preciso ajustar)";
+}
+
+long openseek_offset_apos(double b, long deslocaMs) {
+  // t_cache = a * t_convidado + b; miniaturas MAIS TARDE no convidado = b menor.
+  double nb = b - (double)deslocaMs;
+  if (nb < -21600000.0) nb = -21600000.0;
+  if (nb > 21600000.0) nb = 21600000.0;
+  return (long)(nb < 0 ? nb - 0.5 : nb + 0.5);
 }
