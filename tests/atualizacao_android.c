@@ -11,25 +11,28 @@ int android_instalar_apk(const char *c) { (void)c; return 0; }
 static int falhas = 0;
 #define CONFERE(c, ...) do { if (!(c)) { falhas++; printf("FALHA: " __VA_ARGS__); printf("\n"); } } while (0)
 
+#define REPO "https://github.com/Tolu-Walop-E/nuvio-native-legacy/releases/download/v1.7.0/"
 #define ASSET(nome, dig) "{\"name\":\"" nome "\",\"size\":1,\"digest\":\"sha256:" dig "\",\"download_count\":0," \
-  "\"browser_download_url\":\"https://x/" nome "\"}"
+  "\"browser_download_url\":\"" REPO nome "\"}"
 
 int main(void) {
   char url[512], hash[80];
   const char *rel = "{\"assets\":["
-    ASSET("Nuvio-1.7.0-android-debug.apk", "aaaa") ","
-    ASSET("Nuvio-1.7.0-android-preview.2.apk", "bbbb") ","
+    ASSET("Nuvio-1.7.0-android.apk", "aaaa") ","
+    ASSET("Nuvio-1.7.0-sharing-debug.apk", "bbbb") ","
     ASSET("Nuvio-1.7.0_arm.ipk", "cccc") ","
-    ASSET("Nuvio-1.7.0-android.apk", "dddd") ","
+    ASSET("Nuvio-1.7.0-sharing.apk", "dddd") ","
     ASSET("Nuvio-1.7.0-tpk-arm.so", "eeee") "]}";
-  CONFERE(acharApk(rel, url, sizeof url, hash, sizeof hash), "achou o -android.apk");
-  CONFERE(!strcmp(url, "https://x/Nuvio-1.7.0-android.apk"), "url certa: [%s]", url);
+  CONFERE(acharApk(rel, url, sizeof url, hash, sizeof hash), "achou o -sharing.apk");
+  CONFERE(!strcmp(url, REPO "Nuvio-1.7.0-sharing.apk"), "url certa: [%s]", url);
   CONFERE(!strcmp(hash, "dddd"), "digest do MESMO anexo: [%s]", hash);
-  CONFERE(!acharApk("{\"assets\":[" ASSET("Nuvio-1-android-debug.apk", "aa") "," ASSET("Nuvio-1-android-preview.1.apk", "bb") "]}",
-                    url, sizeof url, hash, sizeof hash), "debug e preview nao casam");
+  CONFERE(!acharApk("{\"assets\":[" ASSET("Nuvio-1-android.apk", "aa") "," ASSET("Nuvio-1-sharing-debug.apk", "bb") "]}",
+                    url, sizeof url, hash, sizeof hash), "outro flavour e debug nao casam");
   CONFERE(url[0] == 0 && hash[0] == 0, "e saem vazios");
-  CONFERE(!acharApk("{\"assets\":[{\"browser_download_url\":\"https://x/Nuvio-1-android.apk\"}]}",
+  CONFERE(!acharApk("{\"assets\":[{\"browser_download_url\":\"" REPO "Nuvio-1-sharing.apk\"}]}",
                     url, sizeof url, hash, sizeof hash), "sem digest nao casa");
+  CONFERE(!acharApk("{\"assets\":[{\"digest\":\"sha256:ab\",\"browser_download_url\":\"https://evil.example/Nuvio-1-sharing.apk\"}]}",
+                    url, sizeof url, hash, sizeof hash), "origem fora do repositorio nao casa");
   CONFERE(!acharApk("{\"assets\":[]}", url, sizeof url, hash, sizeof hash), "sem anexo devolve 0");
   printf(falhas ? "atualizacao_android: %d FALHA(S)\n" : "atualizacao_android: ok\n", falhas);
   return falhas != 0;
