@@ -87,6 +87,16 @@ int main(int argc, char **argv) {
     printf("%ld\n", openseek_offset_apos(atof(argv[2]), atol(argv[3])));
     return 0;
   }
+  if (!strcmp(c, "contribute-body") && argc == 8) {      // url cabecalhos imdb t e durMs
+    OpenSeekFonte f = { argv[2], argv[3], atol(argv[7]), argv[4], atoi(argv[5]), atoi(argv[6]), 0, "", "", 0, -1 };
+    if (!openseek_json_contribuir(out, sizeof out, &f)) { puts("refused"); return 0; }
+    puts(out);
+    return 0;
+  }
+  if (!strcmp(c, "can-contribute") && argc == 3) {
+    puts(openseek_ler_pode_contribuir(argv[2]) ? "yes" : "no");
+    return 0;
+  }
   fputs("uso invalido\n", stderr);
   return 2;
 }

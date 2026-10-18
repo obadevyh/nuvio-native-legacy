@@ -750,6 +750,48 @@ size_t openseek_json_procura(char *dst, size_t n, const char *imdb, int t, int e
   return b.k;
 }
 
+size_t openseek_json_contribuir(char *dst, size_t n, const OpenSeekFonte *f) {
+  Buf b = { dst, n, 0, 1 };
+  int primeiro = 1;
+  if (!dst || n < 2 || !f || !f->url || strncmp(f->url, "https://", 8) || !imdbValido(f->imdb) || f->durMs < 60000) {
+    if (dst && n) dst[0] = 0;
+    return 0;
+  }
+  dst[0] = 0;
+  bTxt(&b, "{\"source\":{\"url\":");
+  bStr(&b, f->url, strlen(f->url));
+  bTxt(&b, ",\"headers\":{");
+  for (int k = 0; k < 3; k++) {                         // a mesma lista de cabecalhos permitidos do POST /v1/previews
+    const char *l = f->cabecalhos;
+    size_t nome = strlen(CABS_OK[k]);
+    while (l && *l) {
+      const char *fim = l + strcspn(l, "\n");
+      if ((size_t)(fim - l) > nome && !strncasecmp(l, CABS_OK[k], nome) && l[nome] == ':') {
+        const char *v = l + nome + 1, *vf = fim;
+        while (v < vf && (*v == ' ' || *v == '\t')) v++;
+        while (vf > v && (vf[-1] == '\r' || vf[-1] == ' ' || vf[-1] == '\t')) vf--;
+        if (vf > v) {
+          if (!primeiro) bTxt(&b, ",");
+          bStr(&b, CABS_OK[k], nome); bTxt(&b, ":"); bStr(&b, v, (size_t)(vf - v));
+          primeiro = 0;
+          break;
+        }
+      }
+      l = *fim ? fim + 1 : fim;
+    }
+  }
+  bTxt(&b, "}},\"imdb_id\":"); bStr(&b, f->imdb, strcspn(f->imdb, ":"));
+  bFmt(&b, ",\"season\":%lld", f->temporada > 0 ? (long long)f->temporada : 0LL);
+  bFmt(&b, ",\"episode\":%lld", f->episodio > 0 ? (long long)f->episodio : 0LL);
+  bFmt(&b, ",\"duration_ms\":%lld}", (long long)f->durMs);
+  if (!b.ok || b.k > 16384) { dst[0] = 0; return 0; }
+  return b.k;
+}
+
+int openseek_ler_pode_contribuir(const char *json) {
+  return json && (strstr(json, "\"contribute\":true") || strstr(json, "\"contribute\": true"));
+}
+
 size_t openseek_json_offset(char *dst, size_t n, long offsetMs) {
   Buf b = { dst, n, 0, 1 };
   if (!dst || n < 8 || offsetMs < -21600000L || offsetMs > 21600000L) { if (dst && n) dst[0] = 0; return 0; }

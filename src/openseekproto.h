@@ -32,7 +32,7 @@ enum {
 enum {
   OSM_NENHUM = 0, OSM_REDE, OSM_PINO_MUDOU, OSM_SEM_PINO, OSM_RECUSADO,
   OSM_OCUPADO, OSM_FONTE, OSM_EXPIRADO, OSM_PREPARANDO, OSM_NAO_PAREADO,
-  OSM_NAO_COMPARTILHADO, OSM_COMPARTILHAMENTO_OFF
+  OSM_NAO_COMPARTILHADO, OSM_COMPARTILHAMENTO_OFF, OSM_CONTRIBUINDO, OSM_OCUPADO_CONTRIB
 };
 enum { OS_PREPARANDO = 1, OS_PRONTO, OS_COMPLETO, OS_FALHOU };
 
@@ -149,6 +149,12 @@ typedef struct {
 int  openseek_ler_procura(const char *json, const char *base, OpenSeekCompart *c);
 // Legenda curta, honesta, para a tela (nunca chama de "verificada" o que e so metadado).
 const char *openseek_rotulo_compart(const OpenSeekCompart *c);
+// CONTRIBUINTE (guest com permissao do dono): quando o titulo NAO esta na biblioteca, o aparelho entrega o link do video
+// ao servidor do dono (POST /v1/contribute, TLS fixado) para que as miniaturas sejam geradas uma vez para todos. Corpo:
+// source{url,headers (so User-Agent/Referer/Origin)}, imdb_id, season, episode, duration_ms. 0 se faltar id tt ou duracao.
+size_t openseek_json_contribuir(char *dst, size_t n, const OpenSeekFonte *f);
+// 1 quando GET /v1/pair/status diz que ESTE aparelho pode contribuir agora ("contribute":true).
+int  openseek_ler_pode_contribuir(const char *json);
 // Novo valor de b (ms) ao deslocar as miniaturas `deslocaMs` para MAIS TARDE na linha do tempo do convidado
 // (positivo = depois). Limitado a +-6 h.
 long openseek_offset_apos(double b, long deslocaMs);

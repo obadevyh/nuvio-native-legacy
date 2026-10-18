@@ -108,6 +108,23 @@ int main(void) {
   CHECK(openseek_offset_apos(0.0, 99999999L) == -21600000L && openseek_offset_apos(0.0, -99999999L) == 21600000L);
   CHECK(openseek_offset_apos(0.4, 0) == 0 && openseek_offset_apos(-0.4, 0) == 0);
 
+  // 10. CONTRIBUINTE: o corpo leva so link https, cabecalhos permitidos, ids e duracao; recusa o que nao serve
+  {
+    char c[1024];
+    const char *cabs = "User-Agent: Nuvio\nCookie: SEGREDO\nReferer: https://ref.example/\nAuthorization: Bearer ABC";
+    OpenSeekFonte f = { "https://store.torbox.app/dl/x.mkv?token=TT", cabs, 1462462, "tt0994314", 1, 2, 123, "", "", 0, -1 };
+    CHECK(openseek_json_contribuir(c, sizeof c, &f) > 0);
+    CHECK(strstr(c, "\"url\":\"https://store.torbox.app/dl/x.mkv?token=TT\"") && strstr(c, "\"imdb_id\":\"tt0994314\""));
+    CHECK(strstr(c, "\"season\":1") && strstr(c, "\"episode\":2") && strstr(c, "\"duration_ms\":1462462"));
+    CHECK(strstr(c, "User-Agent") && strstr(c, "Referer") && !strstr(c, "Cookie") && !strstr(c, "Authorization") && !strstr(c, "SEGREDO"));
+    CHECK(!strstr(c, "video_hash") && !strstr(c, "filename") && !strstr(c, "playhead"));
+    f.url = "http://store.torbox.app/x.mkv"; CHECK(openseek_json_contribuir(c, sizeof c, &f) == 0 && c[0] == 0);        // so https
+    f.url = "https://store.torbox.app/x.mkv"; f.imdb = "kitsu:41370"; CHECK(openseek_json_contribuir(c, sizeof c, &f) == 0);   // sem id tt
+    f.imdb = "tt0994314"; f.durMs = 1000; CHECK(openseek_json_contribuir(c, sizeof c, &f) == 0);                          // duracao real
+    CHECK(openseek_ler_pode_contribuir("{\"device_id\":\"a\",\"device_name\":\"n\",\"contribute\":true}"));
+    CHECK(!openseek_ler_pode_contribuir("{\"device_id\":\"a\",\"contribute\":false}") && !openseek_ler_pode_contribuir("{\"device_id\":\"a\"}") && !openseek_ler_pode_contribuir(NULL));
+  }
+
   if (falhas) { printf("openseek_guest: %d falha(s)\n", falhas); return 1; }
   printf("openseek_guest: ok\n");
   return 0;

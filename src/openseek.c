@@ -382,7 +382,8 @@ typedef struct Sessao {
   char *url, *cabs;         // SEGREDOS: so no corpo do POST
   long durMs;
   char imdb[32], hash[24], arquivo[256];
-  int t, e, convidado;      // convidado: nunca ha URL de video nem trabalho neste servidor
+  int t, e, convidado;      // convidado: nunca ha URL de video nem trabalho neste servidor ...
+  int naoCompart, querUrl, contribuindo;   // ... a nao ser que o DONO autorize ESTE aparelho a contribuir (querUrl copia o link so entao)
   unsigned long long tamanho;
   // dinamico (trava)
   long playheadMs, atMs, ultimoPlay, ultimoQuadrosMs;
@@ -769,6 +770,7 @@ static int procurarCompart(Sessao *s) {
       ok = 1; retryUtc = 0;
     } else if (http == 404) {            // nada compativel na biblioteca (ainda): a reproducao segue normal
       compart.valido = 0;
+      s->naoCompart = 1;
       definirEstado(s, SEEKR_SEM_PREVIA, OSM_NAO_COMPARTILHADO);
       retryUtc = (long long)time(NULL) + 120;
     } else if (http == 403) {            // compartilhamento desligado no servidor do dono
@@ -785,6 +787,63 @@ static int procurarCompart(Sessao *s) {
   rede_resposta_limpar(&r);
   if (ok) return 1;
   return http == 401 || http == 400 ? -1 : 0;
+}
+
+// CONTRIBUINTE: o titulo nao esta na biblioteca e o dono autorizou ESTE aparelho. Pergunta a permissao viva (GET /v1/pair/status),
+// pega o link so agora (querUrl) e o entrega ao servidor do dono, que gera as miniaturas uma vez para todos.
+// 1 = trabalho em andamento, 0 = tentar depois, -1 = parar.
+static int contribuirCriar(Sessao *s) {
+  char url[OS_BASE_MAX + 32], *corpo;
+  OpenSeekFonte f;
+  OpenSeekPrevia p;
+  RedeResposta r;
+  int http, ok = 0, leu, pode;
+  if (!s->naoCompart) return 0;
+  snprintf(url, sizeof url, "%s/v1/pair/status", s->base);
+  http = chamar(NULL, url, s->token, s->pino, 0, NULL, OS_PRAZO_API_MS, &s->fim, &r);
+  pode = http == 200 && r.corpo && openseek_ler_pode_contribuir(r.corpo);
+  rede_resposta_limpar(&r);
+  if (!pode) return 0;                                    // leitor: nada e enviado, nunca
+  pthread_mutex_lock(&trava);
+  s->querUrl = 1;
+  for (int i = 0; i < 50 && !s->fim && !(s->url && s->url[0]); i++) esperar(s, 100);   // pPedir() copia o link
+  corpo = malloc(16385);
+  if (!corpo || !s->url || !s->url[0]) { pthread_mutex_unlock(&trava); free(corpo); return 0; }
+  f = (OpenSeekFonte){ s->url, s->cabs, s->durMs, s->imdb, s->t, s->e, s->tamanho, s->hash, s->arquivo, 0, -1 };
+  if (!openseek_json_contribuir(corpo, 16385, &f)) corpo[0] = 0;
+  pthread_mutex_unlock(&trava);
+  if (!corpo[0]) { zerar(corpo, 16385); free(corpo); return 0; }      // sem id tt / link https: nada a contribuir
+  snprintf(url, sizeof url, "%s/v1/contribute", s->base);
+  http = chamar("POST", url, s->token, s->pino, 0, corpo, OS_PRAZO_API_MS, &s->fim, &r);
+  zerar(corpo, 16385); free(corpo);
+  leu = http == 202 && r.corpo && openseek_ler_previa(r.corpo, s->base, &p);
+  pthread_mutex_lock(&trava);
+  if (s == atual) {
+    if (leu) {
+      snprintf(s->id, sizeof s->id, "%s", p.id);
+      snprintf(s->vttUrl, sizeof s->vttUrl, "%s", p.vtt);
+      s->exp = p.exp; s->jobEstado = p.estado; s->renovar = 0; s->contribuindo = 1; s->temVtt = 0;
+      if (p.versao > s->versaoServidor) s->versaoServidor = p.versao;
+      compart.valido = 0;
+      definirEstado(s, SEEKR_BUSCANDO, OSM_CONTRIBUINDO);
+      retryUtc = 0; ok = 1;
+    } else if (http == 200) {                              // ja havia uma versao compativel na biblioteca: a procura a acha
+      retryUtc = (long long)time(NULL) + 1;
+    } else if (http == 429) {
+      definirEstado(s, SEEKR_SEM_PREVIA, OSM_OCUPADO_CONTRIB);
+      retryUtc = (long long)time(NULL) + (r.retry_after_s > 0 ? r.retry_after_s : 60);
+    } else if (http == 403) {                              // sem permissao agora, ou o servidor recusou esta fonte
+      definirEstado(s, SEEKR_SEM_PREVIA, OSM_NAO_COMPARTILHADO);
+      retryUtc = (long long)time(NULL) + 600;
+    } else {
+      retryUtc = (long long)time(NULL) + 60;
+    }
+  }
+  pthread_mutex_unlock(&trava);
+  printf("[openseek] contribute http=%d ok=%d\n", http, ok); fflush(stdout);
+  rede_resposta_limpar(&r);
+  if (ok) return 1;
+  return http == 401 ? -1 : 0;
 }
 
 static int baixarVtt(Sessao *s) {
@@ -823,14 +882,15 @@ static int baixarVtt(Sessao *s) {
   return http == 200;
 }
 
+static const char *rotaPrevia(const Sessao *s) { return s->contribuindo ? "contribute" : "previews"; }
 static void consultarStatus(Sessao *s, int longo) {
   char url[OS_BASE_MAX + 96];
   OpenSeekPrevia p;
   RedeResposta r;
   int http, leu;
   pthread_mutex_lock(&trava);
-  if (longo) snprintf(url, sizeof url, "%s/v1/previews/%s?wait_version=%ld&wait_ms=500", s->base, s->id, s->versaoServidor);
-  else snprintf(url, sizeof url, "%s/v1/previews/%s", s->base, s->id);
+  if (longo && !s->contribuindo) snprintf(url, sizeof url, "%s/v1/previews/%s?wait_version=%ld&wait_ms=500", s->base, s->id, s->versaoServidor);
+  else snprintf(url, sizeof url, "%s/v1/%s/%s", s->base, rotaPrevia(s), s->id);
   pthread_mutex_unlock(&trava);
   http = chamar(NULL, url, s->token, s->pino, 0, NULL, OS_PRAZO_API_MS, &s->fim, &r);
   leu = http == 200 && r.corpo && openseek_ler_previa(r.corpo, s->base, &p);
@@ -873,6 +933,7 @@ static void *controleFio(void *u) {
     pthread_mutex_unlock(&trava);
     if (s->fim) break;
     int r = s->convidado ? procurarCompart(s) : criarTrabalho(s);
+    if (s->convidado && r == 0 && !s->contribuindo) { int c = contribuirCriar(s); if (c != 0) r = c; }
     if (r < 0) break;
     if (r == 0) {
       unsigned espera = 30000;
@@ -1445,7 +1506,7 @@ static const char *pRotulo(int est) {
   int m;
   pthread_mutex_lock(&trava); m = motivo; pthread_mutex_unlock(&trava);
   switch (est) {
-    case SEEKR_BUSCANDO: return "Preparando miniaturas no OpenSeek";
+    case SEEKR_BUSCANDO: return m == OSM_CONTRIBUINDO ? "Título novo: o servidor está gerando as miniaturas (você contribui)" : "Preparando miniaturas no OpenSeek";
     case SEEKR_PRONTO:
       if (openseek_papel() == OS_PAPEL_CONVIDADO) {
         OpenSeekCompartInfo ci;
@@ -1456,6 +1517,7 @@ static const char *pRotulo(int est) {
       return m == OSM_FONTE ? "O OpenSeek não conseguiu ler este vídeo" :
              m == OSM_NAO_COMPARTILHADO ? "Este título não está na biblioteca compartilhada" :
              m == OSM_COMPARTILHAMENTO_OFF ? "O compartilhamento está desligado no servidor" :
+             m == OSM_OCUPADO_CONTRIB ? "O servidor está ocupado com outra contribuição; tente de novo em instantes" :
              "Este título não tem miniaturas";
     case SEEKR_CHAVE_RECUSADA: return "O OpenSeek recusou este aparelho; pareie de novo";
     case SEEKR_LIMITE_PROVEDOR: return "Servidor OpenSeek ocupado";
@@ -1527,6 +1589,10 @@ static void pPedir(const SeekrFonte *f) {
   }
   s->ultimoPlay = f->playheadMs;
   s->playheadMs = f->playheadMs;
+  if (s->convidado && s->querUrl && s->url && !s->url[0] && f->url && !strncmp(f->url, "https://", 8)) {   // so a contribuinte autorizado, so depois da procura
+    char *u = dup(f->url), *c = dup(f->cabecalhos ? f->cabecalhos : "");
+    if (u && c) { free(s->url); free(s->cabs); s->url = u; s->cabs = c; } else { free(u); free(c); }
+  }
   if (!s->iniciar && (f->scrubbing || s->jogadoMs >= OS_INICIO_MS)) { s->iniciar = 1; pthread_cond_broadcast(&sinal); }
   // Prioridade: o alvo do avanco (ultimo vence) e o fim do avanco (null).
   if (f->scrubbing && (!s->scrubbing || labs(f->posMs - s->atMs) >= 1)) {
