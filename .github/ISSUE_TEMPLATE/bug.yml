@@ -1,0 +1,44 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - LG webOS (.ipk)
+        - Samsung Tizen (.wgt)
+        - Samsung Tizen native (.tpk)
+        - Android TV / Google TV (.apk)
+        - Hisense VIDAA
+    validations:
+      required: true
+  - type: input
+    id: tv
+    attributes:
+      label: TV model and system version
+      placeholder: "e.g. LG OLED65C9, webOS 4.10 / Samsung QE55Q60A, Tizen 6.0 / NVIDIA Shield, Android 11"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Nuvio version
+      description: Settings › About shows it.
+      placeholder: "e.g. 1.5.3 (high cache)"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened and what you expected
+      description: Steps to reproduce help a lot. A photo or short video of the screen is welcome.
+    validations:
+      required: true
+  - type: input
+    id: log
+    attributes:
+      label: Log
+      description: Right after it happens, use Settings › Account › Send log and write the time here.
+      placeholder: "e.g. sent at 21:40"

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: How to install
+    url: https://github.com/iqui27/nuvio-native-legacy/blob/master/INSTALL.md
+    about: Installation steps for LG, Samsung and VIDAA.
