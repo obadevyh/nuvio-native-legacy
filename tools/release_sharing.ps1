@@ -121,8 +121,12 @@ if (-not $a) { gh release delete $tag --repo $Repo --yes | Out-Null; Fail "asset
 Step "6/8 verify what GitHub holds"
 $remote = ($a.digest -replace '^sha256:', '').ToLower()
 if ($remote -ne $sha) { gh release delete $tag --repo $Repo --yes | Out-Null; Fail "GitHub's digest ($remote) differs from the local file ($sha); draft deleted" }
-$tmp = Join-Path $env:TEMP "nuvio-release-check.apk"
-gh api -H "Accept: application/octet-stream" "repos/$Repo/releases/assets/$($a.id)" > $tmp
+# download with gh itself: PowerShell 5.1's ">" re-encodes output as text and would corrupt a binary file
+$tmpDir = Join-Path $env:TEMP "nuvio-release-check"
+Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+New-Item -ItemType Directory $tmpDir | Out-Null
+gh release download $tag --repo $Repo --pattern "Nuvio-$Version-sharing.apk" --dir $tmpDir | Out-Null
+$tmp = Join-Path $tmpDir "Nuvio-$Version-sharing.apk"
 if ((Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower() -ne $sha) { gh release delete $tag --repo $Repo --yes | Out-Null; Fail "re-downloaded asset differs; draft deleted" }
 Remove-Item $tmp -Force
 Write-Host "  asset digest and a fresh download both equal the local SHA-256"
