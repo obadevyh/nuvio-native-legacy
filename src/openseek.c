@@ -24,6 +24,7 @@
 #include "gfx.h"
 #include "jpegrapido.h"
 #include "perfisessao.h"
+#include "idbase.h"
 #include <SDL2/SDL.h>
 #ifndef __EMSCRIPTEN__
 #include <SDL2/SDL_image.h>
@@ -950,7 +951,7 @@ static void imdbDaSessao(Sessao *s) {
   char id[64], tt[32];
   int serie;
   pthread_mutex_lock(&trava);
-  snprintf(id, sizeof id, "%s", s->idOrig);
+  idbase_copiar(s->idOrig, id, sizeof id);
   serie = s->t > 0 || s->e > 0;
   pthread_mutex_unlock(&trava);
   if (!id[0] || (id[0] == 't' && id[1] == 't') || !desc_imdb_para) return;
@@ -1622,7 +1623,10 @@ static void pPedir(const SeekrFonte *f) {
     snprintf(s->base, sizeof s->base, "%s", cfgBase);
     snprintf(s->pino, sizeof s->pino, "%s", cfgPino);
     snprintf(s->token, sizeof s->token, "%s", cfgToken);
-    snprintf(s->imdb, sizeof s->imdb, "%s", f->imdb ? f->imdb : "");
+    // The player's id can carry the episode ("tt0098844:1:5", "tmdb:2734:1:5"); season and episode travel on their
+    // own, and the server's ids are the title's only. Taken whole, the guest's lookup refused every episode before
+    // asking: "not in the shared library" for all series.
+    idbase_copiar(f->imdb ? f->imdb : "", s->imdb, sizeof s->imdb);
     snprintf(s->idOrig, sizeof s->idOrig, "%s", f->imdb ? f->imdb : "");
     snprintf(s->hash, sizeof s->hash, "%s", f->videoHash ? f->videoHash : "");
     snprintf(s->arquivo, sizeof s->arquivo, "%s", f->arquivo ? f->arquivo : "");
