@@ -23,6 +23,7 @@
 #include "dados.h"
 #include "gfx.h"
 #include "jpegrapido.h"
+#include "perfisessao.h"
 #include <SDL2/SDL.h>
 #ifndef __EMSCRIPTEN__
 #include <SDL2/SDL_image.h>
@@ -382,6 +383,7 @@ typedef struct Sessao {
   char *url, *cabs;         // SEGREDOS: so no corpo do POST
   long durMs;
   char imdb[32], hash[24], arquivo[256];
+  char idOrig[64];   // the id the player gave (tmdb:2734...): `imdb` becomes its IMDb id for the server
   int t, e, convidado;      // convidado: nunca ha URL de video nem trabalho neste servidor ...
   int naoCompart, querUrl, contribuindo;   // ... a nao ser que o DONO autorize ESTE aparelho a contribuir (querUrl copia o link so entao)
   unsigned long long tamanho;
@@ -940,6 +942,28 @@ static void consultarStatus(Sessao *s, int longo) {
   rede_resposta_limpar(&r);
 }
 
+// The server only knows IMDb ids. A title opened as tmdb:/tvdb: (Nuvio's own rows) is asked by the IMDb id the
+// app resolves (descoberta.c, cached; one TMDB request at most), here on the worker, never on the player thread.
+// Not linked (unit tests) or not found: the id stays and the lookup says "not in the shared library" as before.
+extern int desc_imdb_para(const char *id, int serie, char *tt, size_t n) NV_PERFIL_OPCIONAL;
+static void imdbDaSessao(Sessao *s) {
+  char id[64], tt[32];
+  int serie;
+  pthread_mutex_lock(&trava);
+  snprintf(id, sizeof id, "%s", s->idOrig);
+  serie = s->t > 0 || s->e > 0;
+  pthread_mutex_unlock(&trava);
+  if (!id[0] || (id[0] == 't' && id[1] == 't') || !desc_imdb_para) return;
+  if (!desc_imdb_para(id, serie, tt, sizeof tt)) {
+    printf("[openseek] title id %.12s: no IMDb id found\n", id); fflush(stdout);
+    return;
+  }
+  pthread_mutex_lock(&trava);
+  snprintf(s->imdb, sizeof s->imdb, "%s", tt);
+  pthread_mutex_unlock(&trava);
+  printf("[openseek] title id %.12s -> %s\n", id, tt); fflush(stdout);
+}
+
 static void *controleFio(void *u) {
   Sessao *s = u;
   int falhas = 0;
@@ -949,6 +973,7 @@ static void *controleFio(void *u) {
   pthread_mutex_lock(&trava);
   while (!s->fim && !s->iniciar) esperar(s, 1000);
   pthread_mutex_unlock(&trava);
+  imdbDaSessao(s);
   while (!s->fim) {
     // Renovar em laco (relogio do servidor torto, 403 seguidos) custa no
     // maximo um POST a cada 5 s.
@@ -1584,7 +1609,7 @@ static void pPedir(const SeekrFonte *f) {
   int conv = openseek_papel() == OS_PAPEL_CONVIDADO;
   pthread_mutex_lock(&trava);
   s = atual;
-  mesma = s && (conv ? (s->convidado && !strcmp(s->imdb, f->imdb ? f->imdb : "") && s->t == f->t && s->e == f->e)
+  mesma = s && (conv ? (s->convidado && !strcmp(s->idOrig, f->imdb ? f->imdb : "") && s->t == f->t && s->e == f->e)
                      : !strcmp(s->url, f->url))
           && labs(s->durMs - f->durMs) < 2000;
   if (s && !mesma) { pthread_mutex_unlock(&trava); sessaoEncerrar(); pthread_mutex_lock(&trava); s = NULL; }
@@ -1598,6 +1623,7 @@ static void pPedir(const SeekrFonte *f) {
     snprintf(s->pino, sizeof s->pino, "%s", cfgPino);
     snprintf(s->token, sizeof s->token, "%s", cfgToken);
     snprintf(s->imdb, sizeof s->imdb, "%s", f->imdb ? f->imdb : "");
+    snprintf(s->idOrig, sizeof s->idOrig, "%s", f->imdb ? f->imdb : "");
     snprintf(s->hash, sizeof s->hash, "%s", f->videoHash ? f->videoHash : "");
     snprintf(s->arquivo, sizeof s->arquivo, "%s", f->arquivo ? f->arquivo : "");
     s->durMs = f->durMs; s->t = f->t; s->e = f->e; s->tamanho = f->tamanho; s->convidado = conv;
