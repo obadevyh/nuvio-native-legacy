@@ -74,7 +74,8 @@ int trailer_suportado(void) { return 1; }
 int trailer_aberto(void) { return opened; }
 int trailer_cheia(void) { return 0; }
 int trailer_tocando(void) { return opened && playing; }
-int trailer_mostra_video(void) { return 1; }   // .tpk: 0 ate o recorte assentar
+static int geometryReady = 1, asyncGeometry;
+int trailer_mostra_video(void) { return geometryReady; }
 static int donoTrailer;
 void trailer_marcar_dono(int dono, const char *imdb) { (void)imdb; donoTrailer = dono; }
 int trailer_dono(void) { return opened ? donoTrailer : 0; }
@@ -97,8 +98,12 @@ void video_tpk_cartao_destino(float x,float y,float w,float h,float *ox,float *o
 #endif
 static int lastNoCartao, rectCalls;
 void trailer_no_cartao(int sim) { lastNoCartao = sim; }
-void trailer_rect(GfxRect r) { lastRect = r; rectCalls++; }
+void trailer_rect(GfxRect r) { lastRect = r; rectCalls++; if (asyncGeometry) geometryReady = 0; }
 GfxRect trailer_retangulo(void) { return lastRect; }
+float gfx_escala_txt_entrar(void) { return 1.0f; }
+void gfx_escala_sair(float anterior) { (void)anterior; }
+static int fraco;
+int memlog_android_fraco(void) { return fraco; }
 void trailer_abrir(const char *source, GfxRect r, int som, int cheia) {
   (void)cheia; lastRect = r;
   lastSom = som;
@@ -500,6 +505,32 @@ int main(void) {
   home_trailer_passo(1,.016f,start+500+NV_TRAILER_HERO_ESPERA_MS);
   rc|=check("tela cheia poster asks for sound with the switch on",opened&&lastSom==1);
 
+  // Dinamica Stage/Split borrow Moderna geometry but keep opaque artwork.
+  // Fullscreen poster trailers must follow the saved layout, even with sound.
+  { const TipoFileira rows[] = {FILEIRA_PALCO, FILEIRA_HEROI_DIVIDIDO};
+    for (int row = 0; row < 2; row++) {
+      for (int layout = HOME_LAYOUT_MODERNA; layout <= HOME_LAYOUT_DINAMICA; layout++) {
+        resetState("tt-dinpalco-trailer");
+        focoHero = 0; foco.fileira = 0; nFileiras = 1;
+        fileiras[0].tipo = rows[row];
+        layoutSetting = layout; posterSetting = AJ_TRAILER_CARTAZ_CHEIA;
+        trailerSetting = 0; somSetting = 1; appleReady = 1;
+        heroPendente = heroAtual; heroPendenteEm = start; sourceRequests = 0;
+        home_trailer_passo(1, .016f, start + 500);
+        home_trailer_passo(1, .016f, start + 500 + NV_TRAILER_HERO_ESPERA_MS);
+        if (layout == HOME_LAYOUT_DINAMICA) {
+          rc |= check(row ? "Dinamica Split blocks hidden fullscreen playback" :
+                            "Dinamica Stage blocks hidden fullscreen playback",
+                      !opened && openedCount == 0 && sourceRequests == 0 &&
+                      heroTrailerItem == -1 && heroTrailerGateAnterior == HERO_GATE_DYNAMIC);
+        } else {
+          rc |= check("Stage/Split fullscreen trailers remain eligible in other saved layouts",
+                      opened && openedCount == 1 && lastSom == 1);
+        }
+      }
+    }
+  }
+
   // TRES MODOS. No card: so com o cartaz que o desenho marcou,
   // no retangulo dele, sem modo cinema; Tela cheia: no destaque, com a Home
   // no lugar (#509: o modo cinema ficava para o trailer do destaque).
@@ -542,6 +573,52 @@ int main(void) {
     home_trailer_passo(1,.016f,start+500);
     home_trailer_passo(1,.016f,start+500+NV_TRAILER_HERO_ESPERA_MS);
     rc|=check("no card asks for sound with the switch on",opened&&lastSom==1&&heroTrailerNoCartao&&lastNoCartao);
+
+
+    // Low-end Android (Onn): no window moves while the card still moves.
+    resetState("tt-card-fraco");fraco=1;
+    focoHero=0;posterSetting=AJ_TRAILER_CARTAZ_CARD;trailerSetting=0;nFileiras=1;foco.fileira=0;
+    layoutSetting=HOME_LAYOUT_MODERNA;trailercinema_zerar(&heroCinema);
+    fileiras[0].tipo=FILEIRA_NORMAL;heroPendente=heroAtual;heroPendenteEm=start;appleReady=1;
+    cartaoTrailerItem=heroAtual;cartaoTrailerRect=card;cartaoTrailerPode=1;
+    { Uint32 t=start+500+NV_TRAILER_HERO_ESPERA_MS;
+      cartaoTrailerServe=1;home_trailer_passo(1,.016f,start+500);
+      for (int q=0;q<10;q++) { cartaoTrailerRect.x+=10.0f;cartaoTrailerServe=1;home_trailer_passo(1,.016f,t+q*16); }
+      rc|=check("low-end: card trailer waits while the card rect moves",!opened);
+      cartaoTrailerServe=1;home_trailer_passo(1,.016f,t+144+NV_CARTAO_ASSENTA_MS-1);
+      rc|=check("low-end: still waiting just before the rect settles",!opened);
+      cartaoTrailerServe=1;home_trailer_passo(1,.016f,t+144+NV_CARTAO_ASSENTA_MS);
+      rc|=check("low-end: opens once the card rect settled",opened&&lastRect.x==cartaoTrailerRect.x);
+      playing=1;rectCalls=0;
+      for (int q=0;q<60;q++) { cartaoTrailerServe=1;home_trailer_passo(1,.016f,t+144+NV_CARTAO_ASSENTA_MS+q*16); }
+      rc|=check("low-end: video fully visible before the card moves",heroTrailerFade>0.9f);
+      // Production order: step sees the previous rect, then draw publishes the
+      // new rect and chooses the hole alpha before the next step can hide it.
+      Uint32 movingAt=t+500+NV_CARTAO_ASSENTA_MS+1000;
+      cartaoTrailerServe=1;home_trailer_passo(1,.016f,movingAt);
+      rc|=check("low-end: stationary draw keeps the video visible",cartaoTrailerAlpha(heroAtual,movingAt)>0.9f);
+      cartaoTrailerRect.x+=40.0f;
+      float movingAlpha=cartaoTrailerAlpha(heroAtual,movingAt);
+      printf("first-moving-frame alpha: %.6f\n",movingAlpha);
+      rc|=check("low-end: draw hides hole before the next trailer step",movingAlpha==0.0f&&rectCalls==0);
+      cartaoTrailerServe=1;home_trailer_passo(1,.016f,movingAt+16);
+      rc|=check("low-end: hole gone on the first moving frame",heroTrailerFade<0.01f);
+      for (int q=1;q<5;q++) { cartaoTrailerServe=1;home_trailer_passo(1,.016f,t+500+NV_CARTAO_ASSENTA_MS+1000+q*16); }
+      rc|=check("low-end: plane holds while the card moves",rectCalls==0);
+      rc|=check("low-end: poster returns (no hole) while the card moves",heroTrailerFade<0.01f);
+      asyncGeometry=1;
+      cartaoTrailerServe=1;home_trailer_passo(1,.016f,t+500+NV_CARTAO_ASSENTA_MS+1000+80+NV_CARTAO_ASSENTA_MS);
+      rc|=check("low-end: plane follows once, after the card settled",rectCalls==1&&lastRect.x==cartaoTrailerRect.x);
+      for (int q=0;q<60;q++) { cartaoTrailerServe=1;home_trailer_passo(1,.016f,movingAt+500+q*16); }
+      rc|=check("low-end: no hole while Android geometry acknowledgement is delayed",
+                heroTrailerFade==0.0f&&cartaoTrailerAlpha(heroAtual,movingAt+1500)==0.0f&&rectCalls==1);
+      heroTrailerFade=0.9f;
+      rc|=check("low-end: draw rejects pending native geometry",cartaoTrailerAlpha(heroAtual,movingAt+1500)==0.0f);
+      geometryReady=1;asyncGeometry=0;
+      for (int q=0;q<60;q++) { cartaoTrailerServe=1;home_trailer_passo(1,.016f,t+700+1000+80+2*NV_CARTAO_ASSENTA_MS+q*16); }
+      rc|=check("low-end: video fades back in once settled",heroTrailerFade>0.9f);
+    }
+    fraco=0;
 
     // Card playback uses the focused title, even when the hero is hidden or
     // its artwork still belongs to another title. Fullscreen still needs it.

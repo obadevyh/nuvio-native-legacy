@@ -51,6 +51,8 @@ namespace NuvioTpk
         [DllImport("libnuvio.so")] static extern void nv_tpk_ciclo(int memoria);
         [DllImport("libdl.so.2")] static extern IntPtr dlopen(string path, int flags);
         [DllImport("libdl.so.2")] static extern IntPtr dlerror();
+        [DllImport("libcapi-appfw-application.so.0")] static extern IntPtr app_get_data_path();
+        [DllImport("libc.so.6")] static extern void free(IntPtr pointer);
         [DllImport("libc.so.6")] static extern int setenv(string name, string value, int overwrite);
         // Reserva de teclas de midia (#196), ver ReservaTeclasMidia. Assinaturas
         // do Ecore_Wl2.h/Ecore_Wayland2.h do rootstrap tizen-9.0-device.core.
@@ -104,9 +106,15 @@ namespace NuvioTpk
         // WindowMode.Transparent. Alvo: (4). Se o lancador do Tizen 9 sobe a
         // principal por cima do GLWindow, uma principal OPACA cobre o GLWindow,
         // que e iconificado e para de desenhar; transparente, nao cobre. Liga
-        // so na API11 (o host do Tizen 7+/9, onde o (4) acontece); 6.0 e 6.5
-        // ficam como estao.
-#if NV_API11
+        // na API11 (o host do Tizen 7+/9, onde o (4) acontece) e na API9
+        // (Tizen 6.5, #612); 6.0 continua opaco.
+        // #612: on QE65QN91BATXXH (6.5), adWroc reported native rendering
+        // continuing behind a black screen. Transparent + no opaque state
+        // worked with unchanged native libraries: the main window may cover
+        // the separate GLWindow. An extra diagnostic window was also removed,
+        // so the cause is not isolated. Opaque state guarded against TV Plus
+        // showing underneath; the reporter saw no such issue on 6.5.
+#if NV_API11 || NV_API9
         const bool JANELA_PRINCIPAL_TRANSPARENTE = true;
 #else
         const bool JANELA_PRINCIPAL_TRANSPARENTE = false;
@@ -129,6 +137,8 @@ namespace NuvioTpk
         // alfa da janela (o furo continua chegando ao video).
 #if NV_API11
         const bool JANELA_PRINCIPAL_OPACA = API11_GLVIEW;
+#elif NV_API9
+        const bool JANELA_PRINCIPAL_OPACA = false; // #612: keep the main window transparent.
 #else
         const bool JANELA_PRINCIPAL_OPACA = true;
 #endif
@@ -192,18 +202,16 @@ namespace NuvioTpk
         // referencia o GC os recolheria.
         Voz voz;
 #endif
-        bool soCarregada;
+        static bool soCarregada;
 
         protected override void OnCreate()
         {
+            Etapa("begin nui-oncreate");
             base.OnCreate();
-            relogio.Start();
+            Etapa("ok nui-oncreate");
             string dados = DirectoryInfo.Data;
-            // Rastro primeiro: se algo abaixo derrubar o processo, a linha ja esta
-            // no disco para o proximo arranque mostrar.
-            etapaAnterior = RodarEtapas(dados);
+            if (string.IsNullOrEmpty(etapasArq)) etapaAnterior = RodarEtapas(dados);
             Etapa("note launch host=" + Host + " " + RuntimeInformation.FrameworkDescription + " tv=" + Tv());
-            AppDomain.CurrentDomain.UnhandledException += (s, e) => Etapa("note unhandled " + e.ExceptionObject);
             try { Arranca(dados); }
             catch (Exception e)
             {
@@ -227,7 +235,7 @@ namespace NuvioTpk
             // Rastro nunca derruba o arranque: sem esses eventos, o app segue.
             try
             {
-                janela.VisibilityChanged += (s, e) => { principalVisivel = e.Visibility; Etapa("note main-window visible=" + e.Visibility + Contagem()); Janela("principal visivel=" + e.Visibility, false); };
+                janela.VisibilityChanged += (s, e) => { if (!e.Visibility) { try { nv_tpk_ciclo(0); } catch (EntryPointNotFoundException) { } } principalVisivel = e.Visibility; Etapa("note main-window visible=" + e.Visibility + Contagem()); Janela("principal visivel=" + e.Visibility, false); };
                 janela.FocusChanged += (s, e) => { Etapa("note main-window focus=" + e.FocusGained + Contagem()); if (e.FocusGained) SobeGlSePreciso("main-window focus"); };
             }
             catch (Exception e) { Etapa("note main-window events unavailable " + e.GetType().Name + ": " + e.Message); }
@@ -249,6 +257,7 @@ namespace NuvioTpk
             // dlopen simples de sempre, byte a byte igual ao anterior. Qualquer
             // falha no staging apaga o staging e volta para a empacotada — a
             // tentativa de atualizar nunca impede o app de abrir.
+            Etapa("note native-library path=" + so + " exists=" + File.Exists(so));
             Etapa("begin dlopen-so");
             bool carregou = false;
             try
@@ -297,14 +306,18 @@ namespace NuvioTpk
             Etapa("ok video-init");
 #if NV_TEXTO
             // CANARIO (Texto.cs): teclado/ditado do sistema. So com -p:NvTextoCanario=1.
+            Etapa("begin texto-init");
             try { texto = new Texto(a => { if (principal != null) principal.Post(_ => a(), null); else a(); }, s => video.Log(s)); }
             catch (Exception e) { Etapa("note texto-init " + e.GetType().Name + ": " + e.Message); }
+            Etapa("ok texto-init");
 #else
             // Botao de microfone das buscas (Voz.cs): abre o teclado da Samsung
             // so para o microfone dele. Se aparece, decide o ajuste "Botao de
             // microfone na busca" com o que a TV diz sobre microfone.
+            Etapa("begin voz-init");
             try { voz = new Voz(a => { if (principal != null) principal.Post(_ => a(), null); else a(); }, s => video.Log(s)); }
             catch (Exception e) { Etapa("note voz-init " + e.GetType().Name + ": " + e.Message); }
+            Etapa("ok voz-init");
 #endif
 
             // API8: o callback roda no fio principal e o DALi troca os buffers
@@ -335,8 +348,10 @@ namespace NuvioTpk
                 Erro("Nuvio could not start.", e.GetType().Name + ": " + e.Message);
                 return;
             }
-            try { Apps.Registrar(a => { if (principal != null) principal.Post(_ => a(), null); else a(); }); } catch (Exception e) { Etapa("note apps-init " + e.GetType().Name); }
             Etapa("ok nv_tpk_iniciar");
+            Etapa("begin apps-init");
+            try { Apps.Registrar(a => { if (principal != null) principal.Post(_ => a(), null); else a(); }); } catch (Exception e) { Etapa("note apps-init " + e.GetType().Name); }
+            Etapa("ok apps-init");
             NvCarga.LimparAntigos(dados);
             // Prova no log (#184): >0 = os DllImport passaram pelo resolvedor e
             // cairam na encenada; o "[atualizacao] instalada X" do C deve dizer
@@ -437,6 +452,9 @@ namespace NuvioTpk
                 () => Quadro(),
                 () => Etapa("note glview terminate callback" + Contagem()));
             glView.RenderingMode = GLRenderingMode.Continuous;
+            // GLView's mode does not keep its owning DALi window updating.
+            // A static video hole must still get frames between watchdog ticks.
+            NuiWindow.Instance.RenderingBehavior = RenderingBehaviorType.Continuously;
             NuiWindow.Instance.KeyEvent += (s, e) => Tecla(e.Key, "main");
             NuiWindow.Instance.Add(glView);
             Etapa("note glview created size=" + W + "x" + H + " format=RGBA8888 mode=Continuous" + Contagem());
@@ -542,32 +560,38 @@ namespace NuvioTpk
 
         void CriaGlWindow()
         {
+            Etapa("begin gl-create");
             gl = new GLWindow("nuvio", new NuiRect(0, 0, W, H), true);
+            Etapa("ok gl-create");
+            Etapa("begin gl-config");
             // O vigia conta "parado" a partir daqui ate a primeira chamada.
             Interlocked.Exchange(ref ultimaChamadaMs, relogio.ElapsedMilliseconds);
 #if NV_API8
             gl.SetEglConfig(false, false, 0, GLWindow.GLESVersion.Version_2_0);
-            gl.RegisterGlCallback(() => { }, () => { Quadro(); }, () => { });
+            gl.RegisterGlCallback(() => { Etapa("ok gl-context-callback"); }, () => { Quadro(); }, () => { });
 #elif NV_API9
             gl.SetEglConfig(false, false, 0, GLESVersion.Version20);
-            gl.RegisterGlCallback(() => { }, () => Quadro(), () => { });
+            gl.RegisterGlCallback(() => { Etapa("ok gl-context-callback"); }, () => Quadro(), () => { });
             gl.RenderingMode = GLRenderingMode.Continuous;
 #else
             gl.SetGraphicsConfig(false, false, 0, GLESVersion.Version20);
-            gl.RegisterGLCallbacks(() => { }, () => Quadro(), () => { });
+            gl.RegisterGLCallbacks(() => { Etapa("ok gl-context-callback"); }, () => Quadro(), () => { });
             gl.RenderingMode = GLRenderingMode.Continuous;
 #endif
+            Etapa("ok gl-config");
             // As duas janelas repassam tecla: qual delas fica com o foco depende
             // do firmware, e so uma recebe de cada vez.
             gl.KeyEvent += (s, e) => Tecla(e.Key, "gl");
             NuiWindow.Instance.KeyEvent += (s, e) => Tecla(e.Key, "main");
             try
             {
-                gl.VisibilityChanged += (s, e) => { glVisivel = e.Visibility; Etapa("note gl-window visible=" + e.Visibility + Contagem()); Janela("gl visivel=" + e.Visibility, false); };
+                gl.VisibilityChanged += (s, e) => { if (!e.Visibility) { try { nv_tpk_ciclo(0); } catch (EntryPointNotFoundException) { } } glVisivel = e.Visibility; Etapa("note gl-window visible=" + e.Visibility + Contagem()); Janela("gl visivel=" + e.Visibility, false); };
                 gl.FocusChanged += (s, e) => Etapa("note gl-window focus=" + e.FocusGained + Contagem());
             }
             catch (Exception e) { Etapa("note gl-window events unavailable " + e.GetType().Name + ": " + e.Message); }
+            Etapa("begin gl-show");
             gl.Show();
+            Etapa("ok gl-show");
             if (JANELA_GL_OPACA)
             {
                 try { gl.SetOpaqueState(true); Janela("gl SetOpaqueState(true) -> IsOpaqueState=" + gl.IsOpaqueState()); }
@@ -625,7 +649,7 @@ namespace NuvioTpk
 
         // Contadores do fio de desenho: chamadas do framework e quadros trocados.
         int chamadas, trocados;
-        readonly Stopwatch relogio = new Stopwatch();
+        static readonly Stopwatch relogio = new Stopwatch();
         long ultimaChamadaMs = -1, inicioDesenhoMs;
         volatile bool pausado;
         bool principalVisivel = true, glVisivel = true;
@@ -801,10 +825,10 @@ namespace NuvioTpk
 
         static string etapasArq = "";
         static readonly object travaEtapa = new object();
-        string etapaAnterior;
-        int etapasEscritas;
+        static string etapaAnterior;
+        static int etapasEscritas;
 
-        void Etapa(string linha)
+        static void Etapa(string linha)
         {
             if (string.IsNullOrEmpty(etapasArq)) return;
             // Teto: o vigia e os eventos de janela nao podem encher a pasta.
@@ -856,7 +880,10 @@ namespace NuvioTpk
                 }
             }
             if (abertas.Count == 0) return null;
-            if (abertas.Count == 1 && abertas[0] == "first-key" && terminou) return null;
+            // A TV fechou o app (terminate): o laco nui-run e o first-key ficam
+            // abertos porque o processo morre antes do "ok". Saida normal.
+            if (terminou) { abertas.Remove("nui-run"); abertas.Remove("first-key"); }
+            if (abertas.Count == 0) return null;
             string r = abertas[abertas.Count - 1];
             if (terminou) r += " (then the TV closed it)";
             if (ultimaNota != null) r += " — last: " + ultimaNota;
@@ -976,8 +1003,8 @@ namespace NuvioTpk
 #if !NV_TEXTO
             try { voz?.Cancelar(); } catch { }
 #endif
-            video?.PausarPeloSistema();
             try { nv_tpk_ciclo(0); } catch (EntryPointNotFoundException) { }
+            video?.PausarPeloSistema();
             base.OnPause();
         }
 
@@ -1184,7 +1211,32 @@ namespace NuvioTpk
 
         static void Main(string[] args)
         {
-            new Program().Run(args);
+            relogio.Start();
+            // Application.DirectoryInfo requires an existing NUIApplication.
+            // Read its native data path first so constructor failures survive.
+            try
+            {
+                IntPtr path = app_get_data_path();
+                try
+                {
+                    string dados = Marshal.PtrToStringAnsi(path);
+                    if (!string.IsNullOrEmpty(dados)) etapaAnterior = RodarEtapas(dados);
+                }
+                finally { if (path != IntPtr.Zero) free(path); }
+            }
+            catch (Exception e) { Console.Error.WriteLine("Startup trace unavailable: " + e.Message); }
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => Etapa("note unhandled " + e.ExceptionObject);
+            Etapa("note entry host=" + Host + " process=" + RuntimeInformation.ProcessArchitecture + " os=" + RuntimeInformation.OSArchitecture);
+            try
+            {
+                Etapa("begin nui-construct");
+                var app = new Program();
+                Etapa("ok nui-construct");
+                Etapa("begin nui-run");
+                app.Run(args);
+                Etapa("ok nui-run");
+            }
+            catch (Exception e) { Etapa("fail nui-start " + e); throw; }
         }
     }
 }

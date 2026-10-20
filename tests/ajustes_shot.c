@@ -20,7 +20,10 @@
 #include "catalogo.h"
 #include "dados.h"
 #include "gfx.h"
+#include "gpunivel.h"
 #include "ilha.h"
+#include "ltv.h"
+#include "perfis.h"
 #include "iconeapp.h"
 #include "logoapp.h"
 #include "text.h"
@@ -100,10 +103,12 @@ static void captura(const char *nome, SDL_Window *win) {
     tex_novo_quadro();
     tex_bombear(6);
     ajustes_atualizar(1.0f / 60.0f, SDL_GetTicks());
+    if (getenv("NUVIO_SHOT_UPSCALE")) gpun_quadro_inicio();   // 720p target, as on the C9
     glClearColor(0.025f, 0.025f, 0.03f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     ajustes_desenhar(SDL_GetTicks());
     rail_shot_desenhar(MENU_AJUSTES);
+    if (getenv("NUVIO_SHOT_UPSCALE")) gpun_quadro_fim();
     // NUVIO_SHOT_MENU=1: the app menu drawn in its own fixed factor (0.9) on
     // top, as app.c does every frame on the TV.
     if (getenv("NUVIO_SHOT_MENU")) {
@@ -201,6 +206,13 @@ int main(int argc, char **argv) {
   ajustes_recursos("deploy/app/art");
   badges_carregar("deploy/app/art");   // marcas de formato (Dolby Vision, 4K...); no app quem faz e home_iniciar
 
+  // NUVIO_SHOT_URLS=1: duas fontes por URL (M9) para a linha "Listas e guias por URL".
+  if (getenv("NUVIO_SHOT_URLS")) {
+    ltv_urls_carregar(perfis_ativo());
+    ltv_urls_adicionar(LTV_URL_M3U, "iptv.exemplo.com", "https://iptv.exemplo.com/get.php?username=x&password=y&type=m3u");
+    ltv_urls_adicionar(LTV_URL_XMLTV, "epg.exemplo.org", "https://epg.exemplo.org/guia.xml.gz");
+  }
+
   // FILEIRAS DE MENTIRA cobrindo as origens que a folha sabe distinguir: o
   // catalogo de addon (com nome de addon e tipo), o grupo de colecoes, e as
   // fileiras que o proprio app monta.
@@ -253,6 +265,27 @@ int main(int argc, char **argv) {
   fileiras_prontas:
 
   ajustes_iniciar();
+  // NUVIO_SHOT_UPSCALE=<algorithm 0..5> (NUVIO_SHOT_NITIDEZ=0..4): every capture
+  // is drawn at 720p and upscaled to 1920x1080 by gpunivel, as on the C9.
+  if (getenv("NUVIO_SHOT_UPSCALE")) {
+    gpun_iniciar(1920, 1080);
+    gpun_forcar_720();
+    gpun_ampliar_app(1);
+    gpun_ampliacao(atoi(getenv("NUVIO_SHOT_UPSCALE")),
+                   getenv("NUVIO_SHOT_NITIDEZ") ? atoi(getenv("NUVIO_SHOT_NITIDEZ")) : 2);
+  }
+  if (getenv("NV_TEXT_SCALE_NAV")) {
+    int op, sec, i, found = 0;
+    const char *key, *label;
+    for (i = 0; ajustes_teste_cena_item(i, &op, &sec, &key, &label); i++) {
+      if (strcmp(key, "escalaTextoLocal")) continue;
+      assert(ajustes_teste_focar_opcao(op));
+      found++;
+    }
+    assert(found == 1);
+    puts("PASS text scale settings navigation");
+    return 0;
+  }
   if (getenv("NUVIO_SHOT_AJUSTES_ESCALA"))
     ajustes_teste_escala(atoi(getenv("NUVIO_SHOT_AJUSTES_ESCALA")));
   ajustes_teste_vidro_env();   // NUVIO_SHOT_VIDRO_OPAC / _FOSCO
@@ -504,9 +537,10 @@ int main(int argc, char **argv) {
     snprintf(nome, sizeof nome, "%s-%s.png", saida, cenarios[i]);
     captura(nome, w);
   }
-  for (i = 21; i <= 22; i++) {
+  for (i = 21; i <= 24; i++) {
+    static const char *const n[] = { "trailers", "trailer-seletor", "ampliacao", "ampliacao-seletor" };
     ajustes_teste_ux_captura(i);
-    snprintf(nome, sizeof nome, "%s-%s.png", saida, i == 21 ? "trailers" : "trailer-seletor");
+    snprintf(nome, sizeof nome, "%s-%s.png", saida, n[i - 21]);
     captura(nome, w);
   }
   if (!getenv("NUVIO_AJUSTES_UX")) {

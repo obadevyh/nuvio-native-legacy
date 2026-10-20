@@ -11,6 +11,23 @@
 #include <assert.h>
 
 int main(void) {
+  assert(valor[AJ_HDR_INTERFACE] == 0 && !ajustes_hdr_interface());
+  assert(somenteDesteAparelho(AJ_HDR_INTERFACE) && !ajustePortavel(AJ_HDR_INTERFACE));
+  assert(!strcmp(CHAVE[AJ_HDR_INTERFACE], "hdrInterfaceLocal"));
+#ifndef NV_ANDROID
+  assert(!ajOpcaoDisponivel(AJ_HDR_INTERFACE));
+#endif
+  valor[AJ_HDR_INTERFACE] = 1; assert(!ajustes_hdr_interface()); // experiment removed: saved "on" stays off
+  valor[AJ_HDR_INTERFACE] = 0;
+  // Merge regression: both appended settings keep their parallel table entries.
+  assert(valor[AJ_XTREAM_CONEXOES] == 0 && valor[AJ_AMPLIAR_UI] == 1);
+  assert(!strcmp(CHAVE[AJ_XTREAM_CONEXOES], "-xtreamConexoes"));
+  assert(!strcmp(CHAVE[AJ_AMPLIAR_UI], "ampliarUiLocal"));
+  // Upscaling: Automatic, sharpness 2; both device-local.
+  assert(valor[AJ_AMPLIACAO_ALGO] == 0 && valor[AJ_AMPLIACAO_NITIDEZ] == 2);
+  assert(!strcmp(CHAVE[AJ_AMPLIACAO_ALGO], "ampliarAlgoLocal") &&
+         !strcmp(CHAVE[AJ_AMPLIACAO_NITIDEZ], "ampliarNitidezLocal"));
+  assert(OPCOES[AJ_XTREAM_CONEXOES].n == 3 && OPCOES[AJ_AMPLIAR_UI].n == 2);
   // c2e07fe41: 0 = follow the primary, then 50%..300% every 10%; the #439
   // indices saved by 2.0.5 are migrated on load (viuLeg2Escala).
   assert(OPCOES[AJ_LEG2_TAMANHO].n == 27);
@@ -177,7 +194,53 @@ int main(void) {
   AJ_VIDRO_QUALIDADE == AJ_TITULO_FIL + 1 &&   // glass quality (local)
   AJ_FUNDO_DIN == AJ_VIDRO_QUALIDADE + 1 &&         // #205: fundo da Dinamica
   AJ_FUNDO_DIN_COR == AJ_FUNDO_DIN + 1 &&
-  AJ_N == AJ_FUNDO_DIN_COR + 1);   // 2.0.6: master's #535 views appended after
+  AJ_ESCALA_TEXTO == AJ_FUNDO_DIN_COR + 1 &&   // text and component scale (local)
+  AJ_FONTE_GRUPO == AJ_ESCALA_TEXTO + 1 &&      // source memory (local)
+  AJ_FONTE_GRUPO_SESSOES == AJ_FONTE_GRUPO + 1 &&
+  AJ_LINK_REUSAR == AJ_FONTE_GRUPO_SESSOES + 1 &&
+  AJ_LINK_PRAZO == AJ_LINK_REUSAR + 1 &&
+  AJ_DET_ESPACO == AJ_LINK_PRAZO + 1 &&   // title page row spacing (local)
+  AJ_FOCO_ACENTO == AJ_DET_ESPACO + 1 &&   // accent focus plate (local)
+  AJ_NT_ORDEM == AJ_FOCO_ACENTO + 1 &&
+  AJ_ARTE_TOM == AJ_NT_ORDEM + 1 &&
+  AJ_PALCO_FUNDO == AJ_ARTE_TOM + 1 &&
+  AJ_URL_LISTA == AJ_PALCO_FUNDO + 1 &&   // URL lists and guides (local)
+  AJ_URL_M3U_ADD == AJ_URL_LISTA + 1 &&
+  AJ_URL_XMLTV_ADD == AJ_URL_M3U_ADD + 1 &&
+  AJ_URL_REM == AJ_URL_XMLTV_ADD + 1 &&
+  AJ_NT_EP == AJ_URL_REM + 1 &&
+  AJ_LIVETV_SUGERIR == AJ_NT_EP + 1 &&
+  AJ_AUDIO_OFFSET == AJ_LIVETV_SUGERIR + 1 &&
+  AJ_XTREAM_CONEXOES == AJ_AUDIO_OFFSET + 1 &&
+  AJ_AMPLIAR_UI == AJ_XTREAM_CONEXOES + 1 &&
+  AJ_GUIA_FONTE == AJ_AMPLIAR_UI + 1 &&
+  AJ_GUIA_RECARREGAR == AJ_GUIA_FONTE + 1 &&
+  AJ_M3U_URL == AJ_GUIA_RECARREGAR + 1 &&
+  AJ_M3U_EPG == AJ_M3U_URL + 1 &&
+  AJ_M3U_LIMPAR == AJ_M3U_EPG + 1 &&
+  AJ_IPTV_CONTA == AJ_M3U_LIMPAR + 1 &&
+  AJ_IPTV_ADD_XTREAM == AJ_IPTV_CONTA + 1 &&
+  AJ_IPTV_ADD_M3U == AJ_IPTV_ADD_XTREAM + 1 &&
+  AJ_IPTV_ADD_STALKER == AJ_IPTV_ADD_M3U + 1 &&
+  AJ_IPTV_NOME == AJ_IPTV_ADD_STALKER + 1 &&
+  AJ_IPTV_ATIVA == AJ_IPTV_NOME + 1 &&
+  AJ_IPTV_REMOVER == AJ_IPTV_ATIVA + 1 &&
+  AJ_IPTV_LISTA_XTREAM == AJ_IPTV_REMOVER + 1 &&
+  AJ_IPTV_LISTA_M3U == AJ_IPTV_LISTA_XTREAM + 1 &&
+  AJ_IPTV_LISTA_STALKER == AJ_IPTV_LISTA_M3U + 1 &&
+  AJ_IPTV_ACOES == AJ_IPTV_LISTA_STALKER + 1 &&
+  AJ_IPTV_EXCLUIR == AJ_IPTV_ACOES + 1 &&
+  AJ_IPTV_SALVAR == AJ_IPTV_EXCLUIR + 1 &&
+  AJ_IPTV_CANCELAR == AJ_IPTV_SALVAR + 1 &&
+  AJ_GUIA_ORDEM == AJ_IPTV_CANCELAR + 1 &&
+  AJ_IPTV_ORDEM == AJ_GUIA_ORDEM + 1 &&
+  AJ_EPG_MEMORIA == AJ_IPTV_ORDEM + 1 &&
+  AJ_GUIA_CATEGORIAS == AJ_EPG_MEMORIA + 1 &&
+  AJ_BIB_HOME == AJ_GUIA_CATEGORIAS + 1 &&
+  AJ_AMPLIACAO_ALGO == AJ_BIB_HOME + 1 &&
+  AJ_AMPLIACAO_NITIDEZ == AJ_AMPLIACAO_ALGO + 1 &&
+  AJ_HDR_INTERFACE == AJ_AMPLIACAO_NITIDEZ + 1 &&
+  AJ_N == AJ_HDR_INTERFACE + 1);
   // #492: retomada morna e o prazo do video pronto
   assert(valor[AJ_RETOMADA_MORNA] == 0 && ajustes_retomada_morna());   // V_LIGA: 0 = Ligado
   assert(!strcmp(CHAVE[AJ_RETOMADA_MORNA], "retomadaMornaLocal") && somenteDesteAparelho(AJ_RETOMADA_MORNA) && !dePerfil(AJ_RETOMADA_MORNA));
@@ -246,10 +309,12 @@ int main(void) {
   assert(!strcmp(CHAVE[AJ_FUNDO_DIN], "fundoDinamicaLocal") && somenteDesteAparelho(AJ_FUNDO_DIN) && !dePerfil(AJ_FUNDO_DIN));
   assert(!strcmp(CHAVE[AJ_FUNDO_DIN_COR], "fundoDinamicaCorLocal") && somenteDesteAparelho(AJ_FUNDO_DIN_COR) && !dePerfil(AJ_FUNDO_DIN_COR));
   valor[AJ_FUNDO_DIN] = 2; assert(ajustes_fundo_din() == 2);
+  valor[AJ_FUNDO_DIN] = 3; assert(ajustes_fundo_din() == 3);
   valor[AJ_FUNDO_DIN] = 9; assert(ajustes_fundo_din() == 0);   // arquivo de outra versao
   valor[AJ_FUNDO_DIN] = 0;
-  assert(OPCOES[AJ_FUNDO_DIN].n == 3 && !strcmp(OPCOES[AJ_FUNDO_DIN].valores[0], "Cinza") &&
-         !strcmp(OPCOES[AJ_FUNDO_DIN].valores[1], "Cor") && !strcmp(OPCOES[AJ_FUNDO_DIN].valores[2], "Imersivo"));
+  assert(OPCOES[AJ_FUNDO_DIN].n == 4 && !strcmp(OPCOES[AJ_FUNDO_DIN].valores[0], "Cinza") &&
+         !strcmp(OPCOES[AJ_FUNDO_DIN].valores[1], "Cor") && !strcmp(OPCOES[AJ_FUNDO_DIN].valores[2], "Imersivo") &&
+         !strcmp(OPCOES[AJ_FUNDO_DIN].valores[3], "Cinza escuro"));
   assert(!strcmp(i18n(OPCOES[AJ_FUNDO_DIN].rotulo), "Dynamic layout background"));
   assert(!strcmp(i18n(OPCOES[AJ_FUNDO_DIN].valores[0]), "Gray") && !strcmp(i18n(OPCOES[AJ_FUNDO_DIN].valores[2]), "Immersive"));
   assert(OPCOES[AJ_FUNDO_DIN_COR].n == 17 && !strcmp(OPCOES[AJ_FUNDO_DIN_COR].valores[valor[AJ_FUNDO_DIN_COR]], "Oceano"));
@@ -282,7 +347,7 @@ int main(void) {
   assert(valor[AJ_ESTAT_LADO] == 0 && ajustes_estat_lado() == 0);
   valor[AJ_ESTAT_LADO] = 1; assert(ajustes_estat_lado() == 1); valor[AJ_ESTAT_LADO] = 0;
   // 13/10: o layout "Apple TV" se chama Dinamica; o valor gravado nao muda.
-  assert(HOME_LAYOUT_DINAMICA == 2 && OPCOES[AJ_HOME_LAYOUT].n == 3);
+  assert(HOME_LAYOUT_DINAMICA == 2 && HOME_LAYOUT_N == 3 && OPCOES[AJ_HOME_LAYOUT].n == 3);
   assert(!strcmp(V_HOME_LAYOUT[HOME_LAYOUT_DINAMICA], "Dinâmica"));
   assert(!strcmp(i18n(V_HOME_LAYOUT[HOME_LAYOUT_DINAMICA]), "Dynamic"));
   puts("ajustes_padroes: ok");

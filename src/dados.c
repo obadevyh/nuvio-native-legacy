@@ -4,13 +4,24 @@
 #endif
 #include "app_id.h"
 #include "dados.h"
+#include "androidcache.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
+#ifndef __EMSCRIPTEN__
+#include <ifaddrs.h>
+#include <sys/socket.h>
+#ifdef __APPLE__
+#include <net/if_dl.h>
+#else
+#include <netpacket/packet.h>
+#endif
+#endif
 
 #ifndef __EMSCRIPTEN__
 static void espacoGravado(const char *nome);
@@ -500,7 +511,12 @@ void dados_sincronizar(void) {
 
 char *dados_caminho(char *dst, unsigned tam, const char *nome) {
   if (!dir[0] || !nome || !*nome) return NULL;
-  snprintf(dst, tam, "%s/%s", dir, nome);
+  const char *base = dir;
+#ifdef NV_ANDROID
+  if (nv_android_cache_name(nome)) base = nv_android_cache_dir();
+#endif
+  if (!base[0]) return NULL;
+  snprintf(dst, tam, "%s/%s", base, nome);
   return dst;
 }
 
@@ -527,8 +543,23 @@ static int gravarInterno(const char *nome, const char *conteudo, int leve) {
   if (!f) { NV_FS_LIBERAR(); return 0; }
   n = conteudo ? strlen(conteudo) : 0;
   if (n && fwrite(conteudo, 1, n, f) != n) { fclose(f); remove(tmp); NV_FS_LIBERAR(); return 0; }
+  // Progress must survive power loss, including the directory entry rename.
+#ifndef __EMSCRIPTEN__
+  int durable = !strcmp(nome, "progresso.txt");
+  if (durable && (fflush(f) != 0 || fsync(fileno(f)) != 0)) {
+    fclose(f); remove(tmp); NV_FS_LIBERAR(); return 0;
+  }
+#endif
   if (fclose(f) != 0) { remove(tmp); NV_FS_LIBERAR(); return 0; }
   if (rename(tmp, caminho) != 0) { remove(tmp); NV_FS_LIBERAR(); return 0; }
+#ifndef __EMSCRIPTEN__
+  if (durable) {
+    int fd = open(dir, O_RDONLY | O_DIRECTORY);
+    int ok = fd >= 0 && fsync(fd) == 0;
+    if (fd >= 0) close(fd);
+    if (!ok) { NV_FS_LIBERAR(); return 0; }
+  }
+#endif
   NV_FS_LIBERAR();
 #ifdef __EMSCRIPTEN__
   if (leve) sujoLeve = 1; else sujo = 1;
@@ -559,6 +590,9 @@ char *dados_ler(const char *nome) {
   NV_FS_TRAVAR();
   f = fopen(caminho, "rb");
   if (!f) { NV_FS_LIBERAR(); return NULL; }
+#ifdef NV_ANDROID
+  if (nv_android_cache_name(nome)) nv_android_cache_touch(caminho);
+#endif
   fseek(f, 0, SEEK_END);
   n = ftell(f);
   fseek(f, 0, SEEK_SET);
@@ -600,6 +634,54 @@ void dados_uuid(char *dst, unsigned tam) {
     dst[i] = hex[rand() & 15];
   }
   dst[36] = 0;
+}
+
+const char *dados_aparelho_id(void) {
+  static char id[64];
+  if (id[0]) return id;
+  const char *raw = getenv("NUVIO_DEVICE_ID");
+  char hardware[128] = "";
+#ifndef __EMSCRIPTEN__
+  if (!raw || !*raw) {
+    // Native TV network interfaces survive uninstall. Prefer wired over Wi-Fi;
+    // enumerate interfaces, not currently connected routes.
+    struct ifaddrs *list = NULL;
+    char best[64] = "";
+    if (!getifaddrs(&list)) {
+      for (struct ifaddrs *p = list; p; p = p->ifa_next) {
+        if (!p->ifa_addr || !p->ifa_name || !strncmp(p->ifa_name, "lo", 2)) continue;
+        const unsigned char *mac = NULL;
+#ifdef __APPLE__
+        if (p->ifa_addr->sa_family == AF_LINK) {
+          struct sockaddr_dl *a = (struct sockaddr_dl *)p->ifa_addr;
+          if (a->sdl_alen == 6) mac = (const unsigned char *)LLADDR(a);
+        }
+#else
+        if (p->ifa_addr->sa_family == AF_PACKET) {
+          struct sockaddr_ll *a = (struct sockaddr_ll *)p->ifa_addr;
+          if (a->sll_halen == 6) mac = a->sll_addr;
+        }
+#endif
+        if (!mac || !(mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5])) continue;
+        if (!best[0] || strcmp(p->ifa_name, best) < 0) {
+          snprintf(best, sizeof best, "%s", p->ifa_name);
+          snprintf(hardware, sizeof hardware, "%02x%02x%02x%02x%02x%02x",
+                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
+      }
+      freeifaddrs(list);
+    }
+    raw = hardware;
+  }
+#else
+  (void)hardware;
+#endif
+  if (!raw || !*raw) return "";
+  // Opaque identifier, never upload/log the raw DUID, Android ID or MAC.
+  unsigned long long h = 1469598103934665603ULL;
+  for (; *raw; raw++) { h ^= (unsigned char)*raw; h *= 1099511628211ULL; }
+  snprintf(id, sizeof id, "device-%016llx", h);
+  return id;
 }
 
 const char *dados_cliente_id(void) {

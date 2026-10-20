@@ -60,11 +60,11 @@ static float vtCardLargura(void);
 static float vtCardAltura(void);
 #define VT_COLS      vtColunas()
 #define VT_COLS_MAX  5
-#define VT_CARD_BASE_W 248.0f
+#define VT_CARD_BASE_W (248.0f / gfx_escala_txt())
 #define VT_CARD_W   vtCardLargura()
 #define VT_CARD_H   vtCardAltura()
 // .seeall-grid tinha 16; na TV o dono pediu mais ar entre os cartazes (13/10).
-#define VT_GAP_X    (vtTelefone() ? 16.0f : 28.0f)
+#define VT_GAP_X    (vtTelefone() ? 16.0f : 28.0f / gfx_escala_txt())
 #define VT_GAP_Y    (20.0f + 40.0f)       // gap + a linha de titulo sob o cartaz
 // GRADE na TV: sem o nome sob o cartaz (o painel ja diz tudo), so o vao.
 #define VT_GRADE_GAP_Y (vtTelefone() ? VT_GAP_Y : 44.0f)
@@ -88,8 +88,8 @@ static float vtCardAltura(void);
 #define VT_PAN_X   (NV_TELA_W - NV_ILHA_MARGEM_D - VT_PAN_W)
 #define VT_PAN_VAO  24.0f   // vao minimo entre a ultima coluna e o painel
 #define VT_PAN_Y   VT_TOPO
-#define VT_PAN_ART_H 330.0f
-#define VT_PAN_ART_W 220.0f
+#define VT_PAN_ART_H (330.0f / gfx_escala_txt())
+#define VT_PAN_ART_W (220.0f / gfx_escala_txt())
 static int   aberta, foco, pedAbrir = -1;
 static int pedRelogio;
 static float anim, scrollY, velY;
@@ -107,9 +107,8 @@ static float tabRol;
 static int vtTelefone(void) {
   return telefoneui_ativo();
 }
-static float vtEscala(void) { return vtTelefone() ? gfx_escala_ui() : 1.0f; }
-/* Keep measurements valid outside drawing too (focus, gestures and menus).
- * Ordinary TV/tablet pages keep their original unscaled viewport. */
+static float vtEscala(void) { return vtTelefone() ? gfx_escala_ui() : gfx_escala_txt(); }
+/* Keep measurements valid outside drawing too (focus, gestures and menus). */
 #undef NV_TELA_W
 #undef NV_TELA_H
 #define NV_TELA_W (NV_LAYOUT_REAL_W / vtEscala())
@@ -126,12 +125,14 @@ static float vtCabecalhoLargura(float x, float original) {
   return fminf(original, fim - x);
 }
 static GfxRect vtTimelineCard(float cy) {
-  float x = vtInicio() + (vtTimelineRetrato() ? 96.0f : 158.0f);
-  float w = vtTelefone() ? fminf(1000.0f, vtFim() - x) : vtFim() - x;
+  float x = fminf(vtFim(), vtInicio() + (vtTimelineRetrato() ? 96.0f : 158.0f));
+  float w = fmaxf(0.0f, vtFim() - x);
+  if (vtTelefone()) w = fminf(1000.0f, w);
   return (GfxRect){x, cy, w, VT_CARD_H};
 }
 static GfxRect vtTimelineArte(GfxRect card) {
-  float w = vtTelefone() ? fminf(376.0f, card.w * 0.36f) : 376.0f;
+  float w = fminf(376.0f / gfx_escala_txt(), fminf(card.w * 0.36f,
+                    (card.h - 24.0f) * 376.0f / 212.0f));
   return (GfxRect){card.x + 12.0f, card.y + 12.0f, w, w * 212.0f / 376.0f};
 }
 // Colunas que cabem entre o inicio do conteudo (a rail fixa entra por
@@ -150,7 +151,9 @@ static int vtColunas(void) {
     int n = (int)((vtFim() - vtInicio() + VT_GAP_X) / (VT_CARD_BASE_W + VT_GAP_X));
     return n < 1 ? 1 : n;
   }
-  float livre = VT_PAN_X - VT_PAN_VAO - ajustes_conteudo_x() + VT_GAP_X;
+  // #521/#205: contam as colunas que cabem em px REAIS (o cartaz sai da escala
+  // de texto); contar na camada ampliada perderia uma coluna por quadro.
+  float livre = (NV_LAYOUT_REAL_W - NV_CHROME_EDGE - VT_PAN_W - VT_PAN_VAO) / gfx_escala_txt() - ajustes_conteudo_x() + VT_GAP_X;
   int n = (int)(livre / (VT_CARD_BASE_W + VT_GAP_X) + 0.001f);
   return n < 1 ? 1 : n > VT_COLS_MAX ? VT_COLS_MAX : n;
 }
@@ -264,12 +267,20 @@ static float tlFoco[VT_MAX], tlProg = -1.0f;
 // sobrepostos (profundidade so por escala, recobrimento e veu). A faixa vai de
 // ponta a ponta e a ficha do titulo fica ABAIXO da linha do tempo. `fluxoPos` e
 // o foco em mola (< 0 = posicionar sem animar).
-#define VT_FLX_W (vtTelefone() ? 200.0f : 220.0f)
-#define VT_FLX_H (VT_FLX_W * 1.5f)
 static float fluxoPos = -1.0f;
 static float fluxoFim(void) { return vtTelefone() ? vtFim() : NV_TELA_W - 48.0f; }
+static float fluxoAltura(void) {
+  if (vtTelefone()) return 300.0f / gfx_escala_txt();
+  float h = NV_TELA_H - VT_TOPO;
+  // Reserve the year label, title/logo, metadata and synopsis below the covers.
+  return fminf((fluxoFim() - vtInicio()) * .35f * 1.5f,
+               fminf(h * .60f, h * .98f - 76.0f - 158.0f));
+}
+#define VT_FLX_H fluxoAltura()
+#define VT_FLX_W (VT_FLX_H / 1.5f)
+static float fluxoTopo(void) { return VT_TOPO + (vtTelefone() ? 40.0f : (NV_TELA_H - VT_TOPO) * .01f); }
 static float fluxoCentro(float x0) { return (x0 + fluxoFim()) * 0.5f; }
-static float fluxoLinhaY(void) { return VT_TOPO + 40.0f + VT_FLX_H + 64.0f; }
+static float fluxoLinhaY(void) { return fluxoTopo() + VT_FLX_H + (vtTelefone() ? 64.0f : (NV_TELA_H - VT_TOPO) * .01f); }
 static float fluxoInfoY(void) { return fluxoLinhaY() + 76.0f; }
 // Caixa do titulo i e quanto ele escurece (0 no foco). O 6o vizinho cai na ponta.
 static GfxRect fluxoRect(int i, float x0, float *sombra) {
@@ -279,7 +290,7 @@ static GfxRect fluxoRect(int i, float x0, float *sombra) {
   float off = ad < 1.0f ? d * A : copysignf(A + alem * S, d);
   float k = fmaxf(0.4f, 1.0f - 0.18f * s - 0.07f * alem), w = W * k, h = H * k;
   if (sombra) *sombra = fminf(0.85f, 0.5f * s + 0.1f * alem);
-  return (GfxRect){ fluxoCentro(x0) + off - w * 0.5f, VT_TOPO + 40.0f + (H - h) * 0.5f, w, h };
+  return (GfxRect){ fluxoCentro(x0) + off - w * 0.5f, fluxoTopo() + (H - h) * 0.5f, w, h };
 }
 
 static int ordenaPorAno(void) {
@@ -763,7 +774,8 @@ static GfxRect celulaRect(int i, const CatItem *it, const char **arte) {
   float x0 = vtInicio();
   float cx = x0 + celX[i], cy = VT_TOPO + celY[i] - scrollY;
   if (lay == VT_LAY_LINHA) {
-    *arte = it->backdrop[0] ? it->backdrop : it->poster;
+    *arte = posterprov_card_formato(it->origem, it->imdb, it->tmdb, it->tipo,
+                                   it->backdrop[0] ? it->backdrop : it->poster, 1);
     return vtTimelineArte(vtTimelineCard(cy));
   }
   { const char *pp = posterprov_card_addon(it->origem, it->imdb, it->tmdb, it->tipo, it->poster);
@@ -855,14 +867,15 @@ static void montar(int n) {
       fluxoPos = -1.0f;
       for (i = 0; i < n; i++) cel(i, i * (VT_FLX_W + VT_GAP_X), 0, VT_FLX_W, VT_FLX_H, 0, i);
       break;
-    case VT_LAY_LINHA:
+    case VT_LAY_LINHA: {
+      GfxRect card = vtTimelineCard(0);
       tlProg = -1.0f;
-      for (i = 0; i < n; i++) cel(i, 0, i * (VT_LINHA_H + VT_TL_GAP), 1158.0f, VT_LINHA_H, i, 0);
-      break;
+      for (i = 0; i < n; i++) cel(i, card.x - vtInicio(), i * (VT_LINHA_H + VT_TL_GAP), card.w, card.h, i, 0);
+      break; }
     case VT_LAY_RANKING: {
       // Quatro por linha: o numeral mora no vao a ESQUERDA do cartaz, como o
       // Top 10 da Dinamica, e o cartaz cobre a ponta direita dele.
-      const float faixa = 100.0f, w = 218.0f, h = w * 1.5f;
+      const float faixa = 100.0f, w = 218.0f / gfx_escala_txt(), h = w * 1.5f;
       int cols = 4;
       float passo = VT_CW / 4.0f + 4.0f;
       if (vtTelefone()) {
@@ -877,7 +890,7 @@ static void montar(int n) {
       break; }
     case VT_LAY_SAGA: {
       // Tres capitulos deitados por linha, com a trilha de progresso por cima.
-      float w = 424.0f, h = 238.0f;
+      float w = 424.0f / gfx_escala_txt(), h = 238.0f / gfx_escala_txt();
       int cols = 3;
       if (vtTelefone()) {
         float livre = vtFim() - vtInicio();
@@ -918,16 +931,11 @@ static void montar(int n) {
       // Blocos de cinco: um grande (2x2) e quatro pequenos, o grande trocando
       // de lado a cada bloco. Linha de cima: o grande e os dois pequenos do
       // alto; linha de baixo: os outros dois.
-      // Pequenos 16:9 e o grande com a altura exata de dois pequenos e o vao,
-      // cabendo em VT_CW com o vao mais largo da TV (13/10).
+      // Solve the five-tile block from available width: big = two rows + gap.
       float g = VT_GAP_X,
-            sh = fminf(vtTelefone() ? 172.0f : 174.0f, (VT_CW - 2.0f * g - 16.0f / 9.0f * g) / (64.0f / 9.0f)),
+            sh = (vtFim() - vtInicio() - (2.0f + 16.0f / 9.0f) * g) / (64.0f / 9.0f),
             sw = sh * 16.0f / 9.0f,
             bh = 2.0f * sh + g, bw = bh * 16.0f / 9.0f, folga = 28.0f;
-      if (vtTelefone()) {
-        float escala = fminf(1.0f, (vtFim() - vtInicio()) / (bw + 2 * sw + 2 * g));
-        bw *= escala; bh *= escala; sw *= escala; sh *= escala; g *= escala; folga *= escala;
-      }
       for (i = 0; i < n; i++) {
         int b = i / 5, k = i % 5;
         float y = b * (bh + g + folga);
@@ -978,7 +986,8 @@ static int atualizarGrade(void) {
 // centro do item em foco. As linhas sao contiguas em indice em toda exibicao.
 static int precisaMontar(int n) {
   return celLay != lay || celN != n || celTelefone != vtTelefone() ||
-    (vtTelefone() && (celAreaW != vtFim() - vtInicio() || celTelaH != NV_TELA_H));
+    ((vtTelefone() || lay == VT_LAY_MURAL || lay == VT_LAY_FLUXO || lay == VT_LAY_LINHA) &&
+     (celAreaW != vtFim() - vtInicio() || celTelaH != NV_TELA_H));
 }
 static int vizinhoNaLinha(int n, int lin) {
   float cx = celX[foco] + celW[foco] * 0.5f, melhor = 1e9f;
@@ -2349,7 +2358,8 @@ static void painel(float a) {
   if (cartaz) {
     // Mantém a geometria 2:3 mesmo sem arte para não deslocar os metadados.
     GfxRect r = { VT_PAN_X, y, VT_PAN_ART_W, VT_PAN_ART_H };
-    const char *arte = it.poster[0] ? it.poster : it.backdrop;
+    const char *arte = posterprov_card_addon(it.origem, it.imdb, it.tmdb, it.tipo,
+                                              it.poster[0] ? it.poster : it.backdrop);
     float raio = ajustes_raio_poster_px() / VT_PAN_ART_H;   // o raio de cartaz do app
     GLuint t = arte[0] ? tex_obter_larg(arte, VT_PAN_ART_W) : 0;
     gfx_cor(r, raio, 1, 1, 1, 0.05f * a);
@@ -3002,8 +3012,8 @@ static void timelineCard(int i,float cy,float a,float x0) {
   // Os cartoes fora do foco recuam um pouco (sem foco na grade, todos iguais).
   if(!tabFocus)a*=.70f+.30f*t;
   GfxRect card=vtTimelineCard(cy), artRect=vtTimelineArte(card);
-  float tx=vtTelefone()?artRect.x+artRect.w+24.0f:card.x+418.0f;
-  float tw=card.x+card.w-tx-(vtTelefone()?24.0f:32.0f);
+  float tx=artRect.x+artRect.w+24.0f;
+  float tw=fmaxf(1.0f,card.x+card.w-tx-(vtTelefone()?24.0f:32.0f));
   // FOCO DE LINHA (layout.h, NV_COR_FOCO e material da ilha): o cartao e uma
   // linha que da para preencher, entao a superficie sobe um degrau e NENHUM
   // contorno (dono, 14/10: "o contorno no componente que ja nao usamos mais").
@@ -3015,7 +3025,7 @@ static void timelineCard(int i,float cy,float a,float x0) {
     gfx_cor((GfxRect){card.x,card.y+12,3,card.h-24},.5f,ar,ag,ab,a);}
   // ARTE PREENCHE O QUADRO 16:9 (cover). Sem backdrop: o cartaz desfocado
   // preenche e o cartaz nitido fica no meio — nunca uma moldura cinza.
-  const char *art=it.backdrop[0]?it.backdrop:it.poster;GLuint tex=art[0]?tex_obter_larg(art,390):0;
+  const char *art=posterprov_card_formato(it.origem,it.imdb,it.tmdb,it.tipo,it.backdrop[0]?it.backdrop:it.poster,1);GLuint tex=art[0]?tex_obter_larg(art,390):0;
   GLuint fundo=tex&&!it.backdrop[0]?gfx_desfocado(tex,art):tex;
   if(fundo){gfx_card_forcar_cover_atual=1;gfx_tex_aspect_atual=tex_aspecto(art);
     gfx_rect(artRect,fundo,GFX_CARD,0,0,0,ra,0,0,0,a);gfx_card_forcar_cover_atual=0;gfx_tex_aspect_atual=0;}
@@ -3160,7 +3170,8 @@ static void fluxoInfo(float a, float x0) {
     txt_bloco_corta(TXT_DET_META2, it.sinopse, 226, 229, 236, x0, y, w, 30.0f, a * 0.9f, 2);
 }
 static const char *arteDeitada(const CatItem *it) {
-  return it->backdrop[0] ? it->backdrop : it->poster;
+  return posterprov_card_formato(it->origem, it->imdb, it->tmdb, it->tipo,
+                                 it->backdrop[0] ? it->backdrop : it->poster, 1);
 }
 
 // O CARTAZ DA GRADE (Grade e Decadas): arte 2:3, titulo embaixo, e na Grade de
@@ -3280,7 +3291,7 @@ static void sagaCard(int i, const CatItem *it, float cx, float cy, float w, floa
 static void muralTile(int i, const CatItem *it, float cx, float cy, float w, float h,
                       float ac, Uint32 agora, int sel) {
   GfxRect r = cartaoArte(i, (GfxRect){ cx, cy, w, h }, arteDeitada(it), ac, agora, sel);
-  int grande = vtTelefone() ? i % 5 == ((i / 5) & 1 ? 2 : 0) : w > 400.0f;
+  int grande = i % 5 == ((i / 5) & 1 ? 2 : 0);
   float pad = grande ? 28.0f : 18.0f, yb = r.y + r.h - pad;
   gfx_veu_base(r, raioCard(r.w, r.h), grande ? 0.55f : 0.62f, 0.85f * ac);
   int nome = ajustes_mural_titulos();   // #521
@@ -3565,7 +3576,7 @@ void vertudo_desenhar(Uint32 agora) {
   float corteTopo = VT_TOPO - 12.0f;
   if (a < 0.01f) return;
   float escalaAnterior = gfx_escala();
-  if (vtTelefone()) gfx_escala_sair(vtEscala());
+  gfx_escala_sair(vtEscala());
 #ifdef NV_TOUCH_UI
   toqueAbas.offset = NULL;
   ponteiro_rolagem(toqueVertudoRolar);
@@ -3573,7 +3584,7 @@ void vertudo_desenhar(Uint32 agora) {
   if (n > VT_MAX) n = VT_MAX;
   if (lay == VT_LAY_VITRINE) {
     vitDesenhar(a, x0);
-    if (vtTelefone()) gfx_escala_sair(escalaAnterior);
+    gfx_escala_sair(escalaAnterior);
     return;
   }
   n = atualizarGrade();
@@ -3663,5 +3674,5 @@ void vertudo_desenhar(Uint32 agora) {
   if (collection) botaoExibicao(a, cabCy);
 
   if (n > 0 && !vtTelefone()) { if (lay == VT_LAY_FLUXO) fluxoInfo(a, x0); else painel(a); }
-  if (vtTelefone()) gfx_escala_sair(escalaAnterior);
+  gfx_escala_sair(escalaAnterior);
 }

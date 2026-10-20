@@ -8,11 +8,15 @@
 #include "nuvem.h"
 #include "rede.h"
 #include "js.h"
+#include "idbase.h"
 #include "idioma.h"
 #include "trakt.h"
 #include "traktscrobble.h"
 #include "artemetahub.h"
 #include "dados.h"
+#include "fichameta.h"
+#include "metaprov.h"
+#include "metaep.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +24,7 @@
 #include <math.h>
 #include <time.h>
 #include <unistd.h>
+#include "provedorhttp.h"
 
 // Optional imports belong to consumers: public declarations keep producers strong.
 extern int trakt_enfeitar_lote_sessao(CatItem *, int, uint64_t) NV_PERFIL_OPCIONAL;
@@ -33,6 +38,7 @@ extern int trakt_enfeitar_lote_sessao(CatItem *, int, uint64_t) NV_PERFIL_OPCION
 #define SMK_PTW_MAX 400
 
 int simkl_ativo(void) { return simklauth_token()[0] != 0; }
+int simkl_aguardando(void) { return provedorEspera(); }
 
 const char *simkl_aviso_sem_vinculo(int querSimkl) {
   return (querSimkl && !simkl_ativo()) ? SIMKL_VINCULE : NULL;
@@ -168,6 +174,28 @@ int simkl_ler_playback(const char *json, CatItem *dst, long long *ids, int max) 
   return n;
 }
 
+// Reuse the provider metadata cache; an unknown mapping opens the title only.
+static int animeAbsoluto(const char *id, int absoluto, int *t, int *e) {
+  char chave[64];
+  MetaEpInfo ep;
+  int ok;
+  snprintf(chave, sizeof chave, "series/%s/%s", id, metaprov_idioma());
+  char *corpo = fichameta_ler(chave, 6 * 3600);
+  ok = metaep_buscar(corpo, 1, 1, &ep);
+  // ponytail: repeated scans reuse provider ordering; index if long shows cost time.
+  for (int i = 1; ok && i < absoluto; i++) {
+    MetaEpInfo prox;
+    ok = metaep_proximo(corpo, ep.temporada, ep.episodio, &prox) &&
+         ((prox.temporada == ep.temporada && prox.episodio == ep.episodio + 1) ||
+          (prox.temporada == ep.temporada + 1 && prox.episodio == 1));
+    if (ok) ep = prox;
+  }
+  free(corpo);
+  *t = ok ? ep.temporada : 0;
+  *e = ok ? ep.episodio : 0;
+  return ok;
+}
+
 int simkl_ler_assistindo(const char *json, CatItem *dst, int max) {
   // O Simkl guarda anime num terceiro tipo: /sync/all-items/anime/<estado>
   // devolve a raiz "anime" e o objeto interno tambem se chama "anime".
@@ -184,17 +212,38 @@ int simkl_ler_assistindo(const char *json, CatItem *dst, int max) {
     const char *f = js_fim(p), *oi, *of;
     CatItem *d = &dst[n];
     char imdb[24], prox[16] = "", quando[40] = "";
-    int t = 0, e = 0;
+    int t = 0, e = 0, absoluto = 0;
     memset(d, 0, sizeof *d);
     // "S01E05". Em dia com o que foi ao ar vem null, e ai nao ha o que seguir.
     if (!js_texto_raiz_em(p, f, "next_to_watch", prox, sizeof prox)) continue;
-    if (sscanf(prox, "S%dE%d", &t, &e) != 2 || t < 0 || e <= 0) continue;
+    if (sscanf(prox, "S%dE%d", &t, &e) != 2) {
+      if (k != 1 || sscanf(prox, "E%d", &e) != 1) continue;
+      absoluto = e;
+    }
+    if (t < 0 || e <= 0) continue;
     if (!objetoRaiz(p, f, chaves[k], &oi, &of)) continue;
-    if (!lerObra(oi, of, d, imdb, sizeof imdb)) continue;
+    if (!lerObra(oi, of, d, imdb, sizeof imdb)) {
+      const char *ii, *ifim;
+      long id;
+      if (k != 1 || !objetoRaiz(oi, of, "ids", &ii, &ifim)) continue;
+      id = (long)js_num(ii, ifim, "tmdb", 0);
+      if (id > 0) snprintf(imdb, sizeof imdb, "tmdb:%ld", id);
+      else {
+        id = (long)js_num(ii, ifim, "simkl", 0);
+        if (id <= 0) continue;
+        snprintf(imdb, sizeof imdb, "simkl:%ld", id);
+      }
+    }
+    { const char *ii, *ifim;
+      if (objetoRaiz(oi, of, "ids", &ii, &ifim))
+        d->tmdb = (long)js_num(ii, ifim, "tmdb", 0);
+    }
+    if (absoluto) animeAbsoluto(imdb, absoluto, &t, &e);
     d->temporada = t;
     d->episodio = e;
     d->progresso = 0;
-    snprintf(d->imdb, sizeof d->imdb, "%s:%d:%d", imdb, t, e);
+    if (e > 0) snprintf(d->imdb, sizeof d->imdb, "%s:%d:%d", imdb, t, e);
+    else snprintf(d->imdb, sizeof d->imdb, "%s", imdb);
     snprintf(d->tipo, sizeof d->tipo, "series");
     // O instante do "a seguir" e o do ULTIMO EPISODIO VISTO, como no Trakt
     // (ult[].quandoMs): e ele que diz quando a pessoa mexeu nesta serie.
@@ -223,6 +272,7 @@ int simkl_ler_plantowatch(const char *json, int serie, CatItem *dst, int max) {
     snprintf(d->imdb, sizeof d->imdb, "%s", imdb);
     snprintf(d->tipo, sizeof d->tipo, "%s", serie ? "series" : "movie");
     d->naLista = 1;
+    d->listaFontes = 1u << AJ_SALVOS_SIMKL;
     // O mesmo acabamento de trakt_lista: arte deterministica pelo IMDb, sem
     // um GET por item, e o genero de sempre para a legenda do cartaz.
     arte_metahub_preencher(d);
@@ -379,7 +429,7 @@ static char *pedirComToken(char metodo, const char *caminho, const char *consult
   cab[2] = NULL;
   if (metodo == 'P')      r = rede_postar_st(url, 20, cab, corpo ? corpo : "", st);
   else if (metodo == 'D') r = rede_apagar(url, 20, cab, st);
-  else                    r = rede_baixar_st(url, 25, cab, st);
+  else                    r = provedorBaixarSt(url, 25, cab, st);
   return r;
 }
 
@@ -428,7 +478,39 @@ static char *pedir(SmkPedido pedido, char metodo, const char *caminho, const cha
   cab[2] = NULL;
   if (metodo == 'P')      r = rede_postar_st(url, 20, cab, corpo ? corpo : "", st);
   else if (metodo == 'D') r = rede_apagar(url, 20, cab, st);
-  else                    r = rede_baixar_st(url, 25, cab, st);
+  else {
+    int next = -1;
+    r = provedorGet(url, 25, cab, st, &next, 1);
+    // Simkl normally returns all items. Follow explicit pagination if present.
+    if (r && strstr(caminho, "/plantowatch")) {
+      char *all = r;
+      int page = 1;
+      while (next > page && page < 64 && pedidoAtual(pedido)) {
+        char paged[720]; page = next;
+        snprintf(paged, sizeof paged, "%s&page=%d&limit=500", url, page);
+        char *part = provedorGet(paged, 25, cab, st, &next, page);
+        char *a = strchr(all, '['), *b = part ? strchr(part, '[') : NULL;
+        if (!a || !b || *st < 200 || *st >= 300) { free(all); free(part); return NULL; }
+        const char *ae = js_fim(a), *be = js_fim(b);
+        if (ae <= a + 1 || ae[-1] != ']' || be <= b + 1 || be[-1] != ']') {
+          free(all); free(part); return NULL;
+        }
+        size_t prefix = (size_t)(ae - all - 1), items = (size_t)(be - b - 2);
+        size_t suffix = strlen(ae - 1);
+        int comma = prefix > (size_t)(a - all + 1) && items > 0;
+        if (prefix + items + suffix + 2 > REDE_CORPO_MAXIMO) { free(all); free(part); return NULL; }
+        char *joined = malloc(prefix + items + suffix + 2);
+        if (!joined) { free(all); free(part); return NULL; }
+        memcpy(joined, all, prefix);
+        if (comma) joined[prefix++] = ',';
+        memcpy(joined + prefix, b + 1, items);
+        strcpy(joined + prefix + items, ae - 1);
+        free(all); free(part); all = joined;
+      }
+      if (next > page) { free(all); return NULL; }
+      r = all;
+    }
+  }
   return r;
 }
 
@@ -689,7 +771,7 @@ int simkl_e_a_seguir(const char *id) {
 }
 
 static int mesmaSerie(const char *a, const char *b) {
-  size_t la = strcspn(a, ":"), lb = strcspn(b, ":");
+  size_t la = idbase_len(a), lb = idbase_len(b);
   return la == lb && !strncmp(a, b, la);
 }
 
@@ -772,10 +854,8 @@ int simkl_continuar(CatItem *saida, int max) {
   { int a, b;
     for (a = 1; a < n; a++) {
       CatItem t = saida[a];
-      for (b = a - 1; b >= 0 &&
-           ((saida[b].progresso == 0 && t.progresso > 0) ||
-            ((saida[b].progresso == 0) == (t.progresso == 0) &&
-             saida[b].retomadoMs < t.retomadoMs)); b--) saida[b + 1] = saida[b];
+      for (b = a - 1; b >= 0 && saida[b].retomadoMs < t.retomadoMs; b--)
+        saida[b + 1] = saida[b];
       saida[b + 1] = t;
     }
   }
@@ -1239,6 +1319,8 @@ static int scrobbleDecidir(int evento, const char *id, double pct) {
     scrEstado.ativo = 1;
     return SCR_START;
   }
+  if (evento == SCR_EV_PONTO)
+    return scrEstado.ativo && mesmo && pct >= 1.0 && pct < 80.0 ? SCR_START : SCR_NADA;
   if (evento == SCR_EV_PAUSOU) {
     if (!scrEstado.ativo || !mesmo) return SCR_NADA;
     scrEstado.ativo = 0;

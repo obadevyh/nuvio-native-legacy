@@ -263,7 +263,13 @@ EM_JS(int, trailer_js_pausado, (), {
   if (!T || !T.f) return 0;
   return T.ehVideo ? (T.f.paused ? 1 : 0) : (T.estado === 2 ? 1 : 0);
 });
-int trailer_suportado(void) { return 1; }
+int trailer_suportado(void) {
+#ifdef NV_TIZEN3_LITE
+  return 0;
+#else
+  return 1;
+#endif
+}
 #else
 // LG (e Mac, onde video_iniciar devolve 0 e nada disto acontece): o trailer
 // e um MP4 no plano de video da TV. O volume so pode ser mexido depois de o
@@ -396,9 +402,18 @@ static void nativoAplicar(void) {
 }
 #endif
 
+// Callers pass the rect in their own layer px (home/detail run inside the text
+// scale layer, #205); the video plane wants real 1920x1080 px. `rect` keeps the
+// real one, trailer_retangulo hands it back in the caller's units.
+static GfxRect naTela(GfxRect r) {
+  float k = gfx_escala_tela_txt();
+  return (GfxRect){ r.x * k, r.y * k, r.w * k, r.h * k };
+}
+
 void trailer_abrir(const char *fonte, GfxRect r, int som, int modoCheia) {
   int nova;
   if (!trailer_suportado() || !fonte || !fonte[0]) return;
+  r = naTela(r);
   // SAMSUNG E SEMPRE MUDO, tambem em tela cheia (dono, 22/09/2026: "trailer
   // fica mudo"). A trava fica AQUI, no unico caminho ate o elemento, e nao so
   // em quem chama: um `som` 1 esquecido num chamador novo desmutaria o embed
@@ -458,6 +473,7 @@ void trailer_abrir(const char *fonte, GfxRect r, int som, int modoCheia) {
 
 void trailer_rect(GfxRect r) {
   if (!aberto) return;
+  r = naTela(r);
 #ifdef NV_TOUCH_UI
   if (rect.x == r.x && rect.y == r.y && rect.w == r.w && rect.h == r.h) return;
 #endif
@@ -529,6 +545,9 @@ int trailer_tocando(void) {
 #endif
 }
 int trailer_mostra_video(void) {
+#ifdef NV_ANDROID
+  if (noCartao && !video_janela_pronta()) return 0;
+#endif
 #if defined(NV_TPK) && !defined(__EMSCRIPTEN__)
   Uint32 t = SDL_GetTicks();
   const char *porque = NULL;
@@ -567,7 +586,10 @@ int trailer_mostra_video(void) {
   return 1;
 #endif
 }
-GfxRect trailer_retangulo(void) { return rect; }
+GfxRect trailer_retangulo(void) {
+  float k = gfx_escala_tela_txt();
+  return (GfxRect){ rect.x / k, rect.y / k, rect.w / k, rect.h / k };
+}
 int trailer_estado(void) {
 #ifdef __EMSCRIPTEN__
   return aberto ? trailer_js_estado() : -2;

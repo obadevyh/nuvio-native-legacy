@@ -10,6 +10,10 @@ void *SDL_AndroidGetJNIEnv(void);
 void *SDL_AndroidGetActivity(void);
 #include "../src/video_android.c"
 // capmkv.c (capitulos do MKV) nao faz parte deste teste.
+int stream_kbps_atual(void) { return 0; }
+int xtream_url_limitada(const char *u) { (void)u; return 0; }
+int xtream_conexoes_limitadas(void) { return 0; }
+int xtream_conta_ler(XtreamConta *c) { memset(c, 0, sizeof *c); return 0; }
 void capmkv_iniciar(const char *u) { (void)u; }
 void capmkv_zerar(void) {}
 double capmkv_creditos(double d) { (void)d; return 0.0; }
@@ -253,7 +257,7 @@ int main(void) {
   assert(abrirSessao(0, 0));
   assert(strstr(registro, "B0"));
   { VideoStats st;
-    Java_space_nuvio_nativelegacy_NvPlayer_nativeStats(&env, NULL, 1000, 25000, 150000, 2, 12, 3, 100, NULL);
+    Java_space_nuvio_nativelegacy_NvPlayer_nativeStats(&env, NULL, 1000, 25000, 150000, 2, 12, 3, 100, NULL, 50000, 80, 1);
     video_estatisticas(&st);
     assert(st.bytes == 1000 && st.bufferSeg == 25 && st.bufferAlvoSeg == 150 && st.quadrosPerdidos == 3);
     assert(abrirSessao(0, 0));

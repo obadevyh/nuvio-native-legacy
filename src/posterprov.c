@@ -162,10 +162,11 @@ int posterprov_extra_normalizar(const char *entrada, char *out, size_t n) {
 
 // ---------------------------------------------------------------- modelo
 static int marcador(const char *p, size_t k) {
-  return (k == 6 && !strncmp(p, "{imdb}", 6)) || (k == 6 && !strncmp(p, "{tmdb}", 6)) ||
-         (k == 6 && !strncmp(p, "{type}", 6)) || (k == 11 && !strncmp(p, "{tipo_tmdb}", 11)) ||
-         (k == 9 && !strncmp(p, "{imdb_id}", 9)) || (k == 9 && !strncmp(p, "{tmdb_id}", 9)) ||
-         (k == 4 && !strncmp(p, "{id}", 4));
+  if (k > 2 && p[k - 2] == '?') k--;  // Optional markers use the same names.
+  return (k == 6 && !strncmp(p, "{imdb", 5)) || (k == 6 && !strncmp(p, "{tmdb", 5)) ||
+         (k == 6 && !strncmp(p, "{type", 5)) || (k == 11 && !strncmp(p, "{tipo_tmdb", 10)) ||
+         (k == 9 && !strncmp(p, "{imdb_id", 8)) || (k == 9 && !strncmp(p, "{tmdb_id", 8)) ||
+         (k == 4 && !strncmp(p, "{id", 3)) || (k == 7 && !strncmp(p, "{shape", 6));
 }
 // Pior caso de cada marcador montado (posterprov_montar_url): {imdb} vira o
 // Ident.tt (ate 23), {tmdb} um long (ate 19 digitos), {type} "series" (6),
@@ -174,9 +175,11 @@ static int marcador(const char *p, size_t k) {
 #define PP_MAX_IMDB 23
 #define PP_MAX_TMDB 19
 static size_t montado_max(const char *p, size_t k) {
-  if ((k == 6 && !strncmp(p, "{imdb}", 6)) || (k == 9 && !strncmp(p, "{imdb_id}", 9)) ||
-      (k == 4 && !strncmp(p, "{id}", 4))) return PP_MAX_IMDB;
-  if ((k == 6 && !strncmp(p, "{tmdb}", 6)) || (k == 9 && !strncmp(p, "{tmdb_id}", 9))) return PP_MAX_TMDB;
+  if (k > 2 && p[k - 2] == '?') k--;
+  if ((k == 6 && !strncmp(p, "{imdb", 5)) || (k == 9 && !strncmp(p, "{imdb_id", 8)) ||
+      (k == 4 && !strncmp(p, "{id", 3))) return PP_MAX_IMDB;
+  if ((k == 6 && !strncmp(p, "{tmdb", 5)) || (k == 9 && !strncmp(p, "{tmdb_id", 8))) return PP_MAX_TMDB;
+  if (k == 7) return 9;                                   // {shape}: landscape
   if (k == 6) return 6;                                   // {type}: "series"
   return 5;                                               // {tipo_tmdb}: "movie"
 }
@@ -249,8 +252,8 @@ static int chave_rpdb_valida(const char *k) {
   return 1;
 }
 
-int posterprov_montar_url(const PosterProvCfg *c, const char *imdb, long tmdb,
-                          const char *tipo, char *out, size_t n) {
+static int montar_formato(const PosterProvCfg *c, const char *imdb, long tmdb,
+                          const char *tipo, int landscape, char *out, size_t n) {
   Ident d;
   int w = -1;
   if (out && n) out[0] = 0;
@@ -300,16 +303,18 @@ int posterprov_montar_url(const PosterProvCfg *c, const char *imdb, long tmdb,
         size_t lv, adv = 1;
         if (*p == '{') {
           adv = (size_t)(strchr(p, '}') - p + 1);   // sintaxe ja validada
-          if (!strncmp(p, "{imdb}", 6) || !strncmp(p, "{imdb_id}", 9)) {
-            if (!d.tt[0]) return 0;
+          int opcional = p[adv - 2] == '?';
+          if (!strncmp(p, "{imdb", 5)) {
+            if (!d.tt[0] && !opcional) return 0;
             snprintf(v, sizeof v, "%s", d.tt);
-          } else if (!strncmp(p, "{tmdb}", 6) || !strncmp(p, "{tmdb_id}", 9)) {
-            if (d.tm <= 0) return 0;
-            snprintf(v, sizeof v, "%ld", d.tm);
-          } else if (!strncmp(p, "{id}", 4)) {
+          } else if (!strncmp(p, "{tmdb", 5)) {
+            if (d.tm <= 0 && !opcional) return 0;
+            if (d.tm > 0) snprintf(v, sizeof v, "%ld", d.tm);
+          } else if (!strncmp(p, "{id", 3)) {
             if (d.tt[0]) snprintf(v, sizeof v, "%s", d.tt);
             else snprintf(v, sizeof v, "%ld", d.tm);
-          } else if (!strncmp(p, "{type}", 6)) { snprintf(v, sizeof v, "%s", d.serie ? "series" : "movie"); }
+          } else if (!strncmp(p, "{shape", 6)) { snprintf(v, sizeof v, "%s", landscape ? "landscape" : "poster");
+          } else if (!strncmp(p, "{type", 5)) { snprintf(v, sizeof v, "%s", d.serie ? "series" : "movie"); }
           else { snprintf(v, sizeof v, "%s", d.serie ? "tv" : "movie"); }
           lv = strlen(v);
           if (k + lv + 1 > n) return 0;
@@ -329,6 +334,11 @@ int posterprov_montar_url(const PosterProvCfg *c, const char *imdb, long tmdb,
   }
   if (w < 0 || (size_t)w >= n || w >= PP_URL_MAX) { out[0] = 0; return 0; }
   return 1;
+}
+
+int posterprov_montar_url(const PosterProvCfg *c, const char *imdb, long tmdb,
+                          const char *tipo, char *out, size_t n) {
+  return montar_formato(c, imdb, tmdb, tipo, 0, out, n);
 }
 
 const char *posterprov_redigir(const char *url, char *out, size_t n) {
@@ -459,23 +469,30 @@ const char *posterprov_card_addon(const char *origem, const char *imdb, long tmd
 
 const char *posterprov_card(const char *imdb, long tmdb, const char *tipo,
                             const char *orig) {
+  return posterprov_card_formato(NULL, imdb, tmdb, tipo, orig, 0);
+}
+
+const char *posterprov_card_formato(const char *origem, const char *imdb, long tmdb,
+                                    const char *tipo, const char *orig, int landscape) {
   uint32_t k;
   Slot *s;
   const char *r = orig;
-  if (cfg.prov == PP_DESLIGADO) return orig;
+  if (cfg.prov == PP_DESLIGADO || posterprov_addon_vence(origem, orig)) return orig;
+  if (landscape && (cfg.prov != PP_MODELO ||
+      (!strstr(cfg.modelo, "{shape}") && !strstr(cfg.modelo, "{shape?}")))) return orig;
   pthread_mutex_lock(&trava);
   if (disjuntorAte) {
     if (agora() < disjuntorAte) { pthread_mutex_unlock(&trava); return orig; }
     disjuntorAte = 0;                              // meia-abertura: tenta de novo
     seguidas = PP_SEGUIDAS_MAX - 1;                // uma falha reabre
   }
-  k = hash_item(imdb, tmdb, tipo);
+  k = hash_item(imdb, tmdb, tipo) ^ (landscape ? 0x80000000u : 0);
   if (falhou_tem(k)) { pthread_mutex_unlock(&trava); return orig; }
   s = &slots[k % PP_SLOTS];
   if (s->chave != k) {
     memset(s, 0, sizeof *s);
     s->chave = k;
-    if (!posterprov_montar_url(&cfg, imdb, tmdb, tipo, s->url, sizeof s->url)) s->url[0] = 0;
+    if (!montar_formato(&cfg, imdb, tmdb, tipo, landscape, s->url, sizeof s->url)) s->url[0] = 0;
   }
   if (!s->url[0]) { pthread_mutex_unlock(&trava); return orig; }   // provedor nao entende o item
   if (!s->ok && hookEstado) {

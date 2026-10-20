@@ -3,7 +3,7 @@
  * valor[], nunca uma fotografia de preferencias ja carregadas do usuario. */
 
 static int uxTemPadrao(int op) {
-  if (ajFalhaBackend(op) || ajLegendaPrincipal(op)) return 1;
+  if (op == AJ_XTREAM_CONEXOES || ajFalhaBackend(op) || ajLegendaPrincipal(op)) return 1;
   return op >= 0 && op < AJ_N &&
     (OPCOES[op].tipo == OP_ESCOLHA || OPCOES[op].tipo == OP_NUMERO) &&
     CHAVE[op] && CHAVE[op][0] && CHAVE[op][0] != '-' &&
@@ -11,12 +11,17 @@ static int uxTemPadrao(int op) {
 }
 
 static int uxValorPadrao(int op) {
+  if (op == AJ_SALVOS_DEST) return ajustes_fonte_resolver(valorPadrao[op], trakt_ativo(), simkl_ativo());
   return uxTemPadrao(op) ? valorPadrao[op] : 0;
 }
 
 /* Fileiras tem uma fonte propria. valor[] e apenas seu espelho na tela. */
 static int uxValorAtual(int op) {
   if (op < 0 || op >= AJ_N) return 0;
+  if (op == AJ_XTREAM_CONEXOES) return xtream_conexoes_modo();
+  if (op == AJ_SALVOS_DEST) return ajustes_fonte_biblioteca();
+  if(op==AJ_GUIA_CATEGORIAS || op==AJ_IPTV_ACOES || op==AJ_IPTV_EXCLUIR)return 0;
+  if(ajIptvGerenciador(op))return ajIptvQuantos(ajIptvTipo(op))?ajIptvAtualTipo(ajIptvTipo(op)):1;
   if (ajLegendaPrincipal(op)) return ajLegendaValor(op);
   if (ajFalhaBackend(op)) return ajFalhaValor(op);
   if (op == AJ_SEEKR_LIGADO && !previaCredencial()) return 1;
@@ -24,7 +29,7 @@ static int uxValorAtual(int op) {
 }
 
 static int uxDiferente(int op) {
-  return uxTemPadrao(op) && uxValorAtual(op) != valorPadrao[op];
+  return uxTemPadrao(op) && uxValorAtual(op) != uxValorPadrao(op);
 }
 
 /* O candidato pode ter alcance diferente do valor salvo. Espelha as excecoes
@@ -88,6 +93,15 @@ static void uxValorTexto(int op, int v, char *buf, size_t tam) {
   if (!buf || !tam) return;
   buf[0] = 0;
   if (op < 0 || op >= AJ_N) return;
+  if(op==AJ_GUIA_CATEGORIAS) {
+    snprintf(buf,tam,"%s",v>=0 && v<uxNCategorias?uxCategorias[v].nome:i18n("Nenhuma"));return;
+  }
+  if(op==AJ_IPTV_CONTA){snprintf(buf,tam,"%s",ajIptvNome(v));return;}
+  if(ajIptvGerenciador(op)) {
+    int tipo=ajIptvTipo(op),n=ajIptvQuantos(tipo);
+    const char *s=v==(n?n:1)?i18n(ajIptvAdicionarNome(tipo)):!n?i18n("Nenhuma"):ajIptvNome(ajIptvDoTipo(tipo,v));
+    snprintf(buf,tam,"%s",s);return;
+  }
   o = &OPCOES[op];
   if (o->tipo == OP_ACAO) texto = i18n("Abrir");
   else if (o->tipo == OP_LEITURA) texto = i18n("Ver detalhes");
@@ -171,7 +185,7 @@ static const char *uxSinonimos(int op) {
     case AJ_LEG2_POS: case AJ_LEG2_TAMANHO: case AJ_LEG2_COR: case AJ_LEG2_FUNDO: case AJ_LEG2_BORDA:
       return "legenda secundaria segunda dupla dual posicao topo junto empilhada tamanho cor fundo borda contorno estilo second subtitle position size color";
     case AJ_FONTE_IDIOMA_AUDIO: return "fonte automatica idioma audio dublado dublagem dual multi anime ingles japones preferir dub language";
-    case AJ_FONTE_PRIORIDADE: case AJ_FONTE_HDR: return "fonte automatica prioridade qualidade equilibrio fluidez hdr dolby vision dv hdr10 sdr cor escolha melhor resolucao";
+    case AJ_FONTE_PRIORIDADE: case AJ_FONTE_HDR: return "fonte automatica prioridade qualidade equilibrio fluidez hdr dolby vision dv hdr10 sdr cor escolha melhor resolucao addon aiostreams ordem primeira order first";
     case AJ_LOGO_APP: return "logo marca simbolo novo classico icone identidade nuvio tv retro play gradiente splash";
     case AJ_ABERTURA: return "abertura splash inicio animacao zoom esmaecer fade direto rapido logo entrada boot arranque";
     case AJ_ESMAECER: return "esmaecer escurecer apagar tela parado ocioso inatividade protecao oled burn-in screensaver descanso tempo minutos dim";
@@ -222,6 +236,8 @@ static const char *uxSinonimos(int op) {
     case AJ_CW_MINIMO: return "minimo continuar assistindo porcentagem percentual entrar fileira retomada progresso quanto assistir comecou piso minimum percent continue watching threshold row";
     case AJ_FONTE_PREPARAR: return "preparar fonte ao abrir titulo antecipar resolver antecipado play instantaneo inicio rapido debrid painel arquivo prepare source ahead instant start";
     case AJ_COLECAO_EXIBICAO: return "colecao colecoes exibicao padrao automatico grade linha tempo ranking saga decadas mural vitrine global collection collections default view automatic grid timeline showcase";
+    case AJ_LINK_REUSAR: case AJ_LINK_PRAZO: return "reusar ultimo link sem busca retomar validade cache horas reuse last link cache duration";
+    case AJ_FONTE_GRUPO: case AJ_FONTE_GRUPO_SESSOES: return "grupo bingegroup binge proximo episodio mesma fonte lembrar fonte escolhida lancamento release sessoes reusar prefer binge group remember picked source same release next episode reuse sessions";
     case AJ_FONTE_PRECARREGAR: return "precarregar video buffer episodio proximo creditos preload video next episode";
     case AJ_FONTE_CONFERIR_VARIAS: return "conferir varias fontes ao mesmo tempo paralelo paralela simultaneo verificar verificacao automatico rapido inicio debrid painel arquivos parallel check several sources speed";
     case AJ_FONTE_AQUECER: return "aquecer conexoes conexao rede dns tls antecipar preparar abrir titulo inicio rapido lento demora warm preconnect connection network speed";
@@ -306,6 +322,8 @@ static const char *uxCaminhoAntigo(int op) {
     case AJ_HIST_CONTA: case AJ_SOCIAL:
       return "Contas e serviços";
     case AJ_FONTE_MANUAL: case AJ_FONTE_AUTO: case AJ_FONTE_REPOR: case AJ_FONTE_PRIORIDADE: case AJ_FONTE_TOCAR_CONFERINDO: case AJ_FONTE_AQUECER: case AJ_FONTE_CONFERIR_VARIAS: case AJ_FONTE_PREPARAR: case AJ_FONTE_PRECARREGAR:
+    case AJ_FONTE_GRUPO: case AJ_FONTE_GRUPO_SESSOES:
+    case AJ_LINK_REUSAR: case AJ_LINK_PRAZO:
     case AJ_FONTE_HDR: case AJ_FONTE_PRAZO: case AJ_FONTE_TEXTO: case AJ_FONTE_ORDEM_ADDON: case AJ_TAM_MAX: case AJ_TAM_MIN:
     case AJ_FONTE_ESCOPO: case AJ_FONTE_ADDONS_PERM: case AJ_FONTE_PLUGINS_PERM: case AJ_FONTE_OUTROS:
     case AJ_FONTE_REGEX: case AJ_FONTE_REGEX_PADRAO: case AJ_FONTE_REGEX_MODELO:
@@ -329,6 +347,7 @@ static const char *uxCaminhoAntigo(int op) {
     case AJ_POSTER_INST: case AJ_POSTER_TOKEN: case AJ_POSTER_EXTRA: case AJ_POSTER_CHAVE:
     case AJ_POSTER_MODELO: case AJ_POSTER_TESTAR:
       return "Cartazes e arte";
+    case AJ_AMPLIAR_UI: case AJ_AMPLIACAO_ALGO: case AJ_AMPLIACAO_NITIDEZ:
     case AJ_RESOLUCAO: case AJ_QUALIDADE_IMG: case AJ_GPU_EFEITOS: case AJ_NAV_RAPIDA: case AJ_MEDIDOR:
     case AJ_DIAGNOSTICO: case AJ_VELOCIDADE: case AJ_ESPACO: case AJ_TEX_MB:
       return "Desempenho desta TV";

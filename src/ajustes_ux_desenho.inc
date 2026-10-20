@@ -177,6 +177,7 @@ static void ajFocoLinha(GfxRect r, float raioPx, float f, float a) {
   if (f <= 0.01f) return;
   if (ajVid()) {
     float ar, ag, ab;
+    if (gfx_foco_placa(r, raioPx / r.h, f, a)) return;
     gfx_cor(r, raioPx / r.h, 1, 1, 1, 0.12f * f * a);
     ajustes_acento(&ar, &ag, &ab);
     gfx_vidro_aro(r, raioPx / r.h, 2.0f, ar, ag, ab, 0.96f * f * a);
@@ -357,7 +358,11 @@ static GfxRect ajInspR(void) { return (GfxRect){ ajInspX(), AJI_MARGEM, NV_VTELA
 #define AJ2_LISTA_W   1000.0f
 #define AJ2_EDITOR_DX  (252.0f / AJ2_S)   // 300
 static float aj2X0(void) {
+  // Read the same fixed rail reservation as Home, even under Settings zoom.
+  float previous = gfx_escala();
+  gfx_escala_sair(gfx_escala_txt());
   float rail = ajustes_rail_largura_fixa();
+  gfx_escala_sair(previous);
   return ((ajTelaCheia() && rail <= 0.0f ? 0.0f : 48.0f) + rail) / AJ2_S;
 }
 // A3: linhas compactas (58 + 2 de vao, rotulo 24), o dobro de linhas na tela.
@@ -389,7 +394,7 @@ static float aj2ListaWRef(void) {
 // opcao em foco fica a esquerda, grande, com kicker, titulo e descricao
 // embaixo (sem ilha); a LISTA compacta numa ilha a direita. A coluna da arte
 // comeca depois da ilha do menu recolhida; arte 44% do que sobra, 36 de vao.
-#define AJ2_CORPO (AJ2_TOPO + AJ_CAB_PAGINA)   // 2.0.2: abaixo do cabecalho da pagina
+#define AJ2_CORPO (AJ2_TOPO + AJ_CAB_PAGINA / gfx_escala_txt())   // 2.0.2: abaixo do cabecalho da pagina
 static float aj2ArteX(void) { return aj2X0(); }
 static float aj2ArteW(void) { return (NV_VTELA_W - AJ2_MARGEM - aj2ArteX()) * 0.44f; }
 static float aj2InspRetratoH(void) {
@@ -401,7 +406,7 @@ static GfxRect aj2ListaR(void) {
     float x = aj2ArteX(), y = AJ2_CORPO + (aj2TemInsp() ? aj2InspRetratoH() + 24.0f : 0.0f);
     return (GfxRect){x, y, NV_VTELA_W - AJ2_MARGEM - x, NV_VTELA_H - y - AJ2_MARGEM};
   }
-  float x = ajustes_layout_lista() ? aj2ArteX() : aj2ArteX() + aj2ArteW() + 36.0f;
+  float x = !aj2TemInsp() ? aj2ArteX() : aj2ArteX() + aj2ArteW() + 36.0f / gfx_escala_txt();
   return (GfxRect){ x, AJ2_CORPO, NV_VTELA_W - AJ2_MARGEM - x, NV_VTELA_H - AJ2_CORPO - AJ2_MARGEM };
 }
 static float ajTopoLista(void) { return aj2ListaR().y + AJ_A3_CAB; }
@@ -442,14 +447,14 @@ static const char *ajRotSeg(int op, int i) {
   char *p;
   snprintf(b[i % 3], sizeof b[0], "%s", i18n(OPCOES[op].valores[i]));
   p = strstr(b[i % 3], " (");
-  if (p && p != b[i % 3]) *p = 0;
+  if (p && p != b[i % 3] && op != AJ_AMPLIAR_UI) *p = 0;
   return b[i % 3];
 }
 // Escolha que cabe na linha: ate tres valores curtos viram o segmentado.
 static float aj2SegLargura(int op, int n);
 static int ajSegmentada(int op) {
   int n;
-  if (op < 0 || ajTipo(op) != AJL_ESC || op == AJ_LEG_LINGUA || op == AJ_LEG_LINGUA2 || op == AJ_AUD_LINGUA || op == AJ_AUD_LINGUA2 || op == AJ_FUNDO ||
+  if (op < 0 || ajIptvMenu(op) || ajTipo(op) != AJL_ESC || op == AJ_LEG_LINGUA || op == AJ_LEG_LINGUA2 || op == AJ_AUD_LINGUA || op == AJ_AUD_LINGUA2 || op == AJ_FUNDO ||
       op == AJ_INTERFACE_MODO /* o seletor com alvos proprios permite sair de TV usando so o toque */ ||
       op == AJ_LOGO_APP /* abre o seletor com miniaturas de 64 px, como o icone do app */) return 0;
   n = nValores(op);
@@ -476,15 +481,18 @@ static void ajToqueInlineValor(int v, int op) {
   if (!ajPontInline || !ajEditandoLinha(op) || v < 0 || v >= nValores(op)) return;
   uxPendente = v; uxRodape = 0;
 }
+#endif
 static void ajToqueConfirmar(int a, int b) {
   (void)a; (void)b;
   if (uxEditor == 1 && !uxRestaurar && !uxAvisoRisco) { uxRodape = 0; uxAplicar(); }
 }
-static void ajToqueCancelar(int a, int b) { (void)a; (void)b; if (uxEditor) uxCancelar(); }
+static void ajToqueCancelar(int a, int b) { (void)a; (void)b; if (uxEditor) ajIptvVoltar(); }
+#ifdef NV_TOUCH_UI
 static void ajToqueEscolhaAlvo(GfxRect r, int v, int op, float topo, float base) {
   if (ajTelaCheia() && ajPontInline && ajEditandoLinha(op))
     ponteiro_alvo_faixa(r.x, r.y, r.w, r.h, topo, base, NULL, ajToqueInlineValor, v, op);
 }
+#endif
 static void ajToqueBotoes(float direita, float yc, float a) {
   const char *rot[2] = { "Confirmar", "Cancelar" };
   for (int i = 0; i < 2; i++) {
@@ -492,12 +500,15 @@ static void ajToqueBotoes(float direita, float yc, float a) {
     GfxRect r = { direita - t.w - 40.0f, yc - 24.0f, t.w + 40.0f, 48.0f };
     if (i == 0) ajPilulaAcento(r, 24.0f, a);
     else ajNeutro(r, 24.0f, 0.10f, AJ_CHIP_SOL, a);
+    if(uxOp==AJ_GUIA_CATEGORIAS && uxRodape==i+1) {
+      float ar,ag,ab;ajustes_acento(&ar,&ag,&ab);
+      gfx_anel_fora(r,0.5f,0,3,ar,ag,ab,a);
+    }
     txt_desenhar_alpha(t, r.x + 20.0f, yc - t.h * 0.5f, a);
     ponteiro_alvo(r.x, r.y, r.w, r.h, NULL, i == 0 ? ajToqueConfirmar : ajToqueCancelar, 0, 0);
     direita = r.x - 12.0f;
   }
 }
-#endif
 // AS LINHAS QUE ABREM (v2): a primeira linha fica com 70,4 (16 + 38,4 + 16),
 // 20 de vao (o gap do flex que quebra) e o que vem embaixo — a regua da cor
 // de destaque editando, os tres cartoes do Fundo em foco e, sem inspetor
@@ -578,8 +589,8 @@ static void aj2Bolinha(int v, float cx, float cy, int foco, int gravada, float a
 static void aj2CorDin(int v, const char *url, float c1[3], float c2[3]) {
   CorvivaPaleta p;
   if (url && url[0] && corviva_paleta(url, &p) && p.ok) {
-    memcpy(c1, p.acento, sizeof p.acento);
-    memcpy(c2, v == AJ_TEMA_GRADIENTE ? p.grad[2] : p.acento, sizeof p.acento);
+    memcpy(c1, v == AJ_TEMA_DINAMICA && valor[AJ_ARTE_TOM] == 1 ? nv_acento_viva : p.acento, sizeof p.acento);
+    memcpy(c2, v == AJ_TEMA_GRADIENTE ? p.grad[2] : c1, sizeof p.acento);
     return;
   }
   memcpy(c1, nv_acento_viva, sizeof nv_acento_viva);
@@ -719,10 +730,13 @@ static int uxPaiVisual(int op) {
   if (ajLegendaSecundaria(op)) return AJ_LEG_LINGUA2;
   switch (op) {
     case AJ_FONTE_PRIORIDADE: case AJ_FONTE_PRAZO: case AJ_FONTE_IDIOMA_AUDIO: return AJ_FONTE_MANUAL;
+    case AJ_FONTE_GRUPO_SESSOES: return AJ_FONTE_GRUPO;
+    case AJ_LINK_PRAZO: return AJ_LINK_REUSAR;
     case AJ_FONTE_REGEX_PADRAO: case AJ_FONTE_REGEX_MODELO: return AJ_FONTE_REGEX;
     case AJ_FONTE_ADDONS_PERM: case AJ_FONTE_PLUGINS_PERM: return AJ_FONTE_ESCOPO;
     case AJ_LEG2_POS: case AJ_LEG2_TAMANHO: case AJ_LEG2_COR: case AJ_LEG2_FUNDO: case AJ_LEG2_BORDA:
       return AJ_LEG_LINGUA2;
+    case AJ_ARTE_TOM: return AJ_TEMA;
     case AJ_DESCANSO_ESTILO: case AJ_DESCANSO_FONTE: return AJ_ESMAECER;
     case AJ_CW_BLUR_PROX: return AJ_CW_THUMB;
     case AJ_HERO_CHEIO: return -1;   // depende do layout, que nao e a linha de cima

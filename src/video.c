@@ -22,6 +22,7 @@
 #include "rede.h"
 #include "velocidade.h"
 #include "cacheboost.h"
+#include "memlog.h"
 #include "dts/dts_playback.h"
 #include "dts_tv.h"
 #include "dts/dts_engine.h"
@@ -29,6 +30,7 @@
 #include "dts/dts_overlay.h"
 #include "legenda.h"
 #include "dados.h"
+#include "ilha.h"
 #include "vazao.h"
 #include <stdio.h>
 #include <string.h>
@@ -41,6 +43,33 @@
 #include <unistd.h>
 #include <math.h>
 #include <limits.h>
+
+#ifndef NV_VERSAO
+#define NV_VERSAO "dev"
+#endif
+
+#define DTS_MARCA_ARQ "dts-conversao.txt"
+static void dtsMarcarAbertas(int n) {
+  char b[sizeof NV_VERSAO + 32];
+  snprintf(b, sizeof b, "%d\n%s\n", n, NV_VERSAO);
+  dados_gravar(DTS_MARCA_ARQ, b);
+}
+static int dtsAbertasSemFechar(void) {
+  char *t = dados_ler(DTS_MARCA_ARQ);
+  char *versao = t ? strchr(t, '\n') : NULL;
+  int n = t ? atoi(t) : 0;
+  if (t && (!versao || strcmp(versao + 1, NV_VERSAO "\n"))) {
+    n = 0;
+    dtsMarcarAbertas(0);
+    printf("[dv] guard reset: version changed\n"); fflush(stdout);
+  }
+  free(t);
+  return n;
+}
+void video_dv_guard_reiniciar(void) {
+  dtsMarcarAbertas(0);
+  printf("[dv] guard reset: user toggle\n"); fflush(stdout);
+}
 
 static DtsPlayback *dtsSessao;
 static char dtsSaida[64];
@@ -632,7 +661,6 @@ static char cabsHttp[512];
 static int iniciarDts(int stream);
 static void bombearDts(void);
 static int dtsLiberadoNestaTv(void);
-static void dtsMarcarAbertas(int n);
 // RECONEXAO (video_reconexao.h). O erro chega no fio do LS2 e so ANOTA
 // (reconErroPend); a decisao e o recarregar sao do video_bombear, no fio
 // principal, como o `recuperando`.
@@ -1539,11 +1567,11 @@ static void chamar(const char *metodo, const char *carga, Filtro cb) {
 // Variante para callbacks que precisam saber a qual sessao pertencem. O
 // contexto e um inteiro convertido em ponteiro; nao ha alocacao para vazar nem
 // memoria cujo tempo de vida possa acabar antes da resposta assincrona.
-static void chamarCtx(const char *metodo, const char *carga, Filtro cb,
+static int chamarCtx(const char *metodo, const char *carga, Filtro cb,
                       void *ctx) {
   char uri[128];
   snprintf(uri, sizeof uri, "luna://com.webos.media/%s", metodo);
-  lsChamar(uri, carga, cb, ctx, metodo);
+  return lsChamar(uri, carga, cb, ctx, metodo);
 }
 
 // Chamada a OUTRO servico. O recorte de fonte NAO mora no com.webos.media: ele
@@ -1566,6 +1594,15 @@ static void chamarEm(const char *servico, const char *metodo,
 
 static void protegerScreensaver(void);
 static int modoLoad;   // video_modo_live_consumir do load em curso
+static char cargaBufferPadrao[8192];
+static int bufferCustom;
+static int aoCarregar(LSHandle *h, LSMessage *m, void *u);
+static void repetirBufferPadrao(void *u) {
+  bufferCustom = 0;
+  printf("[video] bufferControl custom recusado, voltando ao padrao\n");
+  fflush(stdout);
+  chamarCtx("load", cargaBufferPadrao, aoCarregar, u);
+}
 static int aoCarregar(LSHandle *h, LSMessage *m, void *u) {
   const char *p = lsPayload(m), *q;
   char b[256];
@@ -1585,6 +1622,15 @@ static int aoCarregar(LSHandle *h, LSMessage *m, void *u) {
     }
     return 1;
   }
+  if (p && bufferCustom) {
+    char retorno[16] = "";
+    js_bruto(p, NULL, "returnValue", retorno, sizeof retorno);
+    if (!strcmp(retorno, "false") || js_num(p, NULL, "errorCode", 0) != 0) {
+      repetirBufferPadrao(u);
+      return 1;
+    }
+  }
+  bufferCustom = 0;
   if (!p || midia[0]) return 1;
   q = strstr(p, "\"mediaId\":\"");
   if (!q) return 1;
@@ -1600,13 +1646,9 @@ static int aoCarregar(LSHandle *h, LSMessage *m, void *u) {
   chamar("notifyForeground", b, soLog);
   snprintf(b, sizeof b, "{\"mediaId\":\"%s\"}", midia);
   chamarCtx("subscribe", b, aoEvento, (void *)(uintptr_t)minhaSessao);
-  // MODO 1/2 (#158): sem selectTrack antes do sourceInfo — o pipeline de live
-  // ainda nao sabe que faixas tem, e e a unica chamada que este app manda que
-  // o navegador e o Kodi nao mandam no comeco.
-  if (!modoLoad) {
-    snprintf(b, sizeof b, "{\"mediaId\":\"%s\",\"type\":\"video\",\"index\":0}", midia);
-    chamar("selectTrack", b, soLog);
-  }
+  // Let uMS discover and select its default tracks. Selecting video index 0
+  // before sourceInfo can stall TS startup on webOS 24 (#625); a successful
+  // load only allocates the pipeline, so request play without selecting tracks.
   snprintf(b, sizeof b, "{\"mediaId\":\"%s\"}", midia);
   chamar("play", b, soLog);
   return 1;
@@ -1731,8 +1773,8 @@ static int acbConfigurarTipo(int bufferstream) {
   } while (0)
 
 static int iniciar(int automatico);
-int video_iniciar(void)      { return iniciar(0); }
-int video_iniciar_auto(void) { return iniciar(1); }
+int video_iniciar(void)      { mkvass_aceitar_imagem(1); return iniciar(0); }
+int video_iniciar_auto(void) { mkvass_aceitar_imagem(1); return iniciar(1); }
 int video_registro_negado(void) { return regNegado; }
 
 static int iniciar(int automatico) {
@@ -2070,7 +2112,7 @@ static void *lerMkv(void *arg) {
         snprintf(dvAudioCodec[na++], sizeof dvAudioCodec[0], "%s", fx[j].codec);
       }
     }
-    dvAudios = na; dvSondado = 1; }
+    dvAudios = na; }
 
   // DIAGNOSTICO DO DV (203-dvrpu). "Sem [dv] file:" tinha tres causas possiveis
   // e o log nao separava: o arquivo nao tem dvcC; o Tracks nao coube; ou o DV
@@ -2093,6 +2135,17 @@ static void *lerMkv(void *arg) {
       int r = mkv_rpu_alem(url, fx[j].nalTam, 4L * 1024 * 1024);
       printf("[dv] sonda: rpu_banda pelo 1o quadro (%lld bytes em %lld): %s rpu_tipo=%d vdr_rpu_profile=%d\n",
              q, d->blocoIni, r == 1 ? "sim" : r == 0 ? "nao" : "indeciso", d->rpuTipo, d->rpuPerfil);
+    }
+    // C9 firmware dereferences a null HEVC timing context in the DV demuxer
+    // on this input. A profile 8.1 declaration alone is not proof of safe
+    // samples; keep its HDR10 base layer when the probe cannot confirm RPU.
+    // ponytail: conservative probe gate; inspect actual startup packets before
+    // admitting unprobed files (see docs/reviews/c9-dv-crash-2.md).
+    if (fx[j].dvPerfil == 8 && fx[j].dvCompat == 1 &&
+        (d->rpu != 1 || d->quadros < 1)) {
+      dvMkvRpu = 0;
+      printf("[dv] HDR10: profile 8.1 in-band RPU unconfirmed (rpu=%d frames=%d)\n",
+             d->rpu, d->quadros);
     }
     fflush(stdout);
     break;
@@ -2117,6 +2170,13 @@ static void *lerMkv(void *arg) {
     if (nt > NV_FAIXA_MAX) nt = NV_FAIXA_MAX;
     for (i = 0; i < nt; i++) tv[i] = faixaLeg[i].numero;
     modo = mkv_casar_legendas(fx, n, tv, nt, idx);
+    // SEM_IMAGEM so confere contagem: com idioma dos dois lados, tem de bater.
+    if (modo == MKV_CASA_SEM_IMAGEM && !faixasmkv_idiomas_coerentes(faixaLeg, nt, fx, idx)) {
+      int q;
+      printf("[mkv] legendas: casamento sem imagem contradiz o idioma da TV; descartado\n");
+      for (q = 0; q < nt; q++) idx[q] = -1;
+      modo = MKV_CASA_NADA;
+    }
     if (modo == MKV_CASA_NADA && faixasmkv_legendas_por_idioma(faixaLeg, nt, fx, n, idx))
       printf("[mkv] legendas: pares unicos por idioma (lista da TV diferente)\n");
     // DIAGNOSTICO que faltou no #92: sem as duas listas lado a lado no log, o
@@ -2132,7 +2192,8 @@ static void *lerMkv(void *arg) {
       // escondendo (ou o trecho de 320 KB cortando) faixas — e nesse caso
       // NENHUMA faixa ASS vai ao overlay do app, todas ficam com a TV.
       printf("[mkv] legendas da TV x arquivo: modo=%s (tv=%d, arquivo=%d, lista da TV %s)\n",
-             modo == MKV_CASA_ORDINAL ? "ordinal" : modo == MKV_CASA_NUMERO ? "trackNumber" : "nenhum",
+             modo == MKV_CASA_ORDINAL ? "ordinal" : modo == MKV_CASA_NUMERO ? "trackNumber" :
+             modo == MKV_CASA_SEM_IMAGEM ? "ordinal (sem legendas de imagem)" : "nenhum",
              nt, nArq, nLeg > NV_FAIXA_MAX ? "CORTADA em NV_FAIXA_MAX" : "inteira");
       if (modo == MKV_CASA_NADA && nt > 0) {
         char m[96];
@@ -2200,11 +2261,16 @@ static void *lerMkv(void *arg) {
     fflush(stdout); }
   // #510: sourceInfo can omit embedded text tracks the app can render itself.
   nLeg = faixasmkv_acrescentar_texto(faixaLeg, nLeg, NV_FAIXA_MAX, fx, n);
+  // PGS (BD/remux): o uMS nao lista legenda de imagem. O app a decodifica
+  // (pgs.c/imgsub, o mesmo do .tpk) e entra no fim da lista, com o ordinal do arquivo.
+  nLeg = faixasmkv_acrescentar_imagem(faixaLeg, nLeg, NV_FAIXA_MAX, fx, n);
   { char m[64];
     snprintf(m, sizeof m, "mkv: %d faixas lidas, %d legendas com idioma", n, casou);
     marco(m); }
   printf("[mkv] %d legendas ganharam idioma\n", casou);
   fflush(stdout);
+  // Publish only after the DV admission check; the main thread may pump now.
+  dvSondado = 1;
   fioMkvVivo = 0;
   return NULL;
 }
@@ -2397,6 +2463,11 @@ void video_bombear(void) {
   // RECONEXAO: ver video_reconexao.h.
   if (pronto && posSeg > 0.5) reconIniciou = fonteTocou = 1;
   if (pronto) nv_recon_progresso(&recon, posSeg);
+  if (!falhou && (!pronto || (!pausaPedida && bufferandoDesde)) &&
+      nv_recon_expirou(&recon, SDL_GetTicks())) {
+    reconErroRede = 1; reconErroPend = 1;
+    snprintf(erroTexto, sizeof erroTexto, "network recovery timeout");
+  }
   if (reconErroPend) {
     int antes = recon.tentativa;
     reconErroPend = 0;
@@ -2535,6 +2606,41 @@ static void montarHttpHeader(char *dst, unsigned tam) {
   fflush(stdout);
 }
 
+static void montarCarga(char *dst, size_t tam, const char *url, int modo,
+                        const char *dolby, const char *hh, const char *janela,
+                        int preset, long livreMb) {
+  char buffer[192] = "\"bufferControl\":{\"userBufferCtrl\":false},";
+  int mb = !modo && (!strncasecmp(url, "http://", 7) ||
+                    !strncasecmp(url, "https://", 8))
+           ? cacheboost_buffer_mb(preset, livreMb) : 0;
+  if (mb) {
+    unsigned bytes = (unsigned)mb * 1024U * 1024U;
+    // Start at 1/8 capacity; refill below 1/4, up to the RAM-clamped limit.
+    snprintf(buffer, sizeof buffer,
+             "\"bufferControl\":{\"userBufferCtrl\":true,\"preBufferByte\":%u,"
+             "\"bufferMinLevel\":%u,\"bufferMaxLevel\":%u},",
+             bytes / 8, bytes / 4, bytes);
+  }
+  if (modo == 2) {
+    snprintf(dst, tam,
+        "{\"payload\":{\"option\":{"
+        "\"appId\":\"" NV_APP_ID "\","
+        "%s%s"
+        "\"mediaTransportType\":\"%s\","
+        "\"windowId\":\"%s\"}},"
+        "\"uri\":\"%s\",\"type\":\"media\"}",
+        dolby, hh, strstr(url, ".m3u8") ? "HLS" : "URI", janela, url);
+  } else {
+    snprintf(dst, tam,
+        "{\"payload\":{\"option\":{\"useSeekableRanges\":true,"
+        "\"appId\":\"" NV_APP_ID "\","
+        "%s%s%s"
+        "\"windowId\":\"%s\"}},"
+        "\"uri\":\"%s\",\"type\":\"media\"}",
+        dolby, hh, buffer, janela, url);
+  }
+}
+
 static int tocarInterno(const char *url, int comDV) {
   // 8 KB E NAO 2: a URL de fonte vai ate 4096 (Stream.url) e a do Pluto TV
   // leva ~1,7 KB de query com JWT. Com 2048 o snprintf CORTAVA o JSON no meio
@@ -2638,34 +2744,13 @@ static int tocarInterno(const char *url, int comDV) {
   }
   { char hh[768];
     montarHttpHeader(hh, sizeof hh);
-  if (modoLoad == 2) {
-    // PAYLOAD ENXUTO DE LIVE (#158, modo 2): o que o load de um <video> HLS
-    // costuma mandar — transporte dito pelo nome, sem useSeekableRanges nem
-    // bufferControl (que sao de VOD). Experimental, atras de Ajustes.
-    int hls = strstr(url, ".m3u8") != NULL;
-    snprintf(carga, sizeof carga,
-        "{\"payload\":{\"option\":{"
-        "\"appId\":\"" NV_APP_ID "\","
-        "%s%s"
-        "\"mediaTransportType\":\"%s\","
-        "\"windowId\":\"%s\"}},"
-        "\"uri\":\"%s\",\"type\":\"media\"}",
-        dolby, hh, hls ? "HLS" : "URI",
-        expWin[0] ? expWin : "window_id_dummy", url);
-  } else
-  snprintf(carga, sizeof carga,
-      "{\"payload\":{\"option\":{\"useSeekableRanges\":true,"
-      "\"appId\":\"" NV_APP_ID "\","
-      "%s%s"
-      "\"bufferControl\":{\"userBufferCtrl\":false},"
-      "\"windowId\":\"%s\"}},"
-      "\"uri\":\"%s\",\"type\":\"media\"}",
-      dolby, hh,
-      // No caminho do ACB o id e um marcador qualquer (so nao pode ser vazio,
-      // ver acima); no da webOS 5 ele e o endereco REAL do plano exportado e um
-      // valor errado aqui deixa o video sem para onde ir.
-      expWin[0] ? expWin : "window_id_dummy",
-      url);
+    montarCarga(carga, sizeof carga, url, modoLoad, dolby, hh,
+                expWin[0] ? expWin : "window_id_dummy",
+                ajustes_buffer_preset(), memlog_livre_mb());
+    bufferCustom = strstr(carga, "\"userBufferCtrl\":true") != NULL;
+    if (bufferCustom)
+      montarCarga(cargaBufferPadrao, sizeof cargaBufferPadrao, url, modoLoad,
+                  dolby, hh, expWin[0] ? expWin : "window_id_dummy", 0, 0);
     if (strlen(carga) >= sizeof carga - 1) {
       printf("[video] carga do load nao coube em %zu bytes (URL de %zu): recusando\n",
              sizeof carga, strlen(url));
@@ -2716,7 +2801,8 @@ static int tocarInterno(const char *url, int comDV) {
   if (expWin[0]) expJanelaAplicar();
   if (modoLoad) { printf("[video] modo do load: %d\n", modoLoad); fflush(stdout); }
   msDoLoad = agoraMs();
-  chamarCtx("load", carga, aoCarregar, (void *)(uintptr_t)minhaSessao);
+  if (!chamarCtx("load", carga, aoCarregar, (void *)(uintptr_t)minhaSessao) && bufferCustom)
+    repetirBufferPadrao((void *)(uintptr_t)minhaSessao);
   return 1;
 }
 
@@ -2781,24 +2867,10 @@ static void pararSessao(void) {
 //
 // E EM QUALQUER VERSAO: dts-conversao.txt conta as conversoes abertas que nao
 // fecharam. Duas seguidas = o app morreu duas vezes com a conversao aberta, e
-// ela se desliga nesta TV. Uma so pode ser a TV desligada no meio do filme.
-#define DTS_MARCA_ARQ "dts-conversao.txt"
-static int dtsAbertasSemFechar(void) {
-  char *t = dados_ler(DTS_MARCA_ARQ);
-  int n = t ? atoi(t) : 0;
-  free(t);
-  return n;
-}
-static void dtsMarcarAbertas(int n) {
-  char b[16];
-  if (!n && !dtsAbertasSemFechar()) return;
-  snprintf(b, sizeof b, "%d\n", n);
-  dados_gravar(DTS_MARCA_ARQ, b);
-}
+// ela se desliga nesta versao ate a pessoa religar em Ajustes.
+// Uma so pode ser a TV desligada no meio do filme.
 static int dtsLiberadoNestaTv(void) {
-  static int v = -1;
-  int maior, abertas;
-  if (v >= 0) return v;
+  int v, maior, abertas;
   if (access("/tmp/nuvio-dts-liberar", F_OK) == 0) {
     printf("[dts] conversao liberada por /tmp/nuvio-dts-liberar\n"); fflush(stdout);
     return v = 1;
@@ -2821,6 +2893,7 @@ static int dtsLiberadoNestaTv(void) {
 // webOS 3 fica fora; desconhecida chega aqui ja como o chute do webosMaior().
 static int dvVersaoLiberada(int maior) { return maior >= 4; }
 static int dvLiberadoNestaTv(void) {
+  static int avisado;
   int forcado = 0;
 #ifdef NV_DTS_DEBUG
   forcado = access("/tmp/nuvio-dv-forcar", F_OK) == 0;
@@ -2832,6 +2905,11 @@ static int dvLiberadoNestaTv(void) {
   }
   if (dtsAbertasSemFechar() >= 2) {
     printf("[dv] Dolby Vision in MKV off: the app died twice with it open\n"); fflush(stdout);
+    if (!avisado) {
+      avisado = 1;
+      ilha_avisar("dv-guard", ILHA_ERRO, NULL,
+        i18n("Dolby Vision desligado: o app fechou 2 vezes com ele. Religue em Ajustes para tentar de novo."), 10000u, 0);
+    }
     return 0;
   }
   return 1;

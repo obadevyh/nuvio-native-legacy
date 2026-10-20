@@ -3,6 +3,9 @@
 #include <assert.h>
 #include <string.h>
 // Antes do home.c: os dois acessores viram os do teste (ver homeCom).
+#define ajustes_posteres_deitados teste_posteres_deitados
+static int testeDeitados;
+static int teste_posteres_deitados(void) { return testeDeitados; }
 #define ajustes_home_layout teste_home_layout
 #define ajustes_hero_ligado teste_hero_ligado
 #define ajustes_espaco_titulos teste_espaco_titulos
@@ -56,6 +59,9 @@ int   dados_apagar(const char *nome) { (void)nome; return 1; }
 void  dados_marcar_sujo(int leve) { (void)leve; }
 void  sync_proteger_ajustes_locais(void) {}
 int   perfis_ativo(void) { return 1; }
+int   contalib_tem_conta(void) { return 0; }
+int   trakt_ativo(void) { return 0; }
+int   simkl_ativo(void) { return 0; }
 const char *addons_base_por_id(const char *id) { (void)id; return ""; }
 const char *addons_nome_por_id(const char *id) { (void)id; return ""; }
 // fileiras.c declara estas como NV_PERFIL_OPCIONAL (weak_import); sem
@@ -73,20 +79,74 @@ static int testeLayout = HOME_LAYOUT_MODERNA, testeHero = 1;
 int teste_home_layout(void) { return testeLayout; }
 int teste_hero_ligado(void) { return testeHero; }
 void teste_txt_desenhar(TxtLinha l, float x, float y) { (void)l; (void)x; (void)y; nTxtDesenhado++; }
+// Escala de texto e componentes (gfx.c): a mesma conta, sem GL. testeTxt e o
+// fator da camada; o padrao 1 deixa tudo como era.
+static float testeTxt = 1.0f, testeAtiva = 1.0f;
+float gfx_escala(void) { return testeAtiva; }
+float gfx_escala_txt(void) { return testeTxt; }
+float gfx_escala_tela_txt(void) { return (testeTxt != 1.0f && testeAtiva == testeTxt) ? testeTxt : 1.0f; }
+float gfx_poster_k(void) { return testeAtiva != 1.0f ? 1.0f / testeTxt : 1.0f; }
+float gfx_escala_txt_entrar(void) { float a = testeAtiva; testeAtiva = testeTxt; return a; }
+void gfx_escala_sair(float a) { testeAtiva = a; }
 // Duble do desenho do card editorial: sem GL, so o que o teste do genero conta.
 float gfx_tex_aspect_atual;
+void gfx_recorte(float x, float y, float w, float h) { (void)x; (void)y; (void)w; (void)h; }
+void gfx_sem_recorte(void) {}
 void gfx_veu_base(GfxRect c, float r, float f, float a) { (void)c; (void)r; (void)f; (void)a; }
+static int nSinopse;
+static int nHolofote, stageTitleDraws, stageTextDraws;
+static GfxRect stageTitleRect, stageGenreRect;
+static float stageBadgeWidth;
 void gfx_rect(GfxRect r, GLuint t, GfxModo m, float f, float a, float b, float c, float d, float e, float g, float h) {
+  if (m == GFX_HOLOFOTE || m == GFX_PALCO_CHAO) nHolofote++;
+  if (m == GFX_COR && d > 0.9f && e > 0.7f && g < 0.2f) stageBadgeWidth = r.w;
   (void)r; (void)t; (void)m; (void)f; (void)a; (void)b; (void)c; (void)d; (void)e; (void)g; (void)h; }
+void gfx_cor(GfxRect r, float raio, float cr, float cg, float cb, float a) {
+  gfx_rect(r, 0, GFX_COR, 0, 0, 0, raio, cr, cg, cb, a);
+}
 GLuint tex_obter_logo_larg(const char *c, float l) { (void)c; (void)l; return 0; }
+GLuint tex_obter_logo_larg_qualquer(const char *c, float l) { (void)c; (void)l; return 0; }
+void tex_publicar_paleta(const char *c) { (void)c; }
+const char *logotitulo_url(const CatItem *ci, float w) { (void)ci; (void)w; return NULL; }
 int  tex_marca_escura(const char *c) { (void)c; return 0; }
 TxtLinha txt_linha_corta(TxtEstilo e, const char *s, int r, int g, int b, int a, float w) {
   (void)e; (void)s; (void)r; (void)g; (void)b; (void)a; (void)w; return (TxtLinha){ 1, 10, 10, 0, 0 }; }
 float badge_desenhar(float x, float y, const char *t, BadgeEstilo e, float a) { nBadge++; (void)x; (void)y; (void)t; (void)e; (void)a; return 0; }
-float badge_imdb(float x, float y, int n, int e, float a) { nBadge++; (void)x; (void)y; (void)n; (void)e; (void)a; return 0; }
-float badge_imdb_largura(int n) { (void)n; return 0; }
+// Exercise the real IMDb measurement/drawing code in this scene.
+#define badge_desenhar stage_real_badge_desenhar
+#define badge_imdb stage_real_badge_imdb
+#include "../src/badges.c"
+#undef badge_desenhar
+#undef badge_imdb
+float badge_imdb(float x, float y, int n, int e, float a) {
+  nBadge++; return stage_real_badge_imdb(x, y, n, e, a);
+}
+TxtLinha txt_linha(TxtEstilo e, const char *s, int r, int g, int b, int a) {
+  (void)e; (void)r; (void)g; (void)b; (void)a;
+  return (TxtLinha){1, (int)strlen(s) * 16, 24, 0, 0};
+}
+float txt_bloco_corta(TxtEstilo e, const char *s, int r, int g, int b,
+                       float x, float y, float w, float leading, float a, int max) {
+  (void)s; (void)r; (void)g; (void)b;
+  if (e == TXT_HERO_SIN) nSinopse++;
+  if (e == TXT_TITULO3 && a > 0) {
+    stageTitleDraws++;
+    stageTitleRect = (GfxRect){x, y, w, leading * max};
+  }
+  return leading * max;
+}
+float sinopse_bloco_corta(TxtEstilo e, const char *s, int r, int g, int b,
+                          float x, float y, float w, float leading, float a, int max) {
+  assert(max <= 3);
+  return txt_bloco_corta(e, s, r, g, b, x, y, w, leading, a, max);
+}
 int  imdbnota_obter(const char *i, int c, int s) { (void)i; (void)c; (void)s; return testeImdb; }
 const char *i18n(const char *s) { return s; }
+void txt_desenhar_alpha(TxtLinha l, float x, float y, float a) {
+  if (a > 0 && stageTextDraws++ == 0) stageGenreRect = (GfxRect){x, y, l.w, l.h};
+}
+float sinopse_bloco(TxtEstilo o, const char *t, int r, int g, int b, float x, float y, float l, float d, float a, int m) {
+  (void)o; (void)t; (void)r; (void)g; (void)b; (void)x; (void)y; (void)l; (void)d; (void)a; (void)m; return 90.0f; }
 static void homeCom(int layout, int heroLigado) { testeLayout = layout; testeHero = heroLigado; }
 
 int main(void) {
@@ -112,10 +172,10 @@ int main(void) {
     }
     // O passo e o de um cartaz, nao o do painel; a altura reserva a ficha.
     assert(passoFil(1) < larguraFil(1) + 60.0f);
-    assert(alturaTotalFil(1) > alturaFil(1) + 150.0f);
+    assert(alturaTotalFil(1) >= alturaFil(1) + 150.0f);
     // Ano/nota embaixo do poster: o rotulo existe e a altura dele esta reservada.
     assert(temRotulo(FILEIRA_HEROI_DIVIDIDO));
-    assert(alturaTotalFil(1) == alturaFil(1) + NV_POSTER_COPY_H + NV_DIV_META_H);
+    assert(alturaTotalFil(1) == alturaFil(1) + NV_DIV_META_H);
     memset(scrollX, 0, sizeof scrollX);
   }
   // HEROI DIVIDIDO sem repeticao: com 5 itens, em CADA foco o titulo do painel
@@ -184,7 +244,8 @@ int main(void) {
       { float vizX2, vizS2, gap = gapDe(FILEIRA_PALCO);
         palcoGeo(1, c + 2, lw, &vizX2, &vizS2);
         assert(fabsf((vizX2 - vizX) - (lw * vizS + gap)) < 2.0f);
-        assert(fabsf((vizX - cx) - (lw * (1.0f + NV_PALCO_VIZ) * 0.5f + gap)) < 2.0f); }
+        assert(fabsf((vizX - cx) - (lw * (1.0f + NV_PALCO_VIZ) * 0.5f + gap
+                                    + NV_PALCO_INFO_VAO + NV_PALCO_INFO_W)) < 2.0f); }
       anterior = cx;
     }
     focoHero = 1;
@@ -223,6 +284,147 @@ int main(void) {
       }
       palcoPos[1] = 0.0f;
     }
+    // PALCO, 17/10: a ficha a direita do foco cabe na tela em TODO foco, na
+    // escala de texto 80/100/130%, e o vizinho da direita fica depois dela.
+    {
+      const float escalas[] = {0.8f, 1.0f, 1.3f};
+      for (int e = 0; e < 3; e++) {
+        int cols[] = {12, 12};
+        testeTxt = testeAtiva = escalas[e];
+        fileiras[0] = (Fileira){.tipo = FILEIRA_NORMAL, .n = 12, .escala = 1.0f};
+        fileiras[1] = (Fileira){.tipo = FILEIRA_PALCO, .n = 12, .escala = 1.0f};
+        focoHero = 0;
+        focus_iniciar(&foco, 2, cols);
+        assert(focus_mover(&foco, 0, 1) && foco.fileira == 1);
+        memset(scrollX, 0, sizeof scrollX);
+        float lw = larguraFil(1), artH = alturaFil(1);
+        for (int c = 0; c < 12; c++) {
+          if (c) assert(focus_mover(&foco, 1, 0));
+          palcoPos[1] = (float)c;
+          scrollX[1] = alvoScrollFil(1, c, scrollX[1], 0.0f);
+          GfxRect info = palcoInfoRect(1, 100.0f, lw, artH);
+          float cx, s, vx, vs;
+          palcoGeo(1, c, lw, &cx, &s);
+          assert(cx - lw * 0.5f >= 0.0f);
+          assert(info.x >= cx + lw * 0.5f && info.x + info.w <= NV_TELA_W);
+          assert(info.y == 100.0f && info.h == artH);
+          palcoGeo(1, c + 1, lw, &vx, &vs);
+          assert(c == 11 || vx - lw * vs * 0.5f > info.x + info.w);
+        }
+      }
+      testeTxt = testeAtiva = 1.0f;
+    }
+    // HOLOFOTE: um quad so com o foco NA fileira Palco; nada fora dela.
+    {
+      int cols[] = {12, 12};
+      float lw = larguraFil(1), artH = alturaFil(1);
+      anim_politica_reduzida = 1;
+      focoHero = 0;
+      focus_iniciar(&foco, 2, cols);
+      assert(focus_mover(&foco, 0, 1) && foco.fileira == 1);
+      nHolofote = 0; palcoFicha(1, 100.0f, lw, artH); holofote(1000);
+      assert(nHolofote == 1);
+      assert(focus_mover(&foco, 0, -1) && foco.fileira == 0);
+      nHolofote = 0; palcoFicha(1, 100.0f, lw, artH); holofote(1016);
+      assert(nHolofote == 0);
+      assert(focus_mover(&foco, 0, 1) && foco.fileira == 1);
+      focoHero = 1;
+      nHolofote = 0; palcoFicha(1, 100.0f, lw, artH); holofote(1032);
+      assert(nHolofote == 0);
+      anim_politica_reduzida = 0;
+      focoHero = 1;
+    }
+  }
+  // Stage B scene: inspect actual draw coordinates at every supported anchor.
+  {
+    CatItem item = {0};
+    CatFileira row = {.ini = 0, .n = 1};
+    snprintf(item.titulo, sizeof item.titulo, "Teenage Sex and Death at Camp Miasma");
+    snprintf(item.genero, sizeof item.genero, "Movie · Comedy · Horror");
+    snprintf(item.meta, sizeof item.meta, "2026 · 112 min");
+    snprintf(item.sinopse, sizeof item.sinopse, "A director revives a faded slasher franchise.");
+    testeImdb = 65;
+    cat_definir_tudo(&item, 1, &row, 1);
+    fileiras[0] = (Fileira){.tipo = FILEIRA_PALCO, .ini = 0, .n = 1, .escala = 1};
+    foco.fileira = foco.coluna = focoHero = 0;
+    palcoPos[0] = 0;
+    const float scales[] = {.80f, .85f, 1, 1.15f};
+    for (int i = 0; i < 4; i++) {
+      testeTxt = testeAtiva = scales[i];
+      float w = larguraFil(0), h = alturaFil(0);
+      GfxRect p = palcoInfoRect(0, 100, w, h);
+      stageTitleDraws = stageTextDraws = 0;
+      palcoFicha(0, 100, w, h);
+      assert(stageTitleDraws == 1);
+      float cx, scale;
+      palcoGeo(0, 0, w, &cx, &scale);
+      assert(stageGenreRect.y == p.y && p.y == 100 + h * (1 - scale) * .5f);
+      assert(fabsf(p.x - cx - w * scale * .5f - 36) < .01f);
+      assert(stageTitleRect.x >= p.x && stageTitleRect.y >= p.y);
+      assert(stageTitleRect.x + stageTitleRect.w <= p.x + p.w);
+      assert(stageTitleRect.y + stageTitleRect.h <= p.y + p.h);
+      stageBadgeWidth = 0;
+      float used = badge_imdb(0, 0, 65, 0, 1);
+      assert(stageBadgeWidth >= txt_linha(TXT_MINI, "IMDb", 0, 0, 0, 255).w + 16);
+      assert(used == badge_imdb_largura(65));
+    }
+    testeTxt = testeAtiva = 1;
+#ifndef NV_STAGE_BASELINE
+    // Same elapsed time at 30/60 fps; repeat retargets without a position jump.
+    fileiras[0].n = 12;
+    for (int fps = 30; fps <= 60; fps += 30) {
+      foco.coluna = 0;
+      palcoUlt[0] = 0;
+      scrollX[0] = 0;
+      palcoPasso(0, 1000);
+      assert(palcoMov[0].texto == 1);
+      foco.coluna = 1;
+      palcoPasso(0, 1100);
+      for (int frame = 1; frame * 1000 / fps < 160; frame++)
+        palcoPasso(0, 1100 + frame * 1000 / fps);
+      palcoPasso(0, 1260);
+      assert(palcoPos[0] > .5f && palcoPos[0] < .9f);
+      assert(fabsf(palcoMov[0].texto - .4f) < .001f);
+      palcoPasso(0, 1500);
+      assert(palcoPos[0] == 1 && palcoMov[0].texto == 1);
+      foco.coluna = 2;
+      palcoPasso(0, 1600);
+      palcoPasso(0, 1760);
+      float position = palcoPos[0], scroll = scrollX[0];
+      foco.coluna = 8;
+      palcoPasso(0, 1760);
+      assert(palcoPos[0] == position && scrollX[0] == scroll);
+      palcoPasso(0, 2160);
+      assert(palcoPos[0] == 8 && scrollX[0] == palcoMov[0].scrollAlvo);
+      foco.coluna = 7;
+      palcoPasso(0, 2200);
+      palcoPasso(0, 2360);
+      assert(8 - palcoPos[0] > .5f && 8 - palcoPos[0] < .9f);
+      palcoPasso(0, 2600);
+      assert(palcoPos[0] == 7);
+      anim_politica_reduzida = 1;
+      foco.coluna = 0;
+      palcoPasso(0, 2700);
+      assert(palcoPos[0] == 0 && palcoMov[0].texto == 1);
+      anim_politica_reduzida = 0;
+    }
+#endif
+    // Changing text scale must keep the last poster's panel and See all visible.
+    fileiras[0].n = 4;
+    fileiras[0].verTudo = 1;
+    foco.fileira = focoHero = 0;
+    foco.coluna = 3;
+    palcoUlt[0] = 0;
+    testeTxt = testeAtiva = .85f;
+    scrollX[0] = alvoScrollFil(0, 3, 0, 0);
+    palcoPasso(0, 3000);
+    testeTxt = testeAtiva = 1.15f;
+    palcoPasso(0, 4000);
+    GfxRect panel = palcoInfoRect(0, 100, larguraFil(0), alturaFil(0));
+    assert(panel.x + panel.w <= NV_TELA_W);
+    assert(fabsf(scrollX[0] - alvoScrollFil(0, 3, scrollX[0], 0)) < .01f);
+    testeTxt = testeAtiva = 1;
+    testeImdb = 0;
   }
   // A composicao abaixo e a da home SEM o destaque no topo: e nela que a
   // primeira fileira de catalogo vira a vitrine (vitrineNaPrimeira). O #201
@@ -514,6 +716,26 @@ int main(void) {
   assert(!strcmp(arte_por_identidade(1,0),"other-poster.jpg"));
   assert(arte_por_identidade(999,0)==NULL);
 
+  // Ranked rows keep portrait artwork and geometry with landscape posters on.
+  {
+    Fileira saved = fileiras[0];
+    int savedRows = nFileiras, savedFocus = foco.fileira;
+    int savedHero = testeHero;
+    nFileiras = 1; foco.fileira = 0; testeHero = 0;
+    for (int t = 0; t < 2; t++) {
+      fileiras[0] = (Fileira){.tipo = t ? FILEIRA_TOP10 : FILEIRA_TOP10_NUM,
+                              .ini = 0, .n = 1, .escala = 1.0f};
+      float w = larguraFil(0), h = alturaFil(0);
+      for (testeDeitados = 0; testeDeitados <= 1; testeDeitados++) {
+        assert(!strcmp(dinArteDaCor(), "own-poster.jpg"));
+        assert(larguraFil(0) == w && alturaFil(0) == h);
+      }
+    }
+    testeDeitados = 0;
+    fileiras[0] = saved; nFileiras = savedRows;
+    foco.fileira = savedFocus; testeHero = savedHero;
+  }
+
   // A integracao de segunda ordem retargeta sem overshoot, e reduced motion
   // pode saltar ao destino sem deixar velocidade residual.
   { float x=0, v=0;
@@ -643,6 +865,24 @@ int main(void) {
       desenhaEditorialCard(&it, outras[k], 0, 0, 640, 360, 8);
       off = nTxtDesenhado; offB = nBadge;
       assert(on == off && onB == offB && onB == 1);
+    }
+    testeGenero = 1; }
+
+  // O mesmo ajuste no POSTER P/M/G: desligado, sem sinopse nem linha de
+  // genero (so arte e logo/nome); ligado, tudo como sempre.
+  { CatItem it = {0}; float fatores[3] = { 0.8f, 1.0f, 1.25f };
+    snprintf(it.titulo, sizeof it.titulo, "Titulo");
+    snprintf(it.genero, sizeof it.genero, "Terror");
+    snprintf(it.sinopse, sizeof it.sinopse, "Uma sinopse.");
+    for (int k = 0; k < 3; k++) {
+      int on, onS, off, offS;
+      testeGenero = 1; stageTextDraws = 0; nSinopse = 0;
+      desenhaPosterGrande(&it, NULL, 0, 0, 480, 640, 8, 1.0f, fatores[k]);
+      on = stageTextDraws; onS = nSinopse;
+      testeGenero = 0; stageTextDraws = 0; nSinopse = 0;
+      desenhaPosterGrande(&it, NULL, 0, 0, 480, 640, 8, 1.0f, fatores[k]);
+      off = stageTextDraws; offS = nSinopse;
+      assert(onS == 1 && offS == 0 && on == off + 1);
     }
     testeGenero = 1; }
 

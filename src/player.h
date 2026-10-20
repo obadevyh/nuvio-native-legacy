@@ -23,6 +23,15 @@ void player_abrir(int indiceCatalogo, const char *url);
 void player_morph_de(GfxRect logo, GfxRect play);
 void player_definir_episodio(int temporada, int episodio);
 void player_do_inicio(void);
+// 1 depois de player_do_inicio nesta abertura ("Do inicio"): sem ponto salvo.
+int  player_sem_retomada(void);
+// O arquivo tocando e bem mais curto que o titulo (o aviso de duracao viu):
+// pode ser uma parte de um filme em partes (partes.h).
+int  player_parece_parte(void);
+// Cancel duration rejection after confirming the playing file's multipart session.
+void player_confirmar_partes(void);
+// O aviso de duracao com a acao "Manter esta fonte (OK)" ainda esta no ar.
+int  player_aviso_duracao_ativo(void);
 // Posicao confiavel para preparar o Android: registro com duracao conhecida,
 // coerente com o percentual escolhido. Zero mantem a retomada normal depois
 // da duracao real; metadados/reservas nao servem para converter percentual.
@@ -169,21 +178,28 @@ void player_voltar_a_esperar(void);
 
 int  player_aberto(void);   // 1 enquanto a tela existe, inclusive durante o fade de saida
 // Pedidos que so existem com um CANAL no ar (tipo "channel"/"tv"):
-// `player_pediu_guia` — BAIXO ou a tecla azul pediram o overlay do guia.
+// Live OK without controls, DOWN or BLUE requested the mini guide.
 // `player_pediu_zap` — CH+/CH- (NV_SCANCODE_CH_UP/DOWN), PgUp/PgDn e os botoes
 //   do OSD, somados por um debounce de 600 ms (aovivo.h): o deslocamento total.
 int  player_pediu_guia(void);
-// O botao "Guia" do OSD do canal: o guia COMPLETO com o canal no preview.
+// Guide/Menu or the live OSD Guide button: full guide with channel preview.
 int  player_pediu_guia_cheio(void);
 int  player_pediu_zap(void);        // deslocamento em canais (+3, -1...), 0 = nenhum
 int  player_pediu_recarregar(void);  // live OSD or current VOD source reload
 // Capture on Sources open. A changed source/session rejects the request.
 unsigned player_recarregar_contexto(void);
 int player_recarregar_fonte(unsigned contexto);
+// "0" ou o botao "Ultimo canal" na Live TV (decisao 5): voltar ao canal anterior.
+int  player_pediu_ultimo(void);
+// Numero digitado na Live TV (M7) ja confirmado (1,5 s ou OK); 0 = nada.
+int  player_pediu_numero(void);
+const char *player_titulo_canal(void);   // nome do canal no ar ("" sem canal)
 // Identidade do canal congelada na abertura: o indice do catalogo pode ser
 // remapeado por uma republicacao da descoberta em plena reproducao, e zap/foco
 // do guia nao podem depender dele. "" quando a sessao nao e de canal.
 const char *player_id_canal(void);
+// Original resource type, including live-event add-ons using sport/sports.
+const char *player_tipo_canal(void);
 // Marca a sessao como CANAL com o item inteiro de quem abriu — usada pelo
 // guia, que e quem sabe o que pediu para tocar.
 void player_marcar_canal(const CatItem *item);

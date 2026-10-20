@@ -33,7 +33,8 @@ typedef enum {
   FILEIRA_POSTER_GRANDE,
   // 16/10: o painel deitado do foco a esquerda (arte, logo e ficha) e a fila
   // de cartazes a direita; o painel segue o foco da fileira.
-  FILEIRA_HEROI_DIVIDIDO
+  FILEIRA_HEROI_DIVIDIDO,
+  FILEIRA_POSTER       // Explicit portrait row style, independent of global landscape.
 } TipoFileira;
 
 // O item sob o foco, com o retangulo que ele ocupa na tela NESTE quadro. A
@@ -65,6 +66,9 @@ const char *home_arte(int i);
 const char *home_backdrop(int i);   // arte do titulo i do catalogo
 void home_evento(const SDL_Event *e);
 void home_atualizar(float dt, Uint32 agora);
+// Palco: o veu da tela inteira com a luz no titulo em foco; por cima de tudo
+// da home (barra inclusive), antes dos menus e da pagina do titulo.
+void home_holofote_desenhar(Uint32 agora);
 // Poe a home no topo (destaque, fileira 0, sem rolagem) e esquece a posicao
 // lembrada da sessao. Usado ao entrar num perfil novo.
 void home_ir_topo(void);

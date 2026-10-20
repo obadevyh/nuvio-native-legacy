@@ -314,6 +314,32 @@
   0, /* glass quality: Automatica */
   0, /* Dynamic layout background (#205): Gray */
   12, /* Dynamic layout background colour (#205): Ocean */
+  0, /* text and component scale: 85% */
+  0, 0, /* prefer binge group (the hand pick for the whole show + the auto memory) Ligado, across sessions Ligado */
+  0, 5, /* reuse last link: Ligado (owner, 16/10), 24 h */
+  1, /* title page row spacing: Normal */
+  1, /* accent focus: Off (gray plate) */
+  0, /* title line rating order: Default */
+  0, /* art tone: Vivid, identical to existing art colors */
+  0, /* Modern Stage background: Black */
+  0, 0, 0, 0, /* URL lists and guides (Guia de TV, M9): choice (none) and three actions */
+  0, /* episode card rating: follow the title line */
+  0, /* suggest Live TV categories: On, names only */
+  0, /* #578: audio presentation offset, unchanged by default */
+  0, /* Xtream limited connections: Auto; account storage owns the value. */
+  1, /* interface scaling: App (4K) hardware, preserving the existing drawable */
+  0, 0, 0, 0, 0, /* guide source, refresh and M3U actions */
+
+  0, 0, 0, 0, 0, 0, 0, /* native Live TV account registry views/actions */
+  0, 0, 0, /* saved accounts by provider type */
+  0, 0, 0, 0, /* account actions, confirmation, Save and Cancel */
+  0, 0, /* guide category/account order and account reorder action */
+  0, 0, /* EPG memory policy and hidden-category editor */
+  1, /* #507: Library row on Home: Off */
+  0, /* upscaling algorithm: Automatic (default) */
+  2, /* upscaling RCAS sharpness, 0..4 */
+  0, /* experimental HDR menus: Off */
+  0, /* clear cache action */
   0, /* seek preview provider: Seekr.tv (existing installs unchanged) */
   0, 0, 0, /* OpenSeek server / pair / status: actions */
   0, 0, 0, 0, 0, 0, 0, 0, 0, /* OpenSeek shared library: info + offset/undo/reject actions */

@@ -91,6 +91,9 @@ int addons_consulta_atual(const AddonsConsulta *consulta);
 // Uma consulta cancelada/incompleta devolve -1 e deixa *saida NULL.
 int addons_consulta_consultar(const AddonsConsulta *consulta, const char *id, const char *tipo,
                               int fios, int (*cancelado)(void *), void *ctx, void *saida /* Stream ** */);
+// Serial installed add-on availability probe; no plugins, retries, cache, or list publication.
+int addons_consulta_filme(const AddonsConsulta *consulta, const char *id,
+                          int (*cancelado)(void *), void *ctx);
 void addons_consulta_liberar(AddonsConsulta *consulta);
 const char *addons_base(int i);   // URL base, sem /manifest.json
 const char *addons_id_manifesto(int i);   // "id" do manifesto; "" ate a sonda ler
@@ -252,11 +255,11 @@ int  addons_n_legendas(void);
 // memoria pode ser de outro titulo. Quem liga legenda sozinho (faixas.c, #129)
 // precisa dessa distincao; a folha nao, ela so mostra o que ha.
 int  addons_legendas_prontas(void);
+// Thread-local copy, valid until this thread calls addons_legenda() again.
 const Legenda *addons_legenda(int i);
 // ATOMIC SNAPSHOT of the subtitle list: copies up to `max` entries while the
-// list mutex is held, so a reader never sees a list being replaced (the
-// pointer from addons_legenda() is read after the unlock and can race the
-// worker). `geracao` (optional) receives the list generation; `prontas`
+// list mutex is held, so a reader never sees a list being replaced.
+// `geracao` (optional) receives the list generation; `prontas`
 // (optional) the same answer as addons_legendas_prontas(), from the same lock.
 // Returns how many entries were copied.
 int  addons_legendas_copiar(Legenda *dst, int max, unsigned *geracao, int *prontas);
