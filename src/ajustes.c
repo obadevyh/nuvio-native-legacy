@@ -92,6 +92,7 @@
 #include "rede.h"
 #include "debrid.h"
 #include "seekr.h"
+#include "miniatura_android.h"
 #include "openseek.h"
 #include "selospacote.h"
 #include "fonteregra.h"
@@ -1344,7 +1345,13 @@ static const char *JF_ALFA_URL =
 static const char *JF_ALFA_SENHA =
   "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-@!#$%&*+=?/ ";
 
-static const char *V_PREVIA_PROV[] = { "Seekr.tv", "OpenSeek (servidor próprio)" };
+static const char *V_PREVIA_PROV[] = { "Seekr.tv", "OpenSeek (servidor próprio)", "No aparelho (teste)" };
+// "No aparelho" (miniatura_android.c) so existe no Android.
+#ifdef NV_ANDROID
+#define NV_PREVIA_N 3
+#else
+#define NV_PREVIA_N 2
+#endif
 static const char *V_MANTER_PRAZO[] = { "2 min", "5 min", "10 min", "30 min", "Sem limite" };
 static const char *V_AMIGOS_ESTILO[] = { "Feed de cartões", "Ao vivo em destaque", "Histórias com cartaz", "Faixa de presença", "Cartaz primeiro", "Rostos clássicos" };
 static const char *V_CONEXOES[] = { "Automático", "Ligado", "Desligado" };
@@ -1841,7 +1848,7 @@ static const Opcao OPCOES[AJ_N] = {
   ESC("Dolby Vision P7 para P8.1 (experimental)", V_LIGA, 2),
   ESC("Registro na rede local", V_LIGA, 2),                   // local: logRedeLocal
   ESC("Formato no player", V_PLR_FORMATO, 6),          // local: plrFormatoLocal
-  ESC("Provedor das miniaturas", V_PREVIA_PROV, 2),          // local: previaProvedorLocal
+  ESC("Provedor das miniaturas", V_PREVIA_PROV, NV_PREVIA_N),          // local: previaProvedorLocal
   ACAO("Servidor OpenSeek"),
   ACAO("Parear com o OpenSeek"),
   ACAO("Estado do OpenSeek"),
@@ -2758,8 +2765,18 @@ static int previaOpenSeek(void) {
   return valor[AJ_PREVIA_PROVEDOR] == 1;
 #endif
 }
-// "Tem credencial" do provedor ativo: a chave do Seekr ou o pareamento.
-static int previaCredencial(void) { return previaOpenSeek() ? openseek_pareado() : seekrChave[0] != 0; }
+// As miniaturas sao feitas neste aparelho (miniatura_android.c)?
+static int previaLocal(void) {
+#ifdef NV_ANDROID
+  return valor[AJ_PREVIA_PROVEDOR] == 2;
+#else
+  return 0;
+#endif
+}
+// "Tem credencial" do provedor ativo: a chave do Seekr, o pareamento, ou nada a pedir (no aparelho).
+static int previaCredencial(void) {
+  return previaLocal() ? 1 : previaOpenSeek() ? openseek_pareado() : seekrChave[0] != 0;
+}
 static int lig(int op) {
   if (op == AJ_FALHA_PROVEDORES || op == AJ_FALHA_ADDONS) return ajFalhaValor(op) == 0;
   return valor[op] == 0 && (op != AJ_SEEKR_LIGADO || previaCredencial());
@@ -2768,10 +2785,10 @@ static int lig(int op) {
 // (o padrao, NULL no seekr.c) nada de novo e tocado.
 static void previaAplicar(void) {
   static int aplicado;
-  int quer = previaOpenSeek();
+  int quer = previaLocal() ? 2 : previaOpenSeek();
   if (quer == aplicado) return;
   aplicado = quer;
-  seekr_usar_provedor(quer ? openseek_provedor() : NULL);
+  seekr_usar_provedor(quer == 2 ? miniatura_provedor() : quer ? openseek_provedor() : NULL);
 }
 // #311: "Buscar no Cinemeta" so governa a BUSCA (o add-on Cinemeta e a reserva
 // do catalogo do Nuvio). Sem o add-on instalado e com o ajuste no padrao ele nao
@@ -4097,6 +4114,7 @@ static const char *seekrPedirChave(void) {
 }
 // OPENSEEK (openseek.h): o que falta para ligar as miniaturas por ele.
 static const char *previaPedirCredencial(void) {
+  if (previaLocal()) return "";
   if (!previaOpenSeek()) return seekrPedirChave();
   return openseek_endereco()[0] ? i18n("Pareie com o OpenSeek para ligar as miniaturas.")
                                 : i18n("Informe o endereço do servidor OpenSeek.");
@@ -4167,7 +4185,7 @@ static const char *seekrMascarada(void) {
 int ajustes_seekr_habilitado(void) { return valor[AJ_SEEKR_LIGADO] == 0; }
 int ajustes_seekr_ligado(void) { return lig(AJ_SEEKR_LIGADO); }
 int ajustes_seekr_fita(void)   { return lig(AJ_SEEKR_FITA); }
-int ajustes_seekr_ajuste_s(void) { return previaOpenSeek() ? 0 : valor[AJ_SEEKR_AJUSTE]; }
+int ajustes_seekr_ajuste_s(void) { return previaOpenSeek() || previaLocal() ? 0 : valor[AJ_SEEKR_AJUSTE]; }
 
 // ENDERECO DO SERVIDOR P2P (p2p.h). Mora em p2p.txt na pasta de dados, por
 // aparelho: e o IP de um PC/NAS da casa desta TV, sem sentido em outra.
@@ -7292,7 +7310,7 @@ static int visivel(int i) {
     if ((op == AJ_FUNDO_DIN || op == AJ_FUNDO_DIN_COR) && ajustes_home_layout() != HOME_LAYOUT_DINAMICA) return 0;
     // Miniaturas: so as opcoes do provedor escolhido. A sincronia manual existe
     // para a folha do Seekr tirada de OUTRA versao; a do OpenSeek e do proprio video.
-    if ((op == AJ_SEEKR_CHAVE || op == AJ_SEEKR_TESTAR || op == AJ_SEEKR_AJUSTE) && previaOpenSeek()) return 0;
+    if ((op == AJ_SEEKR_CHAVE || op == AJ_SEEKR_TESTAR || op == AJ_SEEKR_AJUSTE) && (previaOpenSeek() || previaLocal())) return 0;
     if (op >= AJ_OPENSEEK_SERVIDOR && op <= AJ_OPENSEEK_ULT && !previaOpenSeek()) return 0;
     // As linhas de biblioteca compartilhada so existem num aparelho CONVIDADO.
     if (op >= AJ_OPENSEEK_COMPART && op <= AJ_OPENSEEK_ULT && openseek_papel() != OS_PAPEL_CONVIDADO) return 0;
