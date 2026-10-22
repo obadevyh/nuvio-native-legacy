@@ -262,6 +262,32 @@ object NvPlayer {
         }
         return 0
     }
+    // ON-DEVICE THUMBNAILS (MiniaturaMotor / miniatura_android.c): the frame ON SCREEN as a 32x18 grey signature
+    // plus the position it was taken at, for the check that a smaller copy lines up with what plays. A 160x90
+    // PixelCopy of the same Surface as quadro(): no download, no decoder, nothing the player feels. Called from a
+    // worker thread (never the main one); null while not playing or when the copy fails.
+    @JvmStatic fun assinaturaTela(): ByteArray? {
+        if (Looper.myLooper() == Looper.getMainLooper()) return null
+        val pronto = java.util.concurrent.CountDownLatch(1)
+        var saida: ByteArray? = null
+        principal.post {
+            val sv = superficie; val p = player
+            if (sv == null || p == null || !sv.holder.surface.isValid || !p.isPlaying || videoW <= 0 || videoH <= 0) {
+                pronto.countDown(); return@post
+            }
+            val b = try { Bitmap.createBitmap(160, (160 * videoH / videoW).coerceIn(16, 160), Bitmap.Config.ARGB_8888) }
+                    catch (_: OutOfMemoryError) { pronto.countDown(); return@post }
+            val pos = p.currentPosition
+            try {
+                PixelCopy.request(sv, b, { r ->
+                    if (r == PixelCopy.SUCCESS) saida = MiniaturaMotor.assinaturaDe(b, pos)
+                    b.recycle(); pronto.countDown()
+                }, principal)
+            } catch (_: Exception) { b.recycle(); pronto.countDown() }
+        }
+        pronto.await(800, java.util.concurrent.TimeUnit.MILLISECONDS)
+        return saida
+    }
     private fun mostrarQuadro(url: String, titulo: String) {
         esconderQuadro()
         if (titulo.isEmpty()) return // Home trailer leaves the last title snapshot alone.

@@ -92,7 +92,7 @@ static int motivoSem;            // M_FALHOU because: 0 the video would not open
 
 // ---- JNI (MiniaturaMotor.kt) ----
 static jclass cls;
-static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede;
+static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela;
 
 static int jniPreparar(void) {
   if (cls) return 1;
@@ -117,7 +117,8 @@ static int jniPreparar(void) {
     jLidos = (*env)->GetStaticMethodID(env, c, "lidos", "(J)J");
     jRitmo = (*env)->GetStaticMethodID(env, c, "ritmo", "()J");
     jFalhaRede = (*env)->GetStaticMethodID(env, c, "falhaRede", "(J)I");
-    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede) {
+    jTela = (*env)->GetStaticMethodID(env, c, "tela", "()[B");
+    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela) {
       (*env)->ExceptionClear(env);
     } else {
       cls = (jclass)(*env)->NewGlobalRef(env, c);
@@ -423,6 +424,137 @@ static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int n
   double sigma = sqrt(s2 / n), spread = sqrt(fmax(0, sp2 / n - (sp / n) * (sp / n)));
   if (spread <= 0) spread = 1;
   *erro = 3 * sigma / sqrt(n) + 2.0 * (sigma / (sqrt(n) * spread)) * durA / 2 + 500.0;
+  return 1;
+}
+
+// ---- the check from the SCREEN: frames the player already shows, no 4K read ----
+// For a copy whose runtime matches the playing file (within 2.5 s: the same cut), the frames on screen are the
+// anchors: NvPlayer.assinaturaTela copies the frame being shown (PixelCopy, 160x90) with its position. Each one is
+// matched against EXACT frames of the copy around the predicted time (the first one after a keyframe scan), and
+// the parabola peak gives the offset. Accepted with 4+ anchors over 10+ s of playback that agree within 1.5 s.
+// Measured before (22/10): the 4K anchors cost 74-82 MB of the playing file and the hitches at the start.
+#define TELA_ANCORAS 5
+#define TELA_MIN_CORR 0.55
+#define TELA_ESPACO_MS 4000L
+#define TELA_ACORDO_MS 1500.0
+#define TELA_PRAZO_MS 120000u
+#define TELA_DUR_IGUAL_MS 2500L
+
+static int mTela(long *pts, float sig[SIG_N], int *temSig) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jbyteArray a = (jbyteArray)(*env)->CallStaticObjectMethod(env, cls, jTela);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); a = NULL; }
+  return desempacotar(env, a, pts, sig, temSig, NULL, NULL);
+}
+
+// Similarity peak of the copy's exact frames at centro + DES[i]; *t = interpolated copy time. 0 = no frame/weak.
+static int picoExato(Job *j, long long hB, const float *sa, double centro, const long *des, int nd, double minCorr,
+                     double *t, double *rMelhor) {
+  double cs[8], ps[8]; int nc = 0;
+  float sb[SIG_N];
+  for (int d = 0; d < nd && !parou(j); d++) {
+    long alvo = (long)(centro + des[d]), p; int ok;
+    if (alvo < 0) alvo = 0;
+    esperarPlayer(j);
+    int lido = mExato(hB, alvo, &p, sb, &ok, NULL, NULL);
+    if (falhou(j, lido, hB)) return -1;
+    if (!lido || !ok) continue;
+    double c = 0;
+    for (int k = 0; k < SIG_N; k++) c += sa[k] * sb[k];
+    cs[nc] = c; ps[nc] = p; nc++;
+  }
+  if (nc < 2) return 0;
+  int m = 0;
+  for (int k = 1; k < nc; k++) if (cs[k] > cs[m]) m = k;
+  *rMelhor = cs[m];
+  if (cs[m] < minCorr) return 0;
+  *t = ps[m];
+  if (m > 0 && m < nc - 1 && ps[m + 1] > ps[m - 1]) {
+    double den = cs[m - 1] - 2 * cs[m] + cs[m + 1];
+    if (den < -1e-9) {
+      double s = 0.5 * (cs[m - 1] - cs[m + 1]) / den;
+      if (s > 1) s = 1;
+      if (s < -1) s = -1;
+      *t = ps[m] + s * (fabs(ps[m + 1] - ps[m]) + fabs(ps[m] - ps[m - 1])) / 2;
+    }
+  }
+  return 1;
+}
+
+// 1 accepted (mapa filled), 0 rejected, -1 the screen gave no frames (the caller falls back to the 4K anchors).
+static int conferirTela(Job *j, long long hB, long durB, Mapa *mapa) {
+  static const long LARGO[] = { -2000, -1000, 0, 1000, 2000 }, ESTREITO[] = { -1000, 0, 1000 };
+  Par m[TELA_ANCORAS];
+  int nm = 0, telas = 0, falhasTela = 0, provas = 0;
+  long ultimo = -1000000;
+  double b = 0;
+  float sa[SIG_N], sb[SIG_N];
+  Uint32 ini = SDL_GetTicks();
+  while (nm < TELA_ANCORAS && !parou(j) && SDL_GetTicks() - ini < TELA_PRAZO_MS && provas < TELA_ANCORAS * 3) {
+    esperarPlayer(j);
+    if (scrubbing) { dormir(j, 500); continue; }
+    long pA; int ok;
+    if (!mTela(&pA, sa, &ok)) { if (++falhasTela >= 10 && !telas) return -1; dormir(j, 1000); continue; }
+    telas++;
+    if (!ok || labs(pA - ultimo) < TELA_ESPACO_MS || pA < 5000) { dormir(j, 1000); continue; }   // flat, too close
+    ultimo = pA; provas++;
+    double t, r = -2;
+    int achou;
+    if (nm == 0) {
+      // first anchor: the copy's KEYFRAMES +-12 s around the same time find the region, then the exact frames
+      double melhor = -2, pMelhor = pA;
+      long ultimoKf = -1;
+      for (long d = -12000; d <= 12000 && !parou(j); d += 2000) {
+        long alvo = pA + d, p; int okB;
+        if (alvo < 0 || alvo >= durB) continue;
+        esperarPlayer(j);
+        int lido = mQuadro(hB, alvo, 1, 0, &p, sb, &okB, NULL, NULL);
+        if (falhou(j, lido, hB)) return 0;
+        if (!lido || !okB || p == ultimoKf) continue;
+        ultimoKf = p;
+        double c = 0;
+        for (int k = 0; k < SIG_N; k++) c += sa[k] * sb[k];
+        if (c > melhor) { melhor = c; pMelhor = p; }
+      }
+      if (melhor < TELA_MIN_CORR - 0.15) {
+        printf("[miniatura] screen check at %lds: no similar copy frame nearby (best r=%.2f)\n", pA / 1000, melhor); fflush(stdout);
+        continue;
+      }
+      achou = picoExato(j, hB, sa, pMelhor, LARGO, 5, TELA_MIN_CORR, &t, &r);
+    } else {
+      achou = picoExato(j, hB, sa, pA + b, ESTREITO, 3, TELA_MIN_CORR, &t, &r);
+    }
+    if (achou < 0) return 0;
+    printf("[miniatura] screen check at %lds: r=%.2f %s (offset %+.2fs)\n", pA / 1000, r, achou ? "match" : "no",
+           achou ? (t - pA) / 1000.0 : 0.0);
+    fflush(stdout);
+    if (!achou) continue;
+    m[nm].pa = pA; m[nm].pb = t; nm++;
+    double soma = 0;
+    for (int k = 0; k < nm; k++) soma += m[k].pb - m[k].pa;
+    b = soma / nm;
+  }
+  if (!telas) return -1;
+  if (nm < 4) { printf("[miniatura] screen check: rejected (%d of %d agree)\n", nm, provas); fflush(stdout); return 0; }
+  double lo = 1e18, hi = -1e18, s2 = 0, aMin = 1e18, aMax = -1e18;
+  for (int k = 0; k < nm; k++) {
+    double o = m[k].pb - m[k].pa;
+    if (o < lo) lo = o;
+    if (o > hi) hi = o;
+    s2 += (o - b) * (o - b);
+    if (m[k].pa < aMin) aMin = m[k].pa;
+    if (m[k].pa > aMax) aMax = m[k].pa;
+  }
+  if (hi - lo > TELA_ACORDO_MS || aMax - aMin < 10000) {
+    printf("[miniatura] screen check: rejected (offsets spread %.1fs over %.0fs of playback)\n", (hi - lo) / 1000, (aMax - aMin) / 1000);
+    fflush(stdout);
+    return 0;
+  }
+  double erro = 3 * sqrt(s2 / nm) / sqrt(nm) + 500.0;
+  mapa->a = 1.0; mapa->b = b; mapa->erro = erro; mapa->inliers = nm;
+  printf("[miniatura] screen check: ACCEPTED t_copy = t_play %+.2fs (%d anchors over %.0fs, +-%.1fs) in %.1f s, no 4K read\n",
+         b / 1000, nm, (aMax - aMin) / 1000, erro / 1000, (SDL_GetTicks() - ini) / 1000.0);
+  fflush(stdout);
   return 1;
 }
 
@@ -763,16 +895,11 @@ static void *trabalhar(void *u) {
     goto fim;
   }
   esperarPlayer(j);
-  hA = mAbrir(j->urlA, j->cabA, 0);
-  if (!hA) {
-    printf("[miniatura] could not open the playing source\n"); fflush(stdout);
-    pthread_mutex_lock(&mu); if (job == j) estado = M_FALHOU; pthread_mutex_unlock(&mu);
-    goto fim;
-  }
-  mInfo(hA, info);
-  if (info[0] > 0) j->dur = (long)info[0];
-  printf("[miniatura] playing %lldx%lld hdr=%lld %.1f min; %d smaller cop%s in the list\n", info[1], info[2], info[3],
-         j->dur / 60000.0, j->nCopias, j->nCopias == 1 ? "y" : "ies");
+  memset(info, 0, sizeof info);
+  // The playing file is NOT opened here: the screen check needs only what the player shows. It is opened only for
+  // the 4K-anchor check (a copy whose runtime differs, or no screen frames) or to make thumbnails from a <= 1080p file.
+  printf("[miniatura] playing %dp %.1f min; %d smaller cop%s in the list\n", j->alturaA, j->dur / 60000.0, j->nCopias,
+         j->nCopias == 1 ? "y" : "ies");
   fflush(stdout);
   for (int c = 0; c < j->nCopias && !usaB && !parou(j); c++) {
     hB = mAbrir(j->copias[c].url, j->copias[c].cab, 1);
@@ -782,7 +909,17 @@ static void *trabalhar(void *u) {
     printf("[miniatura] checking copy %d: %lldx%lld %.1f min\n", c + 1, ib[1], ib[2], ib[0] / 60000.0); fflush(stdout);
     Uint32 c0 = SDL_GetTicks();
     long long lA0 = mLidos(hA);
-    int aceita = ib[0] > 0 && conferir(j, hA, hB, j->dur, (long)ib[0], j->anc, &mapa, info[3] != 0);
+    int aceita = 0, tela = -1;
+    if (ib[0] > 0 && labs((long)ib[0] - j->dur) <= TELA_DUR_IGUAL_MS) tela = conferirTela(j, hB, (long)ib[0], &mapa);
+    if (tela == 1) aceita = 1;
+    else if (tela == -1 && ib[0] > 0 && !parou(j)) {
+      // runtime differs (maybe another cut: anchors across the whole film), or the screen gave no frames
+      printf("[miniatura] %s: checking with the playing file's own frames\n", labs((long)ib[0] - j->dur) > TELA_DUR_IGUAL_MS ?
+             "runtime differs" : "no screen frames");
+      fflush(stdout);
+      if (!hA) { hA = mAbrir(j->urlA, j->cabA, 0); if (hA) { mInfo(hA, info); lA0 = mLidos(hA); } }
+      if (hA) aceita = conferir(j, hA, hB, j->dur, (long)ib[0], j->anc, &mapa, info[3] != 0);
+    }
     long long lidosB = mLidos(hB);
     if (aceita) {
       usaB = 1;
@@ -793,7 +930,11 @@ static void *trabalhar(void *u) {
            (mLidos(hA) - lA0) / 1048576.0, lidosB / 1048576.0);
     fflush(stdout);
   }
-  if (!usaB && (info[2] > 1088 || j->alturaA > 1080)) {
+  if (!usaB && !hA && j->alturaA <= 1080 && !parou(j)) {    // making them from a small playing file needs it open
+    hA = mAbrir(j->urlA, j->cabA, 0);
+    if (hA) mInfo(hA, info);
+  }
+  if (!usaB && (info[2] > 1088 || j->alturaA > 1080 || !hA)) {
     // Never thumbnails from the 4K itself (owner, 22/10: GBs of reads next to the player). The check's anchors stay.
     printf("[miniatura] no copy passed the check: stopping (thumbnails are never made from the %lldp file)\n", info[2]);
     fflush(stdout);

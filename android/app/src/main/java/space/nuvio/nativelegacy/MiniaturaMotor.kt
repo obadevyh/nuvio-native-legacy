@@ -415,6 +415,36 @@ object MiniaturaMotor {
         }
     }
 
+    // The frame on screen (NvPlayer.assinaturaTela), in the reply format of quadro() without a JPEG. Luma from RGB
+    // (Rec. 709 weights), the same crop and 32x18 grid as montar(); the C side removes the mean and normalises, so
+    // the RGB-vs-Y range difference does not matter.
+    @JvmStatic
+    fun tela(): ByteArray? = NvPlayer.assinaturaTela()
+
+    fun assinaturaDe(b: Bitmap, posMs: Long): ByteArray {
+        val w = b.width; val h = b.height
+        val px = IntArray(w * h)
+        b.getPixels(px, 0, w, 0, 0, w, h)
+        val sig = ByteArray(SW * SH)
+        val x0 = w / 10; val x1 = w - w / 10; val y0 = h * 16 / 100; val y1 = h - h * 16 / 100
+        for (j in 0 until SH) for (i in 0 until SW) {
+            val ax = x0 + (x1 - x0) * i / SW; val bx = maxOf(ax + 1, x0 + (x1 - x0) * (i + 1) / SW)
+            val ay = y0 + (y1 - y0) * j / SH; val by = maxOf(ay + 1, y0 + (y1 - y0) * (j + 1) / SH)
+            var sum = 0; var n = 0
+            for (yy in ay until by) for (xx in ax until bx) {
+                val c = px[yy * w + xx]
+                sum += (((c shr 16) and 0xff) * 54 + ((c shr 8) and 0xff) * 183 + (c and 0xff) * 19) shr 8
+                n++
+            }
+            sig[j * SW + i] = (if (n > 0) sum / n else 0).toByte()
+        }
+        val out = ByteArrayOutputStream(600)
+        for (k in 7 downTo 0) out.write(((posMs shr (8 * k)) and 0xff).toInt())
+        out.write(1)
+        out.write(sig)
+        return out.toByteArray()
+    }
+
     private fun montar(s: Sessao, img: Image, ptsMs: Long, jpeg: Boolean): ByteArray {
         val w = img.width; val h = img.height
         val py = img.planes[0]; val pu = img.planes[1]; val pv = img.planes[2]
