@@ -123,6 +123,9 @@ object MiniaturaMotor {
         var dec: MediaCodec? = null
         var soft = false
         var hdr = false
+        // Hardware decoder that gives no frame: first again without the low priority, then (<= 1080p) the software one.
+        // Measured 22/10: the Shield's H.264 decoder at priority 1 next to playback timed out on every frame.
+        var travadas = 0
         var ultimoPts = Long.MIN_VALUE
         var ultimoRes: ByteArray? = null
     }
@@ -216,7 +219,9 @@ object MiniaturaMotor {
 
     private fun decoder(s: Sessao): MediaCodec? {
         s.dec?.let { return it }
-        val tentativas = mutableListOf<Pair<String?, Boolean>>(null to false)
+        val altura = s.fmt.getInteger(MediaFormat.KEY_HEIGHT)
+        val tentativas = mutableListOf<Pair<String?, Boolean>>()
+        if (s.travadas < 2 || altura > 1088) tentativas += null to false
         val mime = if (s.mime == "video/dolby-vision") "video/hevc" else s.mime
         for (ci in MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos) {
             if (ci.isEncoder) continue
@@ -229,8 +234,9 @@ object MiniaturaMotor {
                 c = if (nome == null) MediaCodec.createDecoderByType(s.mime) else MediaCodec.createByCodecName(nome)
                 val f = MediaFormat(s.fmt)
                 if (s.mime == "video/dolby-vision" && soft) f.setString(MediaFormat.KEY_MIME, "video/hevc")
-                // Not real time: the player's decoder keeps the priority (shared hardware on the Shield).
-                f.setInteger(MediaFormat.KEY_PRIORITY, 1)
+                // Not real time: the player's decoder keeps the priority (shared hardware on the Shield), unless that
+                // already left this decoder without frames once.
+                if (s.travadas == 0) f.setInteger(MediaFormat.KEY_PRIORITY, 1)
                 c.configure(f, null, null, 0)
                 c.start()
                 s.dec = c; s.soft = soft
@@ -287,7 +293,7 @@ object MiniaturaMotor {
             var fed = 0
             var eos = false
             val ini = System.currentTimeMillis()
-            while (System.currentTimeMillis() - ini < 8000) {
+            while (System.currentTimeMillis() - ini < 4000) {
                 if (!eos && fed < 40) {
                     val ib = dec.dequeueInputBuffer(2000)
                     if (ib >= 0) {
@@ -306,8 +312,9 @@ object MiniaturaMotor {
                     if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return motivo(s, tMs, "decoder ended without a frame (fed $fed)")
                 }
             }
-            soltarDecoder(h)   // stuck: start clean next time
-            return motivo(s, tMs, "decoder timed out (fed $fed)")
+            soltarDecoder(h)   // stuck: start clean next time, one step further down the decoder ladder
+            if (!s.soft && !s.fonte.erroRede) s.travadas++
+            return motivo(s, tMs, "decoder timed out (fed $fed), next try: ${if (s.travadas >= 2) "software" else "normal priority"}")
         } catch (e: Exception) {
             soltarDecoder(h)
             return motivo(s, tMs, "error ${e.javaClass.simpleName}")

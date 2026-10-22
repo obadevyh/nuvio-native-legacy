@@ -540,8 +540,11 @@ static void chaveArquivo(const SeekrFonte *f, char *out, size_t n) {
   const char *nome = f->arquivo && f->arquivo[0] ? f->arquivo : "";
   const char *barra = strrchr(nome, '/');
   if (barra) nome = barra + 1;
-  if (nome[0] && f->tamanho) snprintf(id, sizeof id, "f|%s|%llu", nome, (unsigned long long)f->tamanho);
-  else snprintf(id, sizeof id, "u|%s", f->url ? f->url : "");
+  // Never the link: add-on/proxy links are signed per request (measured: a resumed episode missed its saved set).
+  // The title + episode, then the file's exact size and name when the add-on declares them, else its duration.
+  if (f->tamanho || nome[0])
+    snprintf(id, sizeof id, "t|%s:%d:%d|%llu|%s", f->imdb ? f->imdb : "", f->t, f->e, (unsigned long long)f->tamanho, nome);
+  else snprintf(id, sizeof id, "d|%s:%d:%d|%ld", f->imdb ? f->imdb : "", f->t, f->e, f->durMs / 1000);
   unsigned long long h = 1469598103934665603ULL;
   for (const char *p = id; *p; p++) { h ^= (unsigned char)tolower((unsigned char)*p); h *= 1099511628211ULL; }
   char dir[512];
