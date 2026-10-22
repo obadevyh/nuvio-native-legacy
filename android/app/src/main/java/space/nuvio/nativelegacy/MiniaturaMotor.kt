@@ -18,7 +18,7 @@ import kotlin.math.pow
 // SEEK-BAR THUMBNAILS MADE ON THIS DEVICE (src/miniatura_android.c is the C side).
 //
 // One keyframe at a time: seek the container index to the nearest keyframe, hand
-// that one sample to a decoder, shrink the frame to 320x180 (JPEG for the bar)
+// that one sample to a decoder, shrink the frame to 480x270 (JPEG for the bar)
 // and to a 32x18 grey signature (OpenSeek's, for checking that a smaller copy of
 // the same title lines up with what is playing). Reads go through our own range
 // reader (256 KB blocks, small LRU), so nothing is downloaded ahead and the bytes
@@ -30,8 +30,8 @@ object MiniaturaMotor {
     private const val TAG = "nuvio-miniatura"
     private const val BLK = 256 * 1024
     private const val NBLK = 24
-    const val TW = 320
-    const val TH = 180
+    const val TW = 480   // shown at 576x324 in the seek preview (player.c); was 320x180
+    const val TH = 270
     const val SW = 32
     const val SH = 18
 

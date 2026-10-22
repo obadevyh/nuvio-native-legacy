@@ -2,14 +2,14 @@
 // seekr.c next to Seekr.tv and OpenSeek: Settings > "Provedor das miniaturas" >
 // "No aparelho (teste)".
 //
-// While a title plays, worker threads make a 320x180 thumbnail per 10 s from the
+// While a title plays, worker threads make a 480x270 thumbnail per 10 s from the
 // nearest KEYFRAME of a SMALLER COPY of the same title from the source list
 // (cached, 480p-1080p, same edition words, runtime within 10 %; the same file
 // from two add-ons counts once), after a frame check that the two line up
 // (OpenSeek's timeline check, backend/openseek/timeline.py: anchors, 32x18 grey
 // signatures, a fine pass on exact copy frames, one offset/speed mapping or a
 // rejection). Decoding: MiniaturaMotor.kt (the device decoder as a second
-// session, Android's software decoder when that gives no frames).
+// session above 1080p; Android's software decoder first for the copies).
 // Thumbnails are NEVER made from a file above 1080p: no copy, or none passing the
 // check, means no thumbnails (the check reads ~20 frames of the playing file).
 //

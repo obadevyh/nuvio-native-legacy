@@ -5144,7 +5144,8 @@ static void seekrMiniatura(float bx, float bw, float frac, float yBarra, float a
   GLuint t[3] = { 0, 0, 0 };
   double cue[3] = { -1, -1, -1 };
   int fita, n, k, est;
-  const float w = 384.0f, h = 216.0f, ws = 256.0f, hs = 144.0f, vao = 12.0f, linha = 52.0f;
+  // Netflix-sized (owner, 22/10: "the preview is tiny"): 576x324, ~30 % of the 1080p canvas; was 384x216.
+  const float w = 576.0f, h = 324.0f, ws = 384.0f, hs = 216.0f, vao = 14.0f, linha = 56.0f;
   float x, y, tot, xs[3];
   Uint32 agora = SDL_GetTicks();
   if (ehCanal() || !(scrubbing || posVisSolto) || a < 0.05f || !ajustes_seekr_habilitado()) return;
