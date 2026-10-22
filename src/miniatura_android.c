@@ -269,7 +269,8 @@ static void esperarPlayer(const Job *j) {
   }
 }
 // A failed frame: when a READ failed (the engine says so), back off 5 s, 10 s, 20 s and end the job on the 4th in a
-// row (the link is refusing us). A frame that only would not DECODE is skipped at once; 8 of those in a row end it.
+// row (the link is refusing us). A frame that only would not DECODE is skipped at once; 3 of those in a row end it
+// (22/10: a copy whose frames all threw made decoders in a burst next to the player, whose own decoder then failed).
 static __thread int falhasSeguidas, decodSeguidas;   // per lane
 static int mFalhaRede(long long h);
 static int falhou(const Job *j, int ok, long long h) {
@@ -280,7 +281,7 @@ static int falhou(const Job *j, int ok, long long h) {
     return 1;
   }
   if (!rede) {
-    if (++decodSeguidas >= 8) { printf("[miniatura] stopping: %d frames in a row would not decode\n", decodSeguidas); fflush(stdout); return 1; }
+    if (++decodSeguidas >= 3) { printf("[miniatura] stopping: %d frames in a row would not decode\n", decodSeguidas); fflush(stdout); return 1; }
     return 0;
   }
   if (++falhasSeguidas >= 4) {
@@ -947,8 +948,8 @@ static void *trabalhar(void *u) {
   falhasSeguidas = 0; decodSeguidas = 0;
   if (j->arq[0]) limparCache(j->arq);           // other titles' sets older than 2 h go now
   if (carregar(j)) goto fim;                    // a complete saved set: no network at all
-  if (j->nCopias == 0 && j->alturaA > 1080) {    // nothing smaller to make them from: the 4K is not even opened
-    printf("[miniatura] no smaller copy in the list: no thumbnails for a %dp file\n", j->alturaA); fflush(stdout);
+  if (j->nCopias == 0) {                        // nothing smaller to make them from: the playing file is not opened
+    printf("[miniatura] no smaller copy in the list: no thumbnails for this title\n"); fflush(stdout);
     pthread_mutex_lock(&mu); if (job == j) { estado = M_FALHOU; motivoSem = 1; } pthread_mutex_unlock(&mu);
     goto fim;
   }
@@ -970,7 +971,7 @@ static void *trabalhar(void *u) {
     int aceita = 0, tela = -1;
     if (ib[0] > 0 && labs((long)ib[0] - j->dur) <= TELA_DUR_IGUAL_MS) tela = conferirTela(j, hB, (long)ib[0], &mapa);
     if (tela == 1) aceita = 1;
-    else if (tela == -1 && ib[0] > 0 && !parou(j)) {
+    else if (tela == -1 && ib[0] > 0 && j->alturaA > 1080 && !parou(j)) {   // never decode a <= 1080p playing file
       // runtime differs (maybe another cut: anchors across the whole film), or the screen gave no frames
       printf("[miniatura] %s: checking with the playing file's own frames\n", labs((long)ib[0] - j->dur) > TELA_DUR_IGUAL_MS ?
              "runtime differs" : "no screen frames");
@@ -988,14 +989,11 @@ static void *trabalhar(void *u) {
            (mLidos(hA) - lA0) / 1048576.0, lidosB / 1048576.0);
     fflush(stdout);
   }
-  if (!usaB && !hA && j->alturaA <= 1080 && !parou(j)) {    // making them from a small playing file needs it open
-    hA = mAbrir(j->urlA, j->cabA, 0);
-    if (hA) mInfo(hA, info);
-  }
-  if (!usaB && (info[2] > 1088 || j->alturaA > 1080 || !hA)) {
+  // Never thumbnails from the PLAYING file, at any resolution: decoding the very video the player decodes is what
+  // preceded the player's own decoder failing (4003) and the source switches (22/10, a 1080p remux episode).
+  if (!usaB) {
     // Never thumbnails from the 4K itself (owner, 22/10: GBs of reads next to the player). The check's anchors stay.
-    printf("[miniatura] no copy passed the check: stopping (thumbnails are never made from the %dp file)\n",
-           info[2] > 0 ? (int)info[2] : j->alturaA);
+    printf("[miniatura] no copy passed the check: stopping (thumbnails are never made from the playing file)\n");
     fflush(stdout);
     pthread_mutex_lock(&mu); if (job == j && !j->feitos) { estado = M_FALHOU; motivoSem = 1; } pthread_mutex_unlock(&mu);
     goto fim;

@@ -403,6 +403,9 @@ object MiniaturaMotor {
         // Hardware decoder that gives no frame: first again without the low priority, then (<= 1080p) the software one.
         // Measured 22/10: the Shield's H.264 decoder at priority 1 next to playback timed out on every frame.
         var travadas = 0
+        // Codec errors (IllegalState/CodecException) on this file: at 2 the file is given up. Measured 22/10: a copy
+        // whose frames threw at once made 8 decoders in ~1 s, and the player's own decoder failed (4003) next to it.
+        var errosCodec = 0
         var ultimoPts = Long.MIN_VALUE
         var ultimoRes: ByteArray? = null
     }
@@ -509,8 +512,17 @@ object MiniaturaMotor {
         return try { f.prefetch(tempos) } catch (e: IOException) { if (f.recusado) -2 else -1 }
     }
 
+    // At most one NEW decoder every 2 s for the whole engine: decoders are a shared resource of this process, and a
+    // burst of them next to the player is what took the player's away (22/10).
+    private var ultimaCriacao = 0L
     private fun decoder(s: Sessao): MediaCodec? {
         s.dec?.let { return it }
+        if (s.errosCodec >= 2) return null
+        synchronized(this) {
+            val espera = ultimaCriacao + 2000 - android.os.SystemClock.elapsedRealtime()
+            if (espera > 0) Thread.sleep(espera)
+            ultimaCriacao = android.os.SystemClock.elapsedRealtime()
+        }
         val altura = s.fmt.getInteger(MediaFormat.KEY_HEIGHT)
         val tentativas = mutableListOf<Pair<String?, Boolean>>()
         val mime = if (s.mime == "video/dolby-vision") "video/hevc" else s.mime
@@ -619,7 +631,8 @@ object MiniaturaMotor {
             return motivo(s, tMs, "decoder timed out (fed $fed), next try: ${if (s.travadas >= 2) "software" else "normal priority"}")
         } catch (e: Exception) {
             soltarDecoder(h)
-            return motivo(s, tMs, "error ${e.javaClass.simpleName}")
+            if (e is IllegalStateException || e is MediaCodec.CodecException) s.errosCodec++
+            return motivo(s, tMs, "error ${e.javaClass.simpleName}${if (s.errosCodec >= 2) ": decoder given up for this file" else ""}")
         }
     }
 
@@ -663,6 +676,7 @@ object MiniaturaMotor {
             return null
         } catch (e: Exception) {
             soltarDecoder(h)
+            if (e is IllegalStateException || e is MediaCodec.CodecException) s.errosCodec++
             return null
         }
     }
