@@ -61,8 +61,9 @@ object MiniaturaMotor {
             pausar()
             var ultimo: IOException? = null
             for (tentativa in 0 until 2) {
-                if (tentativa > 0) Thread.sleep(2000)
+                if (tentativa > 0) { Thread.sleep(2000); pausar() }
                 val c = URL(alvo).openConnection() as HttpURLConnection
+                val ini = android.os.SystemClock.elapsedRealtime()
                 try {
                     c.instanceFollowRedirects = true
                     c.connectTimeout = 15000
@@ -80,9 +81,11 @@ object MiniaturaMotor {
                     if (got != n) throw IOException("short read")
                     lidos += got
                     requisicoes++
+                    resultado(android.os.SystemClock.elapsedRealtime() - ini, true)
                     return d
                 } catch (e: IOException) {
                     ultimo = e
+                    resultado(0, false)
                     c.disconnect()
                 }
             }
@@ -106,9 +109,11 @@ object MiniaturaMotor {
                 }
                 feito
             } catch (e: Exception) {
+                erroRede = true   // the extractor only sees "end of data": tell the C side it was the network
                 -1
             }
         }
+        @Volatile var erroRede = false
 
         override fun getSize() = tamanho
         override fun close() {}
@@ -124,15 +129,39 @@ object MiniaturaMotor {
 
     private val sessoes = ConcurrentHashMap<Long, Sessao>()
     private var proximo = 1L
-    private const val INTERVALO_MS = 350L          // ~3 requests per second, all sessions together
+    // Request pacing for ALL sessions together, adaptive. Starts at ~6/s (170 ms apart; measured 22/10: one request
+    // to a StremThru proxy takes ~0.29 s, so two lanes keep ~6 in flight per second on 2 kept-alive sockets). Any
+    // failure or a slow answer (> 1.5 s) doubles the gap at once (up to 1.4 s, ~0.7/s); 20 quick answers in a row
+    // take 20 ms off again. The first Shield run showed what crowding the link does: the player's own reconnects
+    // were refused.
+    private const val INTERVALO_MIN_MS = 170L
+    private const val INTERVALO_MAX_MS = 1400L
+    private const val LENTO_MS = 1500L
+    private var intervalo = INTERVALO_MIN_MS
+    private var rapidas = 0
     private var ultimaReq = 0L
     @Volatile private var requisicoes = 0L
 
     private fun pausar() = synchronized(this) {
-        val espera = ultimaReq + INTERVALO_MS - android.os.SystemClock.elapsedRealtime()
+        val espera = ultimaReq + intervalo - android.os.SystemClock.elapsedRealtime()
         if (espera > 0) Thread.sleep(espera)
         ultimaReq = android.os.SystemClock.elapsedRealtime()
     }
+
+    private fun resultado(ms: Long, ok: Boolean) = synchronized(this) {
+        if (!ok || ms > LENTO_MS) {
+            val antes = intervalo
+            intervalo = minOf(INTERVALO_MAX_MS, intervalo * 2)
+            rapidas = 0
+            if (intervalo != antes) Log.i(TAG, "slowing down: ${if (ok) "slow answer ${ms} ms" else "failed request"}, now ${1000 / intervalo}/s")
+        } else if (++rapidas >= 20 && intervalo > INTERVALO_MIN_MS) {
+            intervalo = maxOf(INTERVALO_MIN_MS, intervalo - 20)
+            rapidas = 0
+        }
+    }
+
+    @JvmStatic
+    fun ritmo(): Long = 1000 / intervalo
 
     @JvmStatic
     fun requisicoes(): Long = requisicoes
@@ -233,15 +262,26 @@ object MiniaturaMotor {
     // Result: 8 bytes pts ms (big endian) + 1 byte "signature valid" + SW*SH signature bytes (grey, the C side
     // normalises) + the JPEG (only when `jpeg`). null on failure. The same keyframe twice in a row is not
     // decoded again (matching probes the same spot from neighbouring times).
+    // 1 when the last quadro/quadroExato of this session failed because a READ failed (back off), 0 otherwise
+    // (a frame that would not decode: skip it).
+    @JvmStatic
+    fun falhaRede(h: Long): Int = if (sessoes[h]?.fonte?.erroRede == true) 1 else 0
+
+    private fun motivo(s: Sessao, tMs: Long, m: String): ByteArray? {
+        Log.w(TAG, "no frame at ${tMs / 1000}s: $m${if (s.fonte.erroRede) " (read failed)" else ""}")
+        return null
+    }
+
     @JvmStatic
     fun quadro(h: Long, tMs: Long, closest: Boolean, jpeg: Boolean): ByteArray? {
         val s = sessoes[h] ?: return null
+        s.fonte.erroRede = false
         try {
             s.ex.seekTo(tMs * 1000, if (closest) MediaExtractor.SEEK_TO_CLOSEST_SYNC else MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
             val st = s.ex.sampleTime
-            if (st < 0) return null
+            if (st < 0) return motivo(s, tMs, "seek found no sample")
             if (st == s.ultimoPts && !jpeg) s.ultimoRes?.let { return it }
-            val dec = decoder(s) ?: return null
+            val dec = decoder(s) ?: return motivo(s, tMs, "no decoder")
             dec.flush()
             val info = MediaCodec.BufferInfo()
             var fed = 0
@@ -263,15 +303,14 @@ object MiniaturaMotor {
                     if (info.size > 0) dec.getOutputImage(ob)?.use { img -> res = montar(s, img, info.presentationTimeUs / 1000, jpeg) }
                     dec.releaseOutputBuffer(ob, false)
                     if (res != null) { s.ultimoPts = st; s.ultimoRes = if (jpeg) null else res; return res }
-                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return null
+                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return motivo(s, tMs, "decoder ended without a frame (fed $fed)")
                 }
             }
             soltarDecoder(h)   // stuck: start clean next time
-            return null
+            return motivo(s, tMs, "decoder timed out (fed $fed)")
         } catch (e: Exception) {
-            Log.w(TAG, "frame failed: ${e.javaClass.simpleName}")
             soltarDecoder(h)
-            return null
+            return motivo(s, tMs, "error ${e.javaClass.simpleName}")
         }
     }
 
@@ -281,9 +320,10 @@ object MiniaturaMotor {
     @JvmStatic
     fun quadroExato(h: Long, tMs: Long): ByteArray? {
         val s = sessoes[h] ?: return null
+        s.fonte.erroRede = false
         try {
             s.ex.seekTo(tMs * 1000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-            if (s.ex.sampleTime < 0) return null
+            if (s.ex.sampleTime < 0) return motivo(s, tMs, "exact: seek found no sample")
             val dec = decoder(s) ?: return null
             dec.flush()
             s.ultimoPts = Long.MIN_VALUE

@@ -86,7 +86,7 @@ static char origem[48] = "";      // what the thumbnails came from (log + label)
 
 // ---- JNI (MiniaturaMotor.kt) ----
 static jclass cls;
-static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos;
+static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede;
 
 static int jniPreparar(void) {
   if (cls) return 1;
@@ -109,7 +109,9 @@ static int jniPreparar(void) {
     jSoltar = (*env)->GetStaticMethodID(env, c, "soltarDecoder", "(J)V");
     jFechar = (*env)->GetStaticMethodID(env, c, "fechar", "(J)V");
     jLidos = (*env)->GetStaticMethodID(env, c, "lidos", "(J)J");
-    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos) {
+    jRitmo = (*env)->GetStaticMethodID(env, c, "ritmo", "()J");
+    jFalhaRede = (*env)->GetStaticMethodID(env, c, "falhaRede", "(J)I");
+    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede) {
       (*env)->ExceptionClear(env);
     } else {
       cls = (jclass)(*env)->NewGlobalRef(env, c);
@@ -200,6 +202,19 @@ static long long mLidos(long long h) {
   return r;
 }
 
+static int mFalhaRede(long long h) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jint r = h ? (*env)->CallStaticIntMethod(env, cls, jFalhaRede, (jlong)h) : 0;
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 0; }
+  return r;
+}
+static long long mRitmo(void) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jlong r = (*env)->CallStaticLongMethod(env, cls, jRitmo);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 0; }
+  return r;
+}
+
 static long memDisponivelKB(void) {
   FILE *f = fopen("/proc/meminfo", "r");
   char l[128]; long v = -1;
@@ -222,10 +237,16 @@ static void esperarPlayer(const Job *j) {
     dormir(j, 1000);
   }
 }
-// Consecutive read failures: back off 5 s, 10 s, 20 s; the 4th in a row ends the job (the link is refusing us).
-static int falhasSeguidas;
-static int falhou(const Job *j, int ok) {
-  if (ok) { falhasSeguidas = 0; return 0; }
+// A failed frame: when a READ failed (the engine says so), back off 5 s, 10 s, 20 s and end the job on the 4th in a
+// row (the link is refusing us). A frame that only would not DECODE is skipped at once; 8 of those in a row end it.
+static __thread int falhasSeguidas, decodSeguidas;   // per lane
+static int mFalhaRede(long long h);
+static int falhou(const Job *j, int ok, long long h) {
+  if (ok) { falhasSeguidas = 0; decodSeguidas = 0; return 0; }
+  if (!mFalhaRede(h)) {
+    if (++decodSeguidas >= 8) { printf("[miniatura] stopping: %d frames in a row would not decode\n", decodSeguidas); fflush(stdout); return 1; }
+    return 0;
+  }
   if (++falhasSeguidas >= 4) {
     printf("[miniatura] stopping: %d reads in a row failed (source refusing)\n", falhasSeguidas); fflush(stdout);
     return 1;
@@ -347,7 +368,7 @@ static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int n
       if (t < 0) t = 0;
       esperarPlayer(j);
       int lido = mExato(hB, t, &p, sb, &ok);
-      if (falhou(j, lido)) return 0;
+      if (falhou(j, lido, hB)) return 0;
       if (!lido || !ok) continue;
       double c = 0;
       for (int k = 0; k < SIG_N; k++) c += sa[k] * sb[k];
@@ -398,8 +419,8 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, An
       esperarPlayer(j);
       esperarFolga(j);
       int lido = mQuadro(hA, tA, 1, 1, &an->pA, an->sig, &an->ok, &jpg, &nj);
+      if (falhou(j, lido, hA)) { mSoltar(hA); return 0; }
       mSoltar(hA);                                           // the 4K decoder goes back to the player between anchors
-      if (falhou(j, lido)) return 0;
       an->estado = lido ? 1 : -1;
       if (lido) {                                            // the anchor is also a finished tile when it lands on its slot
         int k = (int)((an->pA + GRADE_MS / 2) / GRADE_MS);
@@ -426,7 +447,7 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, An
       long tb = t < 0 ? 0 : t >= durB ? durB - 1 : t, pB; int okB;
       esperarPlayer(j);
       int lidoB = mQuadro(hB, tb, 1, 0, &pB, sb, &okB, NULL, NULL);
-      if (falhou(j, lidoB)) return 0;
+      if (falhou(j, lidoB, hB)) return 0;
       if (!lidoB) continue;
       chamadasB++;
       if (!okB) continue;
@@ -445,6 +466,23 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, An
     printf("[miniatura] check anchor %d/%d at %lds: best r=%.2f next r=%.2f %s (offset %+.1fs)\n", v + 1, N_ANCORAS,
            pA / 1000, melhor, segundo, casou ? "match" : "no", nc ? (pMelhor - pA) / 1000.0 : 0.0);
     fflush(stdout);
+    // Enough already: from 12 anchors on, 8+ agreeing on one mapping with 2+ in every quarter is what the full 20
+    // would have to show anyway (the fine pass still checks the timing). Saves ~8 4K reads and ~25 s.
+    if (v + 1 >= 12 && nm >= MIN_INLIERS) {
+      double a0, b0;
+      int q[4] = {0}, ok = 0;
+      if (hipotese(matches, nm, razao, &a0, &b0))
+        for (int k = 0; k < nm; k++)
+          if (fabs(matches[k].pb - (a0 * matches[k].pa + b0)) <= MAX_RESIDUO_MS) {
+            int qq = (int)(matches[k].pa * 4 / durA);
+            if (qq >= 0 && qq < 4) q[qq]++;
+            ok++;
+          }
+      if (ok >= MIN_INLIERS && q[0] >= MIN_POR_QUARTO && q[1] >= MIN_POR_QUARTO && q[2] >= MIN_POR_QUARTO && q[3] >= MIN_POR_QUARTO) {
+        printf("[miniatura] check: clear after %d anchors (%d agree)\n", v + 1, ok); fflush(stdout);
+        break;
+      }
+    }
   }
   double a, b;
   if (!hipotese(matches, nm, razao, &a, &b)) { printf("[miniatura] check: no visual match (%d)\n", nm); return 0; }
@@ -615,13 +653,61 @@ static int proximo(const Job *j) {
   return -1;
 }
 
+// One lane of thumbnail making (see trabalhar). Slots are claimed under the lock, so two lanes never make the same one.
+typedef struct { Job *j; long long h; int usaB; Mapa mapa; int id; int feitos; unsigned long somaMs; long long lido; } Faixa;
+static void *faixa(void *u) {
+  Faixa *f = u;
+  Job *j = f->j;
+  long long lido0 = mLidos(f->h);
+  falhasSeguidas = 0; decodSeguidas = 0;
+  while (!parou(j)) {
+    if (bufferando || video_reconectando() || video_falhou()) { mSoltar(f->h); esperarPlayer(j); continue; }
+    long disp = memDisponivelKB();
+    if (disp >= 0 && disp < PISO_KB) { mSoltar(f->h); dormir(j, 1500); continue; }
+    pthread_mutex_lock(&mu);
+    int k = proximo(j);
+    if (k >= 0) j->tentado[k] = 1;
+    pthread_mutex_unlock(&mu);
+    if (k < 0) break;
+    long alvo = k * GRADE_MS, p; int okS;
+    float sig[SIG_N]; unsigned char *jpg = NULL; int nj = 0;
+    Uint32 s = SDL_GetTicks();
+    long tB = f->usaB ? (long)(f->mapa.a * alvo + f->mapa.b) : alvo;
+    if (tB < 0) tB = 0;
+    int ok = mQuadro(f->h, tB, 1, 1, &p, sig, &okS, &jpg, &nj);
+    if (falhou(j, ok, f->h)) break;
+    if (ok && f->usaB) p = (long)((p - f->mapa.b) / f->mapa.a);       // back on the playing file's timeline
+    if (ok && jpg && labs(p - alvo) <= TOL_MS) {
+      int dest = (int)((p + GRADE_MS / 2) / GRADE_MS);
+      pthread_mutex_lock(&mu);
+      if (dest < 0 || dest >= j->n) dest = k;
+      if (!j->tiles[dest].jpg) { j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; jpg = NULL; j->feitos++; }
+      j->tentado[dest] = 1;
+      if (job == j) estado = M_PRONTO;
+      pthread_mutex_unlock(&mu);
+    }
+    free(jpg);
+    f->feitos++; f->somaMs += SDL_GetTicks() - s;
+    f->lido = mLidos(f->h) - lido0;
+    if (f->id == 1 && f->feitos % 100 == 0) salvar(j, 0);
+    if (f->id == 1 && f->feitos % 30 == 0) {
+      printf("[miniatura] %d/%d tiles from %s, lane avg %lu ms, lane read %.1f MB, pace %lld/s, free %ld MB\n", j->feitos, j->n,
+             origem, f->somaMs / (unsigned long)f->feitos, f->lido / 1048576.0, mRitmo(), disp / 1024);
+      fflush(stdout);
+    }
+    if (!f->usaB) usleep(20000);
+  }
+  f->lido = mLidos(f->h) - lido0;
+  return NULL;
+}
+
 static void *trabalhar(void *u) {
   Job *j = u;
   long long hA = 0, hB = 0, info[5];
   Mapa mapa = {1.0, 0.0, 0.0, 0};
-  int usaB = 0;
+  int usaB = 0, copiaUsada = 0;
   Uint32 t0 = SDL_GetTicks();
-  falhasSeguidas = 0;
+  falhasSeguidas = 0; decodSeguidas = 0;
   if (j->arq[0]) limparCache(j->arq);           // other titles' sets older than 2 h go now
   if (carregar(j)) goto fim;                    // a complete saved set: no network at all
   esperarPlayer(j);
@@ -648,6 +734,7 @@ static void *trabalhar(void *u) {
     long long lidosB = mLidos(hB);
     if (aceita) {
       usaB = 1;
+      copiaUsada = c;
       snprintf(origem, sizeof origem, "%dp copy", j->copias[c].altura);
     } else { mFechar(hB); hB = 0; }
     printf("[miniatura] check took %.1f s, read play %.1f MB + copy %.1f MB\n", (SDL_GetTicks() - c0) / 1000.0,
@@ -656,50 +743,26 @@ static void *trabalhar(void *u) {
   }
   if (!usaB) snprintf(origem, sizeof origem, "%dp (playing file)", j->alturaA);
   {
-    long long hT = usaB ? hB : hA, lido0 = mLidos(hT);
-    int feitosAqui = 0; unsigned long somaMs = 0;
-    while (!parou(j)) {
-      if (bufferando || video_reconectando() || video_falhou()) { mSoltar(hT); esperarPlayer(j); continue; }
-      long disp = memDisponivelKB();
-      if (disp >= 0 && disp < PISO_KB) { mSoltar(hT); dormir(j, 1500); continue; }
-      pthread_mutex_lock(&mu);
-      int k = proximo(j);
-      if (k >= 0) j->tentado[k] = 1;
-      pthread_mutex_unlock(&mu);
-      if (k < 0) break;
-      long alvo = k * GRADE_MS, p; int okS;
-      float sig[SIG_N]; unsigned char *jpg = NULL; int nj = 0;
-      Uint32 s = SDL_GetTicks();
-      long tB = usaB ? (long)(mapa.a * alvo + mapa.b) : alvo;
-      if (tB < 0) tB = 0;
-      int ok = mQuadro(hT, tB, 1, 1, &p, sig, &okS, &jpg, &nj);
-      if (falhou(j, ok)) break;
-      if (ok && usaB) p = (long)((p - mapa.b) / mapa.a);              // back on the playing file's timeline
-      if (ok && jpg && labs(p - alvo) <= TOL_MS) {
-        int dest = (int)((p + GRADE_MS / 2) / GRADE_MS);
-        pthread_mutex_lock(&mu);
-        if (dest < 0 || dest >= j->n) dest = k;
-        if (!j->tiles[dest].jpg) { j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; jpg = NULL; j->feitos++; }
-        j->tentado[dest] = 1;
-        if (job == j) estado = M_PRONTO;
-        pthread_mutex_unlock(&mu);
-      }
-      free(jpg);
-      feitosAqui++; somaMs += SDL_GetTicks() - s;
-      if (feitosAqui % 100 == 0) salvar(j, 0);
-      if (feitosAqui % 30 == 0) {
-        printf("[miniatura] %d/%d tiles from %s, avg %lu ms, read %.1f MB, free %ld MB\n", j->feitos, j->n, origem,
-               somaMs / (unsigned long)feitosAqui, (mLidos(hT) - lido0) / 1048576.0, disp / 1024);
-        fflush(stdout);
-      }
-      usleep(20000);
+    // From the small copy: two lanes, each with its own reader and decoder, so a request is always in flight while
+    // the other lane decodes (one request takes ~0.3 s through an add-on proxy; the pacing in MiniaturaMotor is
+    // shared and adaptive). From the playing 4K file: one lane only (the decode is what the player feels).
+    Faixa f1 = { j, usaB ? hB : hA, usaB, mapa, 1, 0, 0, 0 }, f2 = { j, 0, usaB, mapa, 2, 0, 0, 0 };
+    pthread_t t2;
+    int duas = 0;
+    if (usaB && !parou(j)) {
+      f2.h = mAbrir(j->copias[copiaUsada].url, j->copias[copiaUsada].cab);
+      if (f2.h) duas = pthread_create(&t2, NULL, faixa, &f2) == 0;
+      if (!duas) { mFechar(f2.h); f2.h = 0; }
     }
+    faixa(&f1);
+    if (duas) pthread_join(t2, NULL);
+    mFechar(f2.h);
     pthread_mutex_lock(&mu);
     int completo = proximo(j) < 0;
     pthread_mutex_unlock(&mu);
     salvar(j, completo && !parou(j));
-    printf("[miniatura] done: %d/%d tiles from %s in %.0f s, read %.1f MB\n", j->feitos, j->n, origem,
-           (SDL_GetTicks() - t0) / 1000.0, (mLidos(hT) - lido0) / 1048576.0);
+    printf("[miniatura] done: %d/%d tiles from %s in %.0f s (%d lane%s), read %.1f MB, pace now %lld/s\n", j->feitos, j->n,
+           origem, (SDL_GetTicks() - t0) / 1000.0, duas ? 2 : 1, duas ? "s" : "", (f1.lido + f2.lido) / 1048576.0, mRitmo());
     fflush(stdout);
   }
 fim:
