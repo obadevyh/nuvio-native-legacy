@@ -594,7 +594,10 @@ object MiniaturaMotor {
                     val ib = dec.dequeueInputBuffer(2000)
                     if (ib >= 0) {
                         // Software decoders hand the frame out on end-of-stream; Nvidia's drops it there, so it is fed on.
-                        val n = if (s.soft && fed >= 1) -1 else s.ex.readSampleData(dec.getInputBuffer(ib)!!, 0)
+                        // HEVC gets ONE more sample first: Android's software HEVC decoder sometimes ended without a
+                        // frame on the keyframe alone (4 of 612, 22/10); the first frame out is still the keyframe.
+                        val antesDoFim = if (s.mime == "video/hevc" || s.mime == "video/dolby-vision") 2 else 1
+                        val n = if (s.soft && fed >= antesDoFim) -1 else s.ex.readSampleData(dec.getInputBuffer(ib)!!, 0)
                         if (n < 0) { dec.queueInputBuffer(ib, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); eos = true }
                         else {
                             if (fed == 0) s.fonte.ajustarJanela(n)   // the keyframe's real size sizes the next reads

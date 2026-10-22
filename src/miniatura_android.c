@@ -74,6 +74,7 @@ typedef struct {
   Ancora anc[N_ANCORAS];
   char arq[640];             // the saved set on this device ("" = cannot save)
   int feitos;
+  Uint32 lacunaDesde;        // when the exact-frame gap pass started (0 = not yet)
   volatile int parar;
   int vivo;
 } Job;
@@ -849,7 +850,15 @@ static int coberto(const Job *j, int k) {
   return 0;
 }
 // Only real gaps (nothing made within 8 s): measured 22/10, exact-frame fills of covered slots were the last
-// ~50 s of a 3 h film.
+// ~50 s of a 3 h film. And only while they are worth it: not at all once 90 % of the slots have their own
+// thumbnail, and never more than 10 s (measured 22/10 on 102 min: ~20 fills cost 65 s and 80 MB, ~3 s and
+// 4 MB each, for spots the bar already covered with a neighbour). Called with `mu` held.
+#define LACUNA_COBERTURA 0.90
+#define LACUNA_PRAZO_MS 10000u
+static int lacunaPermitida(const Job *j) {
+  if (j->feitos >= (int)(j->n * LACUNA_COBERTURA)) return 0;
+  return !j->lacunaDesde || SDL_GetTicks() - j->lacunaDesde < LACUNA_PRAZO_MS;
+}
 static int proximaLacuna(const Job *j) {
   int ph = (int)(playheadMs / GRADE_MS), melhor = -1;
   for (int k = 0; k < j->n; k++)
@@ -880,7 +889,10 @@ static void *faixa(void *u) {
         if (q < 0) break;
         j->tentado[q] = 1; fila[nfila++] = q;
       }
-      if (!nfila && f->usaB && (k = proximaLacuna(j)) >= 0) { j->tentado[k] = 2; exato = 1; }   // second pass: the exact frame
+      if (!nfila && f->usaB && lacunaPermitida(j) && (k = proximaLacuna(j)) >= 0) {   // second pass: the exact frame
+        if (!j->lacunaDesde) j->lacunaDesde = SDL_GetTicks();
+        j->tentado[k] = 2; exato = 1;
+      }
       pthread_mutex_unlock(&mu);
       if (nfila > 1 && lote > 0) {
         long ts[LOTE];
@@ -1005,7 +1017,7 @@ static void *trabalhar(void *u) {
     if (duas) pthread_join(t2, NULL);
     mFechar(f2.h);
     pthread_mutex_lock(&mu);
-    int completo = proximo(j) < 0 && (!usaB || proximaLacuna(j) < 0) && !parou(j);
+    int completo = proximo(j) < 0 && (!usaB || !lacunaPermitida(j) || proximaLacuna(j) < 0) && !parou(j);
     pthread_mutex_unlock(&mu);
     salvar(j, completo);
     if (completo) avisoPronto = j->g;
