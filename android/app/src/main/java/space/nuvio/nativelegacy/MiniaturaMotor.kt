@@ -65,13 +65,13 @@ object MiniaturaMotor {
         // keyframe. A keyframe bigger than the window simply costs a second request, never a wrong frame.
         // Sized from the TYPICAL keyframe (running mean x 1.3 + 32 KB, 96-384 KB), not 1.6x the largest: measured
         // 22/10, an H.264 copy read ~0.5 MB per thumbnail for ~0.2 MB keyframes. A bigger keyframe costs one more
-        // small request, never a wrong frame.
+        // small request, never a wrong frame. +64 KB of margin for the block headers around it.
         private var media = 0
         fun ajustarJanela(amostra: Int) {
             somaKf += amostra; nKf++
             if (!manter || tamanho > (8L shl 30)) return
             media = if (media == 0) amostra else (media * 7 + amostra) / 8
-            janela = (media * 13 / 10 + 32 * 1024).coerceIn(96 * 1024, 384 * 1024)
+            janela = (media * 13 / 10 + 64 * 1024).coerceIn(128 * 1024, 384 * 1024)
         }
         // keyframes per multi-range request: as many as ~4 MB of windows (4-32)
         fun loteIdeal(): Int = ((4 shl 20) / janela).coerceIn(4, 32)
@@ -417,6 +417,8 @@ object MiniaturaMotor {
         // Codec errors (IllegalState/CodecException) on this file: at 2 the file is given up. Measured 22/10: a copy
         // whose frames threw at once made 8 decoders in ~1 s, and the player's own decoder failed (4003) next to it.
         var errosCodec = 0
+        // reused per session: the frame's planes copied in one go (see montar)
+        var yArr = ByteArray(0); var uArr = ByteArray(0); var vArr = ByteArray(0)
         var ultimoPts = Long.MIN_VALUE
         var ultimoRes: ByteArray? = null
     }
@@ -653,7 +655,12 @@ object MiniaturaMotor {
                         if (n < 0) { dec.queueInputBuffer(ib, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); eos = true }
                         else {
                             if (fed == 0) s.fonte.ajustarJanela(n)   // the keyframe's real size sizes the next reads
-                            dec.queueInputBuffer(ib, 0, n, s.ex.sampleTime, 0); s.ex.advance(); fed++
+                            dec.queueInputBuffer(ib, 0, n, s.ex.sampleTime, 0)
+                            fed++
+                            // No advance() after the LAST sample fed (software path): on Matroska it reads on through
+                            // the audio blocks to the next video frame, past the prefetched window. Measured 23/10:
+                            // ~1 extra request per thumbnail (847 requests for 25 batches on a 2 h film).
+                            if (!s.soft || fed < antesDoFim) s.ex.advance()
                         }
                     }
                 }
@@ -759,12 +766,21 @@ object MiniaturaMotor {
         val w = if (cr.width() > 0) cr.width() else img.width
         val h = if (cr.height() > 0) cr.height() else img.height
         val py = img.planes[0]; val pu = img.planes[1]; val pv = img.planes[2]
-        val by = py.buffer; val bu = pu.buffer; val bv = pv.buffer
+        // Each plane copied ONCE into a reused array, then plain array reads: ByteBuffer.get() per sample cost ~0.4 s of
+        // CPU per 480x270 thumbnail on the Shield (23/10: frames 345 s vs network 108 s on a 2 h film).
+        fun copia(b: java.nio.ByteBuffer, atual: ByteArray): ByteArray {
+            val d = b.duplicate(); d.position(0)
+            val arr = if (atual.size >= d.limit()) atual else ByteArray(d.limit())
+            d.get(arr, 0, d.limit())
+            return arr
+        }
+        s.yArr = copia(py.buffer, s.yArr)
+        val ya8 = s.yArr
         val rs = py.rowStride; val ps = py.pixelStride
         val crs = pu.rowStride; val cps = pu.pixelStride
         val off = if (img.format == 0x36) 1 else 0   // YCBCR_P010 (10-bit in 16): the high byte, little endian
         val pq = s.hdr
-        fun y(x: Int, yy: Int): Int { val v = by.get((yy + cy) * rs + (x + cx) * ps + off).toInt() and 0xff; return if (pq) pqLut[v] else v }
+        fun y(x: Int, yy: Int): Int { val v = ya8[(yy + cy) * rs + (x + cx) * ps + off].toInt() and 0xff; return if (pq) pqLut[v] else v }
         // signature: crop 10 % left/right, 16 % top/bottom (letterbox), box-average to 32x18
         val sig = ByteArray(SW * SH)
         val x0 = w / 10; val x1 = w - w / 10; val y0 = h * 16 / 100; val y1 = h - h * 16 / 100
@@ -781,6 +797,8 @@ object MiniaturaMotor {
         out.write(1)
         out.write(sig)
         if (jpeg) {
+            s.uArr = copia(pu.buffer, s.uArr); s.vArr = copia(pv.buffer, s.vArr)
+            val ua8 = s.uArr; val va8 = s.vArr
             // The picture keeps ITS shape inside the 16:9 thumbnail, with black bars, as it looks on the TV. Measured
             // 22/10: a 1280x536 (2.39:1) copy squeezed into 480x270 stretched everything vertically.
             val px = IntArray(TW * TH) { 0xff000000.toInt() }
@@ -798,8 +816,8 @@ object MiniaturaMotor {
                     val xa = maxOf(0, sx - qx); val xb = minOf(w - 1, sx + qx)
                     val yv = (y(xa, ya) + y(xb, ya) + y(xa, yb) + y(xb, yb) + 2) shr 2
                     val ci = ((sy + cy) / 2) * crs + ((sx + cx) / 2) * cps + off
-                    var u = (bu.get(ci).toInt() and 0xff) - 128
-                    var v = (bv.get(ci).toInt() and 0xff) - 128
+                    var u = (ua8[ci].toInt() and 0xff) - 128
+                    var v = (va8[ci].toInt() and 0xff) - 128
                     if (pq) { u /= 2; v /= 2 }   // the tone curve flattens luma; keep colour from oversaturating
                     val c = (yv - 16).coerceAtLeast(0) * 298
                     val r = ((c + 409 * v + 128) shr 8).coerceIn(0, 255)
