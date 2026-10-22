@@ -492,8 +492,10 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, An
 // ---- the set on this device's storage: a rewatch or a resume shows it at once and reads nothing ----
 // <data>/miniaturas/<fnv64 of the file identity>.nvm : "NVM1", n, dur, complete, then (k, pts, len, jpeg)...
 // Identity: the file name + exact size the add-on declared (the same file through any link), else the link.
-// Capped at 200 MB in total; the least recently used sets go first.
+// Kept 2 hours after the last use (long enough to come back to the film the same evening), then deleted; never
+// more than 200 MB in total, least recently used first.
 #define CACHE_MAX_BYTES (200LL << 20)
+#define CACHE_TTL_S (2 * 3600)
 
 static void chaveArquivo(const SeekrFonte *f, char *out, size_t n) {
   char id[700];
@@ -515,6 +517,8 @@ static int lerI32(FILE *f, long *v) { unsigned char b[4]; if (fread(b, 1, 4, f) 
 // Loads what an earlier run made. 1 = the set was complete (nothing to read from the network).
 static int carregar(Job *j) {
   if (!j->arq[0]) return 0;
+  struct stat st;
+  if (stat(j->arq, &st) == 0 && time(NULL) - st.st_mtime > CACHE_TTL_S) { unlink(j->arq); return 0; }
   FILE *f = fopen(j->arq, "rb");
   if (!f) return 0;
   char mag[4]; long n, dur, completo, k, pts, len;
@@ -556,6 +560,7 @@ static void limparCache(const char *dirArq) {
     char p[820]; struct stat st;
     snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
     if (stat(p, &st)) continue;
+    if (time(NULL) - st.st_mtime > CACHE_TTL_S && strcmp(p, dirArq)) { unlink(p); continue; }   // expired
     if (n == cap) { cap = cap ? cap * 2 : 32; ArqCache *nv = realloc(v, sizeof *v * (size_t)cap); if (!nv) break; v = nv; }
     snprintf(v[n].nome, sizeof v[n].nome, "%s", p); v[n].tam = st.st_size; v[n].quando = st.st_mtime; n++;
     total += st.st_size;
@@ -617,6 +622,7 @@ static void *trabalhar(void *u) {
   int usaB = 0;
   Uint32 t0 = SDL_GetTicks();
   falhasSeguidas = 0;
+  if (j->arq[0]) limparCache(j->arq);           // other titles' sets older than 2 h go now
   if (carregar(j)) goto fim;                    // a complete saved set: no network at all
   esperarPlayer(j);
   hA = mAbrir(j->urlA, j->cabA);

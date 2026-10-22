@@ -344,11 +344,15 @@ object MiniaturaMotor {
         out.write(sig)
         if (jpeg) {
             val px = IntArray(TW * TH)
+            // 2x2 samples per output pixel (not one): far less aliasing on edges and text, for 3 more reads each
+            val qx = maxOf(1, w / (TW * 4)); val qy = maxOf(1, h / (TH * 4))
             for (ty in 0 until TH) {
                 val sy = (ty * h + h / 2) / TH
+                val ya = maxOf(0, sy - qy); val yb = minOf(h - 1, sy + qy)
                 for (tx in 0 until TW) {
                     val sx = (tx * w + w / 2) / TW
-                    val yv = y(sx, sy)
+                    val xa = maxOf(0, sx - qx); val xb = minOf(w - 1, sx + qx)
+                    val yv = (y(xa, ya) + y(xb, ya) + y(xa, yb) + y(xb, yb) + 2) shr 2
                     val ci = (sy / 2) * crs + (sx / 2) * cps + off
                     var u = (bu.get(ci).toInt() and 0xff) - 128
                     var v = (bv.get(ci).toInt() and 0xff) - 128
