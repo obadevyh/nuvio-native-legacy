@@ -698,14 +698,19 @@ object MiniaturaMotor {
     }
 
     private fun montar(s: Sessao, img: Image, ptsMs: Long, jpeg: Boolean): ByteArray {
-        val w = img.width; val h = img.height
+        // The VISIBLE area: decoders pad (1920x1088 for 1080p) and report the picture in cropRect.
+        val cr = img.cropRect
+        val cx = if (cr.width() > 0) cr.left else 0
+        val cy = if (cr.height() > 0) cr.top else 0
+        val w = if (cr.width() > 0) cr.width() else img.width
+        val h = if (cr.height() > 0) cr.height() else img.height
         val py = img.planes[0]; val pu = img.planes[1]; val pv = img.planes[2]
         val by = py.buffer; val bu = pu.buffer; val bv = pv.buffer
         val rs = py.rowStride; val ps = py.pixelStride
         val crs = pu.rowStride; val cps = pu.pixelStride
         val off = if (img.format == 0x36) 1 else 0   // YCBCR_P010 (10-bit in 16): the high byte, little endian
         val pq = s.hdr
-        fun y(x: Int, yy: Int): Int { val v = by.get(yy * rs + x * ps + off).toInt() and 0xff; return if (pq) pqLut[v] else v }
+        fun y(x: Int, yy: Int): Int { val v = by.get((yy + cy) * rs + (x + cx) * ps + off).toInt() and 0xff; return if (pq) pqLut[v] else v }
         // signature: crop 10 % left/right, 16 % top/bottom (letterbox), box-average to 32x18
         val sig = ByteArray(SW * SH)
         val x0 = w / 10; val x1 = w - w / 10; val y0 = h * 16 / 100; val y1 = h - h * 16 / 100
@@ -722,17 +727,23 @@ object MiniaturaMotor {
         out.write(1)
         out.write(sig)
         if (jpeg) {
-            val px = IntArray(TW * TH)
+            // The picture keeps ITS shape inside the 16:9 thumbnail, with black bars, as it looks on the TV. Measured
+            // 22/10: a 1280x536 (2.39:1) copy squeezed into 480x270 stretched everything vertically.
+            val px = IntArray(TW * TH) { 0xff000000.toInt() }
+            val dw: Int; val dh: Int
+            if (w.toLong() * TH >= h.toLong() * TW) { dw = TW; dh = ((TW.toLong() * h / w).toInt() / 2 * 2).coerceIn(2, TH) }
+            else { dh = TH; dw = ((TH.toLong() * w / h).toInt() / 2 * 2).coerceIn(2, TW) }
+            val ox = (TW - dw) / 2; val oy = (TH - dh) / 2
             // 2x2 samples per output pixel (not one): far less aliasing on edges and text, for 3 more reads each
-            val qx = maxOf(1, w / (TW * 4)); val qy = maxOf(1, h / (TH * 4))
-            for (ty in 0 until TH) {
-                val sy = (ty * h + h / 2) / TH
+            val qx = maxOf(1, w / (dw * 4)); val qy = maxOf(1, h / (dh * 4))
+            for (ty in 0 until dh) {
+                val sy = (ty * h + h / 2) / dh
                 val ya = maxOf(0, sy - qy); val yb = minOf(h - 1, sy + qy)
-                for (tx in 0 until TW) {
-                    val sx = (tx * w + w / 2) / TW
+                for (tx in 0 until dw) {
+                    val sx = (tx * w + w / 2) / dw
                     val xa = maxOf(0, sx - qx); val xb = minOf(w - 1, sx + qx)
                     val yv = (y(xa, ya) + y(xb, ya) + y(xa, yb) + y(xb, yb) + 2) shr 2
-                    val ci = (sy / 2) * crs + (sx / 2) * cps + off
+                    val ci = ((sy + cy) / 2) * crs + ((sx + cx) / 2) * cps + off
                     var u = (bu.get(ci).toInt() and 0xff) - 128
                     var v = (bv.get(ci).toInt() and 0xff) - 128
                     if (pq) { u /= 2; v /= 2 }   // the tone curve flattens luma; keep colour from oversaturating
@@ -740,7 +751,7 @@ object MiniaturaMotor {
                     val r = ((c + 409 * v + 128) shr 8).coerceIn(0, 255)
                     val g = ((c - 100 * u - 208 * v + 128) shr 8).coerceIn(0, 255)
                     val b = ((c + 516 * u + 128) shr 8).coerceIn(0, 255)
-                    px[ty * TW + tx] = (0xff shl 24) or (r shl 16) or (g shl 8) or b
+                    px[(oy + ty) * TW + ox + tx] = (0xff shl 24) or (r shl 16) or (g shl 8) or b
                 }
             }
             val bmp = Bitmap.createBitmap(px, TW, TH, Bitmap.Config.ARGB_8888)

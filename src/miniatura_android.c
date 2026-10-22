@@ -713,7 +713,7 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, An
 }
 
 // ---- the set on this device's storage: a rewatch or a resume shows it at once and reads nothing ----
-// <data>/miniaturas/<fnv64 of the file identity>.nvm : "NVM1", n, dur, complete, then (k, pts, len, jpeg)...
+// <data>/miniaturas/<fnv64 of the file identity>.nvm : "NVM2" (NVM1 = 320x180 squeezed sets from before 22/10, ignored), n, dur, complete, then (k, pts, len, jpeg)...
 // Identity: the file name + exact size the add-on declared (the same file through any link), else the link.
 // Kept 2 hours after the last use (long enough to come back to the film the same evening), then deleted; never
 // more than 200 MB in total, least recently used first.
@@ -749,7 +749,7 @@ static int carregar(Job *j) {
   if (!f) return 0;
   char mag[4]; long n, dur, completo, k, pts, len;
   int lidos = 0;
-  if (fread(mag, 1, 4, f) != 4 || memcmp(mag, "NVM1", 4) || !lerI32(f, &n) || !lerI32(f, &dur) || !lerI32(f, &completo) ||
+  if (fread(mag, 1, 4, f) != 4 || memcmp(mag, "NVM2", 4) || !lerI32(f, &n) || !lerI32(f, &dur) || !lerI32(f, &completo) ||
       n != j->n) { fclose(f); return 0; }
   while (lerI32(f, &k) && lerI32(f, &pts) && lerI32(f, &len)) {
     if (k < 0 || k >= j->n || len <= 0 || len > (1 << 20)) break;
@@ -812,7 +812,7 @@ static void salvar(Job *j, int completo) {
   snprintf(tmp, sizeof tmp, "%s.tmp", j->arq);
   FILE *f = fopen(tmp, "wb");
   if (!f) return;
-  fwrite("NVM1", 1, 4, f);
+  fwrite("NVM2", 1, 4, f);
   escreverI32(f, j->n); escreverI32(f, j->dur); escreverI32(f, completo);
   for (int k = 0; k < j->n; k++) {
     pthread_mutex_lock(&mu);
