@@ -3,10 +3,9 @@
 
 #ifndef NV_ANDROID
 const SeekrProvedor *miniatura_provedor(void) { return NULL; }
+int miniatura_prontas_agora(void) { return 0; }
 #else
 #include "dados.h"
-#include "idioma.h"
-#include "ilha.h"
 #include "streams.h"
 #include "video.h"
 #include <dirent.h>
@@ -87,6 +86,7 @@ static volatile long posMs, playheadMs;
 static volatile int scrubbing, bufferando;
 static char origem[48] = "";      // what the thumbnails came from (log + label)
 static volatile unsigned avisoPronto;
+static Uint32 prontoDesde;          // when the playing title's set completed (the player shows it 4 s)
 static int motivoSem;            // M_FALHOU because: 0 the video would not open, 1 no smaller copy usable
    // generation whose set just completed (pPedir shows the notice)
 
@@ -238,8 +238,10 @@ static void dormir(const Job *j, int ms) { for (int t = 0; t < ms && !parou(j); 
 // through a StremThru proxy): a burst of thumbnail reads on the playing link and the player's reconnects were
 // refused together (ConnectException) until it gave up.
 static int folgaBaixa(void) {
-  double bf = video_buffer_fim(), pos = video_pos();
-  return bf > 0.5 && bf - pos < 20.0;
+  double bf = video_buffer_fim(), pos = video_pos(), dur = video_duracao();
+  double quer = 20.0;
+  if (dur > 0 && dur - pos - 1.0 < quer) quer = dur - pos - 1.0;
+  return bf > 0.5 && quer > 0 && bf - pos < quer;
 }
 static void esperarPlayer(const Job *j) {
   int avisou = 0;
@@ -680,10 +682,19 @@ static int proximo(const Job *j) {
 }
 
 // A slot the keyframe pass left empty (the copy's keyframes too far apart), nearest to the playhead first.
+static int coberto(const Job *j, int k) {
+  for (int d = -1; d <= 1; d++) {
+    int v = k + d;
+    if (v >= 0 && v < j->n && j->tiles[v].jpg && labs(j->tiles[v].pts - k * GRADE_MS) <= TOL_COPIA_MS) return 1;
+  }
+  return 0;
+}
+// Only real gaps (nothing made within 8 s): measured 22/10, exact-frame fills of covered slots were the last
+// ~50 s of a 3 h film.
 static int proximaLacuna(const Job *j) {
   int ph = (int)(playheadMs / GRADE_MS), melhor = -1;
   for (int k = 0; k < j->n; k++)
-    if (j->tentado[k] == 1 && !j->tiles[k].jpg && (melhor < 0 || abs(k - ph) < abs(melhor - ph))) melhor = k;
+    if (j->tentado[k] == 1 && !j->tiles[k].jpg && !coberto(j, k) && (melhor < 0 || abs(k - ph) < abs(melhor - ph))) melhor = k;
   return melhor;
 }
 
@@ -880,7 +891,8 @@ static int pQuadros(double posSeg, int n, GLuint *out, double *cueSeg) {
         if (k - d >= 0 && j->tiles[k - d].jpg) atual = k - d;
         else if (k + d < j->n && j->tiles[k + d].jpg) atual = k + d;
       }
-      velho = atual >= 0;
+      // a neighbour within 8 s IS this slot's thumbnail (no "still loading" ring); further away it stands in
+      velho = atual >= 0 && labs(j->tiles[atual].pts - k * GRADE_MS) > TOL_COPIA_MS;
     }
     int alvos[3] = { k - 1, atual, k + 1 }, base = n == 1 ? 1 : 0;
     for (int i = 0; i < n; i++) {
@@ -918,7 +930,7 @@ static void pPedir(const SeekrFonte *f) {
   posMs = f->posMs; playheadMs = f->playheadMs; scrubbing = f->scrubbing;
   if (avisoPronto && avisoPronto == geracao) {          // the playing title's set is complete
     avisoPronto = 0;
-    ilha_avisar("miniaturas-prontas", ILHA_OK, "aj_film", i18n("Miniaturas geradas"), 4000u, 0);
+    prontoDesde = SDL_GetTicks();
   }
   bufferando = video_bufferando_ms() > 0;
   if (!f->url || strncmp(f->url, "http", 4) || f->durMs < 60000) return;
@@ -976,4 +988,10 @@ static const SeekrProvedor PROVEDOR = {
   pTemChave, pEstado, pRotulo, pUso, pTentar, pPedir, pDesligar, pQuadros, pVelho, pOcioso
 };
 const SeekrProvedor *miniatura_provedor(void) { return &PROVEDOR; }
+int miniatura_prontas_agora(void) {
+  if (!prontoDesde) return 0;
+  if (SDL_GetTicks() - prontoDesde < 4000u) return 1;
+  prontoDesde = 0;
+  return 0;
+}
 #endif

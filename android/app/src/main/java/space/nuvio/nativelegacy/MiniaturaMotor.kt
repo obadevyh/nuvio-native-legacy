@@ -60,6 +60,16 @@ object MiniaturaMotor {
             if (tamanho > (8L shl 30)) { janela = 2 shl 20; limite = 12L shl 20 }
         }
 
+        // The copy's window follows its keyframes: ~1.6x the largest of the recent ones (+32 KB for the container's
+        // block headers), 128-384 KB. Measured 22/10: a fixed 384 KB read ~0.43 MB per 720p thumbnail, about 3x the
+        // keyframe. A keyframe bigger than the window simply costs a second request, never a wrong frame.
+        private var maiorRecente = 0
+        fun ajustarJanela(amostra: Int) {
+            if (!manter || tamanho > (8L shl 30)) return
+            maiorRecente = maxOf(amostra, maiorRecente * 7 / 8)
+            janela = (maiorRecente * 8 / 5 + 32 * 1024).coerceIn(128 * 1024, 384 * 1024)
+        }
+
         private fun segmento(p: Long): Pair<Long, ByteArray> {
             for (i in segs.indices.reversed()) {
                 val s = segs[i]
@@ -337,7 +347,10 @@ object MiniaturaMotor {
                         // Software decoders hand the frame out on end-of-stream; Nvidia's drops it there, so it is fed on.
                         val n = if (s.soft && fed >= 1) -1 else s.ex.readSampleData(dec.getInputBuffer(ib)!!, 0)
                         if (n < 0) { dec.queueInputBuffer(ib, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); eos = true }
-                        else { dec.queueInputBuffer(ib, 0, n, s.ex.sampleTime, 0); s.ex.advance(); fed++ }
+                        else {
+                            if (fed == 0) s.fonte.ajustarJanela(n)   // the keyframe's real size sizes the next reads
+                            dec.queueInputBuffer(ib, 0, n, s.ex.sampleTime, 0); s.ex.advance(); fed++
+                        }
                     }
                 }
                 val ob = dec.dequeueOutputBuffer(info, 2000)

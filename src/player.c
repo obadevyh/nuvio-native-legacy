@@ -134,6 +134,7 @@ static void avisarCascaAberto(int v) { (void)v; tex_pressao_reproducao(v); }
 #include "plrui.h"
 #include "escala.h"
 #include "plrilha.h"
+#include "miniatura_android.h"
 #include "cacheboost.h"
 #include "audioinfo.h"
 #include "legendasui.h"   /* F04: second subtitle band */
@@ -6472,6 +6473,15 @@ void player_desenhar(Uint32 agora) {
         plrilha_pedir(&pd);
       }
     } }
+  // MINIATURAS FEITAS NO APARELHO (miniatura_android.h): o conjunto do titulo ficou completo.
+  if (miniatura_prontas_agora()) {
+    PlrIlhaPedido pd;
+    memset(&pd, 0, sizeof pd);
+    pd.icone = "aj_film";
+    pd.texto = i18n("Miniaturas geradas");
+    pd.semFim = 1; pd.aberta = 1;
+    plrilha_pedir(&pd);
+  }
   if (player_carregando() && ehCanal()) {
     // CANAL SINTONIZANDO: a versao COMPACTA, uma linha na propria ilha do
     // relogio (dono, 03/10: "no player do live tv vamos usar a versao compacta
