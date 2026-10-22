@@ -4,8 +4,13 @@
 #ifndef NV_ANDROID
 const SeekrProvedor *miniatura_provedor(void) { return NULL; }
 #else
+#include "dados.h"
 #include "streams.h"
 #include "video.h"
+#include <dirent.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <utime.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
 #include <ctype.h>
@@ -44,6 +49,10 @@ const SeekrProvedor *miniatura_provedor(void) { return NULL; }
 enum { M_PARADO = 0, M_BUSCANDO, M_PRONTO, M_FALHOU };
 
 typedef struct { unsigned char *jpg; int n; long pts; } Tile;
+// What the playing file showed at each check anchor: decoded ONCE per title and reused for every copy checked
+// (the 4K decode is what the player feels; a second copy must not pay it again).
+typedef struct { int estado; long pA; int ok; float sig[SIG_N]; } Ancora;   // estado: 0 not yet, 1 read, -1 failed
+
 
 typedef struct {
   char url[4096], cab[512];
@@ -59,6 +68,8 @@ typedef struct {
   Copia copias[TENTATIVAS];
   int nCopias;
   Tile *tiles; unsigned char *tentado; int n;
+  Ancora anc[N_ANCORAS];
+  char arq[640];             // the saved set on this device ("" = cannot save)
   int feitos;
   volatile int parar;
   int vivo;
@@ -75,7 +86,7 @@ static char origem[48] = "";      // what the thumbnails came from (log + label)
 
 // ---- JNI (MiniaturaMotor.kt) ----
 static jclass cls;
-static jmethodID jAbrir, jInfo, jQuadro, jSoltar, jFechar, jLidos;
+static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos;
 
 static int jniPreparar(void) {
   if (cls) return 1;
@@ -94,10 +105,11 @@ static int jniPreparar(void) {
     jAbrir = (*env)->GetStaticMethodID(env, c, "abrir", "(Ljava/lang/String;Ljava/lang/String;)J");
     jInfo = (*env)->GetStaticMethodID(env, c, "info", "(J)[J");
     jQuadro = (*env)->GetStaticMethodID(env, c, "quadro", "(JJZZ)[B");
+    jExato = (*env)->GetStaticMethodID(env, c, "quadroExato", "(JJ)[B");
     jSoltar = (*env)->GetStaticMethodID(env, c, "soltarDecoder", "(J)V");
     jFechar = (*env)->GetStaticMethodID(env, c, "fechar", "(J)V");
     jLidos = (*env)->GetStaticMethodID(env, c, "lidos", "(J)J");
-    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jSoltar || !jFechar || !jLidos) {
+    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos) {
       (*env)->ExceptionClear(env);
     } else {
       cls = (jclass)(*env)->NewGlobalRef(env, c);
@@ -128,13 +140,25 @@ static void mInfo(long long h, long long out[5]) {
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return; }
   if (a) { (*env)->GetLongArrayRegion(env, a, 0, 5, (jlong *)out); (*env)->DeleteLocalRef(env, a); }
 }
-// One keyframe: pts (ms), signature (unit-norm, mean-removed; 0 when flat) and optionally the JPEG (malloc'd).
+// Unpacks MiniaturaMotor's reply: pts (ms), signature (unit-norm, mean-removed; 0 when flat), JPEG (malloc'd).
+static int desempacotar(JNIEnv *env, jbyteArray a, long *pts, float sig[SIG_N], int *temSig, unsigned char **jpg, int *nJpg);
+// One keyframe (closest or at/before tMs).
 static int mQuadro(long long h, long tMs, int closest, int querJpeg, long *pts, float sig[SIG_N], int *temSig,
                    unsigned char **jpg, int *nJpg) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jbyteArray a = (jbyteArray)(*env)->CallStaticObjectMethod(env, cls, jQuadro, (jlong)h, (jlong)tMs,
                                                             closest ? JNI_TRUE : JNI_FALSE, querJpeg ? JNI_TRUE : JNI_FALSE);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); a = NULL; }
+  return desempacotar(env, a, pts, sig, temSig, jpg, nJpg);
+}
+// The frame AT tMs (decoded forward from the keyframe), signature only: the fine pass of the check.
+static int mExato(long long h, long tMs, long *pts, float sig[SIG_N], int *temSig) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jbyteArray a = (jbyteArray)(*env)->CallStaticObjectMethod(env, cls, jExato, (jlong)h, (jlong)tMs);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); a = NULL; }
+  return desempacotar(env, a, pts, sig, temSig, NULL, NULL);
+}
+static int desempacotar(JNIEnv *env, jbyteArray a, long *pts, float sig[SIG_N], int *temSig, unsigned char **jpg, int *nJpg) {
   if (!a) return 0;
   jsize n = (*env)->GetArrayLength(env, a);
   unsigned char *b = n >= CAB + SIG_N ? malloc((size_t)n) : NULL;   // signature-only replies carry no JPEG
@@ -267,7 +291,7 @@ static int escolherCopias(const Stream *play, Copia *out) {
   return n;
 }
 
-// ---- the timeline check (OpenSeek timeline.verify_alignment, without the fine refine pass) ----
+// ---- the timeline check (OpenSeek timeline.verify_alignment) ----
 typedef struct { double a, b, erro; int inliers; } Mapa;
 typedef struct { double pa, pb; } Par;
 
@@ -290,33 +314,108 @@ static int hipotese(const Par *m, int n, double razao, double *a, double *b) {
   return 1;
 }
 
-static int conferir(Job *j, long long hA, long long hB, long durA, long durB, Mapa *mapa) {
+
+// Room for the player before each 4K read: at least 8 s buffered ahead (when the player reports it).
+static void esperarFolga(const Job *j) {
+  for (int t = 0; t < 30 && !parou(j); t++) {
+    double bf = video_buffer_fim(), pos = video_pos();
+    if (bf <= 0.5 || bf - pos >= 8.0) return;
+    dormir(j, 500);
+  }
+}
+
+// Fine pass (OpenSeek timeline._refine): for up to 8 spread anchors, the copy's frame at EXACT times around the
+// coarse prediction, the similarity peak by a parabola; keyframe spacing no longer limits the offset. Copy only.
+#define REFINAR 8
+#define MIN_REFINADOS 5
+static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int ni, double a, double b, long durA,
+                   double *b2, double *erro, int *nref) {
+  static const long DES[5] = { -2000, -1000, 0, 1000, 2000 };
+  Par ord[N_ANCORAS], ref[REFINAR];
+  int n = 0;
+  float sb[SIG_N];
+  memcpy(ord, in, sizeof(Par) * (size_t)ni);
+  for (int x = 0; x < ni; x++) for (int y = x + 1; y < ni; y++) if (ord[y].pa < ord[x].pa) { Par t = ord[x]; ord[x] = ord[y]; ord[y] = t; }
+  int passo = ni / REFINAR > 0 ? ni / REFINAR : 1;
+  for (int q = 0; q < ni && n < REFINAR && !parou(j); q += passo) {
+    const float *sa = NULL;
+    for (int k = 0; k < N_ANCORAS; k++) if (anc[k].estado == 1 && anc[k].ok && anc[k].pA == (long)ord[q].pa) sa = anc[k].sig;
+    if (!sa) continue;
+    double cs[5], ps[5]; int nc = 0;
+    for (int d = 0; d < 5; d++) {
+      long t = (long)(a * ord[q].pa + b) + DES[d], p; int ok;
+      if (t < 0) t = 0;
+      esperarPlayer(j);
+      int lido = mExato(hB, t, &p, sb, &ok);
+      if (falhou(j, lido)) return 0;
+      if (!lido || !ok) continue;
+      double c = 0;
+      for (int k = 0; k < SIG_N; k++) c += sa[k] * sb[k];
+      cs[nc] = c; ps[nc] = p; nc++;
+    }
+    if (nc < 3) continue;
+    int m = 0;
+    for (int k = 1; k < nc; k++) if (cs[k] > cs[m]) m = k;
+    if (cs[m] < MIN_CORR) continue;
+    double t = ps[m];
+    if (m > 0 && m < nc - 1 && ps[m + 1] > ps[m - 1]) {                 // parabola through the peak and its neighbours
+      double den = cs[m - 1] - 2 * cs[m] + cs[m + 1];
+      if (den < -1e-9) {
+        double s = 0.5 * (cs[m - 1] - cs[m + 1]) / den;
+        if (s > 1) s = 1;
+        if (s < -1) s = -1;
+        t = ps[m] + s * (fabs(ps[m + 1] - ps[m]) + fabs(ps[m] - ps[m - 1])) / 2;
+      }
+    }
+    ref[n].pa = ord[q].pa; ref[n].pb = t; n++;
+  }
+  *nref = n;
+  if (n < MIN_REFINADOS) return 0;
+  double soma = 0, sp = 0, sp2 = 0, s2 = 0;
+  for (int k = 0; k < n; k++) { soma += ref[k].pb - a * ref[k].pa; sp += ref[k].pa; sp2 += ref[k].pa * ref[k].pa; }
+  *b2 = soma / n;
+  for (int k = 0; k < n; k++) { double r = ref[k].pb - (a * ref[k].pa + *b2); s2 += r * r; }
+  double sigma = sqrt(s2 / n), spread = sqrt(fmax(0, sp2 / n - (sp / n) * (sp / n)));
+  if (spread <= 0) spread = 1;
+  *erro = 3 * sigma / sqrt(n) + 2.0 * (sigma / (sqrt(n) * spread)) * durA / 2 + 500.0;
+  return 1;
+}
+
+static int conferir(Job *j, long long hA, long long hB, long durA, long durB, Ancora *anc, Mapa *mapa) {
   double razao = (double)durB / (double)durA;
   Par matches[N_ANCORAS];
   int nm = 0, chamadasB = 0;
-  float sa[SIG_N], sb[SIG_N];
+  float sb[SIG_N];
   if (fabs(razao - 1.0) > MAX_RAZAO_ERRO) { printf("[miniatura] check: runtime differs %.1f%%\n", (razao - 1) * 100); return 0; }
   for (int v = 0; v < N_ANCORAS && !parou(j); v++) {
     int i = (v * 7) % N_ANCORAS;
-    double frac = (i + 0.2 + 0.6 * fmod(i * 0.6180339887, 1.0)) / N_ANCORAS;
-    long tA = (long)(durA * frac);
-    tA = (tA + GRADE_MS / 2) / GRADE_MS * GRADE_MS;
-    long pA; int okA;
-    unsigned char *jpg = NULL; int nj = 0;
-    esperarPlayer(j);
-    int lido = mQuadro(hA, tA, 1, 1, &pA, sa, &okA, &jpg, &nj);
-    if (falhou(j, lido)) return 0;
-    if (!lido) continue;
-    // the anchor is also a finished tile when it lands on its slot
-    { int k = (int)((pA + GRADE_MS / 2) / GRADE_MS);
-      pthread_mutex_lock(&mu);
-      if (jpg && k >= 0 && k < j->n && labs(pA - k * GRADE_MS) <= TOL_MS && !j->tiles[k].jpg) {
-        j->tiles[k].jpg = jpg; j->tiles[k].n = nj; j->tiles[k].pts = pA; j->tentado[k] = 1;
-        j->feitos++; estado = M_PRONTO; jpg = NULL;
+    Ancora *an = &anc[i];
+    if (an->estado == 0) {
+      double frac = (i + 0.2 + 0.6 * fmod(i * 0.6180339887, 1.0)) / N_ANCORAS;
+      long tA = (long)(durA * frac);
+      tA = (tA + GRADE_MS / 2) / GRADE_MS * GRADE_MS;
+      unsigned char *jpg = NULL; int nj = 0;
+      esperarPlayer(j);
+      esperarFolga(j);
+      int lido = mQuadro(hA, tA, 1, 1, &an->pA, an->sig, &an->ok, &jpg, &nj);
+      mSoltar(hA);                                           // the 4K decoder goes back to the player between anchors
+      if (falhou(j, lido)) return 0;
+      an->estado = lido ? 1 : -1;
+      if (lido) {                                            // the anchor is also a finished tile when it lands on its slot
+        int k = (int)((an->pA + GRADE_MS / 2) / GRADE_MS);
+        pthread_mutex_lock(&mu);
+        if (jpg && k >= 0 && k < j->n && labs(an->pA - k * GRADE_MS) <= TOL_MS && !j->tiles[k].jpg) {
+          j->tiles[k].jpg = jpg; j->tiles[k].n = nj; j->tiles[k].pts = an->pA; j->tentado[k] = 1;
+          j->feitos++; estado = M_PRONTO; jpg = NULL;
+        }
+        pthread_mutex_unlock(&mu);
       }
-      pthread_mutex_unlock(&mu); }
-    free(jpg);
-    if (!okA) continue;                                      // flat frame: no information
+      free(jpg);
+      dormir(j, 400);                                        // spread the 4K reads out
+    }
+    if (an->estado != 1 || !an->ok) continue;                // failed, or a flat frame: no information
+    long pA = an->pA;
+    const float *sa = an->sig;
     double a, b, centro;
     long janela, passo;
     if (hipotese(matches, nm, razao, &a, &b)) { centro = a * pA + b; janela = JANELA_ESTREITA_MS; passo = PASSO_ESTREITO_MS; }
@@ -341,9 +440,10 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, Ma
     }
     double segundo = -1;
     for (int k = 0; k < nc; k++) if (fabs(ps[k] - pMelhor) > TOMADA_MS && cs[k] > segundo) segundo = cs[k];
-    if (nc && melhor >= MIN_CORR && melhor - segundo >= MIN_MARGEM) { matches[nm].pa = pA; matches[nm].pb = pMelhor; nm++; }
-    printf("[miniatura] check anchor %d/%d at %lds: best r=%.2f next r=%.2f %s\n", v + 1, N_ANCORAS, pA / 1000, melhor,
-           segundo, nc && melhor >= MIN_CORR && melhor - segundo >= MIN_MARGEM ? "match" : "no");
+    int casou = nc && melhor >= MIN_CORR && melhor - segundo >= MIN_MARGEM;
+    if (casou) { matches[nm].pa = pA; matches[nm].pb = pMelhor; nm++; }
+    printf("[miniatura] check anchor %d/%d at %lds: best r=%.2f next r=%.2f %s (offset %+.1fs)\n", v + 1, N_ANCORAS,
+           pA / 1000, melhor, segundo, casou ? "match" : "no", nc ? (pMelhor - pA) / 1000.0 : 0.0);
     fflush(stdout);
   }
   double a, b;
@@ -358,22 +458,142 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, Ma
     return 0;
   }
   hipotese(in, ni, razao, &a, &b);
-  double res = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, s2 = 0;
-  for (int k = 0; k < ni; k++) {
-    double r = in[k].pb - (a * in[k].pa + b);
-    if (fabs(r) > res) res = fabs(r);
-    sx += in[k].pa; sy += r; sxx += in[k].pa * in[k].pa; sxy += in[k].pa * r; s2 += r * r;
-  }
+  double res = 0;
+  for (int k = 0; k < ni; k++) { double r = fabs(in[k].pb - (a * in[k].pa + b)); if (r > res) res = r; }
   if (res > MAX_RESIDUO_MS || fabs(a - 1.0) > MAX_RAZAO_ERRO) { printf("[miniatura] check: rejected (residual %.0f ms)\n", res); return 0; }
-  double media = sy / ni, sigma = sqrt(fmax(0, s2 / ni - media * media));
-  double den = ni * sxx - sx * sx, tend = den > 0 ? fabs((ni * sxy - sx * sy) / den) * durA / 2 : 0;
-  double erro = 3 * sigma / sqrt(ni) + tend + 0.5 * 4000.0 + 250.0;
-  if (erro > MAX_ERRO_MS) { printf("[miniatura] check: mapping uncertain (%.0f ms)\n", erro); return 0; }
-  mapa->a = a; mapa->b = b; mapa->erro = erro; mapa->inliers = ni;
-  printf("[miniatura] check: ACCEPTED t_copy = %.5f x t_play %+.1fs (%d anchors, +-%.1fs, %d copy reads)\n", a, b / 1000, ni,
-         erro / 1000, chamadasB);
+  // the fine pass, under each plausible speed (same speed; the duration ratio when that could be a real speed change)
+  double slopes[2] = { a, fabs(razao - 1.0) >= 0.01 ? (a == 1.0 ? razao : 1.0) : a };
+  int ns = slopes[1] != slopes[0] ? 2 : 1;
+  double melhorErro = 1e300, melhorA = a, melhorB = b;
+  int melhorN = 0;
+  for (int h = 0; h < ns && !parou(j); h++) {
+    double bh = b, b2, erro; int nref = 0;
+    if (h == 1) {                                            // offset for the other slope: median over the inliers
+      double bs[N_ANCORAS];
+      for (int k = 0; k < ni; k++) bs[k] = in[k].pb - slopes[1] * in[k].pa;
+      bh = mediana(bs, ni);
+    }
+    if (refinar(j, hB, anc, in, ni, slopes[h], bh, durA, &b2, &erro, &nref) && fabs(b2 - bh) <= MAX_RESIDUO_MS && erro < melhorErro) {
+      melhorErro = erro; melhorA = slopes[h]; melhorB = b2; melhorN = nref;
+    }
+    printf("[miniatura] fine pass (speed %.4f): %d anchors refined%s\n", slopes[h], nref,
+           nref >= MIN_REFINADOS ? "" : " (too few)");
+    fflush(stdout);
+  }
+  if (melhorN < MIN_REFINADOS) { printf("[miniatura] check: fine pass failed\n"); fflush(stdout); return 0; }
+  if (melhorErro > MAX_ERRO_MS) { printf("[miniatura] check: mapping uncertain (%.0f ms after the fine pass)\n", melhorErro); return 0; }
+  mapa->a = melhorA; mapa->b = melhorB; mapa->erro = melhorErro; mapa->inliers = ni;
+  printf("[miniatura] check: ACCEPTED t_copy = %.5f x t_play %+.2fs (%d anchors, fine %d, +-%.1fs, %d copy reads)\n", melhorA,
+         melhorB / 1000, ni, melhorN, melhorErro / 1000, chamadasB);
   fflush(stdout);
   return 1;
+}
+
+// ---- the set on this device's storage: a rewatch or a resume shows it at once and reads nothing ----
+// <data>/miniaturas/<fnv64 of the file identity>.nvm : "NVM1", n, dur, complete, then (k, pts, len, jpeg)...
+// Identity: the file name + exact size the add-on declared (the same file through any link), else the link.
+// Capped at 200 MB in total; the least recently used sets go first.
+#define CACHE_MAX_BYTES (200LL << 20)
+
+static void chaveArquivo(const SeekrFonte *f, char *out, size_t n) {
+  char id[700];
+  const char *nome = f->arquivo && f->arquivo[0] ? f->arquivo : "";
+  const char *barra = strrchr(nome, '/');
+  if (barra) nome = barra + 1;
+  if (nome[0] && f->tamanho) snprintf(id, sizeof id, "f|%s|%llu", nome, (unsigned long long)f->tamanho);
+  else snprintf(id, sizeof id, "u|%s", f->url ? f->url : "");
+  unsigned long long h = 1469598103934665603ULL;
+  for (const char *p = id; *p; p++) { h ^= (unsigned char)tolower((unsigned char)*p); h *= 1099511628211ULL; }
+  char dir[512];
+  if (!dados_caminho(dir, sizeof dir, "miniaturas")) { out[0] = 0; return; }
+  snprintf(out, n, "%s/%016llx.nvm", dir, h);
+}
+
+static void escreverI32(FILE *f, long v) { unsigned char b[4] = { (unsigned char)(v >> 24), (unsigned char)(v >> 16), (unsigned char)(v >> 8), (unsigned char)v }; fwrite(b, 1, 4, f); }
+static int lerI32(FILE *f, long *v) { unsigned char b[4]; if (fread(b, 1, 4, f) != 4) return 0; *v = (long)((unsigned long)b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]); return 1; }
+
+// Loads what an earlier run made. 1 = the set was complete (nothing to read from the network).
+static int carregar(Job *j) {
+  if (!j->arq[0]) return 0;
+  FILE *f = fopen(j->arq, "rb");
+  if (!f) return 0;
+  char mag[4]; long n, dur, completo, k, pts, len;
+  int lidos = 0;
+  if (fread(mag, 1, 4, f) != 4 || memcmp(mag, "NVM1", 4) || !lerI32(f, &n) || !lerI32(f, &dur) || !lerI32(f, &completo) ||
+      n != j->n) { fclose(f); return 0; }
+  while (lerI32(f, &k) && lerI32(f, &pts) && lerI32(f, &len)) {
+    if (k < 0 || k >= j->n || len <= 0 || len > (1 << 20)) break;
+    unsigned char *b = malloc((size_t)len);
+    if (!b || fread(b, 1, (size_t)len, f) != (size_t)len) { free(b); break; }
+    pthread_mutex_lock(&mu);
+    if (!j->tiles[k].jpg) { j->tiles[k].jpg = b; j->tiles[k].n = (int)len; j->tiles[k].pts = pts; j->feitos++; lidos++; b = NULL; }
+    j->tentado[k] = 1;
+    if (job == j && j->feitos) estado = M_PRONTO;
+    pthread_mutex_unlock(&mu);
+    free(b);
+  }
+  fclose(f);
+  utime(j->arq, NULL);                                       // recently used: the cap removes others first
+  printf("[miniatura] loaded %d saved thumbnails%s\n", lidos, completo ? " (complete: nothing to read)" : ""); fflush(stdout);
+  return completo && lidos > 0;
+}
+
+typedef struct { char nome[300]; long long tam; time_t quando; } ArqCache;
+static void limparCache(const char *dirArq) {
+  char dir[512];
+  snprintf(dir, sizeof dir, "%s", dirArq);
+  char *barra = strrchr(dir, '/');
+  if (!barra) return;
+  *barra = 0;
+  DIR *d = opendir(dir);
+  if (!d) return;
+  ArqCache *v = NULL; int n = 0, cap = 0;
+  long long total = 0;
+  struct dirent *e;
+  while ((e = readdir(d))) {
+    size_t L = strlen(e->d_name);
+    if (L < 5 || strcmp(e->d_name + L - 4, ".nvm")) continue;
+    char p[820]; struct stat st;
+    snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+    if (stat(p, &st)) continue;
+    if (n == cap) { cap = cap ? cap * 2 : 32; ArqCache *nv = realloc(v, sizeof *v * (size_t)cap); if (!nv) break; v = nv; }
+    snprintf(v[n].nome, sizeof v[n].nome, "%s", p); v[n].tam = st.st_size; v[n].quando = st.st_mtime; n++;
+    total += st.st_size;
+  }
+  closedir(d);
+  while (total > CACHE_MAX_BYTES && n > 1) {
+    int velhoI = 0;
+    for (int i = 1; i < n; i++) if (v[i].quando < v[velhoI].quando) velhoI = i;
+    if (!strcmp(v[velhoI].nome, dirArq)) { v[velhoI].quando = (time_t)0x7fffffff; continue; }
+    unlink(v[velhoI].nome);
+    total -= v[velhoI].tam;
+    v[velhoI] = v[--n];
+  }
+  free(v);
+}
+
+static void salvar(Job *j, int completo) {
+  if (!j->arq[0] || !j->feitos) return;
+  char dir[512], tmp[620];
+  snprintf(dir, sizeof dir, "%s", j->arq);
+  char *barra = strrchr(dir, '/');
+  if (barra) { *barra = 0; mkdir(dir, 0700); }
+  snprintf(tmp, sizeof tmp, "%s.tmp", j->arq);
+  FILE *f = fopen(tmp, "wb");
+  if (!f) return;
+  fwrite("NVM1", 1, 4, f);
+  escreverI32(f, j->n); escreverI32(f, j->dur); escreverI32(f, completo);
+  for (int k = 0; k < j->n; k++) {
+    pthread_mutex_lock(&mu);
+    unsigned char *b = j->tiles[k].jpg; int len = j->tiles[k].n; long pts = j->tiles[k].pts;
+    pthread_mutex_unlock(&mu);                                // tiles are only ever added while the job lives
+    if (!b) continue;
+    escreverI32(f, k); escreverI32(f, pts); escreverI32(f, len);
+    fwrite(b, 1, (size_t)len, f);
+  }
+  int ok = fclose(f) == 0;
+  if (ok && rename(tmp, j->arq) == 0) limparCache(j->arq);
+  else unlink(tmp);
 }
 
 // ---- which slot next ----
@@ -397,6 +617,7 @@ static void *trabalhar(void *u) {
   int usaB = 0;
   Uint32 t0 = SDL_GetTicks();
   falhasSeguidas = 0;
+  if (carregar(j)) goto fim;                    // a complete saved set: no network at all
   esperarPlayer(j);
   hA = mAbrir(j->urlA, j->cabA);
   if (!hA) {
@@ -417,7 +638,7 @@ static void *trabalhar(void *u) {
     printf("[miniatura] checking copy %d: %lldx%lld %.1f min\n", c + 1, ib[1], ib[2], ib[0] / 60000.0); fflush(stdout);
     Uint32 c0 = SDL_GetTicks();
     long long lA0 = mLidos(hA);
-    int aceita = ib[0] > 0 && conferir(j, hA, hB, j->dur, (long)ib[0], &mapa);
+    int aceita = ib[0] > 0 && conferir(j, hA, hB, j->dur, (long)ib[0], j->anc, &mapa);
     long long lidosB = mLidos(hB);
     if (aceita) {
       usaB = 1;
@@ -459,6 +680,7 @@ static void *trabalhar(void *u) {
       }
       free(jpg);
       feitosAqui++; somaMs += SDL_GetTicks() - s;
+      if (feitosAqui % 100 == 0) salvar(j, 0);
       if (feitosAqui % 30 == 0) {
         printf("[miniatura] %d/%d tiles from %s, avg %lu ms, read %.1f MB, free %ld MB\n", j->feitos, j->n, origem,
                somaMs / (unsigned long)feitosAqui, (mLidos(hT) - lido0) / 1048576.0, disp / 1024);
@@ -466,6 +688,10 @@ static void *trabalhar(void *u) {
       }
       usleep(20000);
     }
+    pthread_mutex_lock(&mu);
+    int completo = proximo(j) < 0;
+    pthread_mutex_unlock(&mu);
+    salvar(j, completo && !parou(j));
     printf("[miniatura] done: %d/%d tiles from %s in %.0f s, read %.1f MB\n", j->feitos, j->n, origem,
            (SDL_GetTicks() - t0) / 1000.0, (mLidos(hT) - lido0) / 1048576.0);
     fflush(stdout);
@@ -585,6 +811,7 @@ static void pPedir(const SeekrFonte *f) {
   j->tentado = calloc((size_t)j->n, 1);
   if (!j->tiles || !j->tentado) { free(j->tiles); free(j->tentado); free(j); return; }
   snprintf(j->urlA, sizeof j->urlA, "%s", f->url);
+  chaveArquivo(f, j->arq, sizeof j->arq);
   snprintf(j->cabA, sizeof j->cabA, "%s", f->cabecalhos ? f->cabecalhos : "");
   const Stream *st = stream_item(stream_atual());
   j->alturaA = st ? st->altura : 0;

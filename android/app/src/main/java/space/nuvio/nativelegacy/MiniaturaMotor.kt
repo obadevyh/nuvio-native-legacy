@@ -200,6 +200,8 @@ object MiniaturaMotor {
                 c = if (nome == null) MediaCodec.createDecoderByType(s.mime) else MediaCodec.createByCodecName(nome)
                 val f = MediaFormat(s.fmt)
                 if (s.mime == "video/dolby-vision" && soft) f.setString(MediaFormat.KEY_MIME, "video/hevc")
+                // Not real time: the player's decoder keeps the priority (shared hardware on the Shield).
+                f.setInteger(MediaFormat.KEY_PRIORITY, 1)
                 c.configure(f, null, null, 0)
                 c.start()
                 s.dec = c; s.soft = soft
@@ -268,6 +270,49 @@ object MiniaturaMotor {
             return null
         } catch (e: Exception) {
             Log.w(TAG, "frame failed: ${e.javaClass.simpleName}")
+            soltarDecoder(h)
+            return null
+        }
+    }
+
+    // The frame AT `tMs` (not the keyframe): decode forward from the keyframe before it and keep the first frame
+    // whose time is >= tMs. Signature only. For the fine pass of the timeline check, on the small copy only
+    // (a 720p GOP is cheap to run through; a 4K one is not).
+    @JvmStatic
+    fun quadroExato(h: Long, tMs: Long): ByteArray? {
+        val s = sessoes[h] ?: return null
+        try {
+            s.ex.seekTo(tMs * 1000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            if (s.ex.sampleTime < 0) return null
+            val dec = decoder(s) ?: return null
+            dec.flush()
+            s.ultimoPts = Long.MIN_VALUE
+            val info = MediaCodec.BufferInfo()
+            var fed = 0
+            var eos = false
+            val ini = System.currentTimeMillis()
+            while (System.currentTimeMillis() - ini < 10000) {
+                if (!eos) {
+                    val ib = dec.dequeueInputBuffer(2000)
+                    if (ib >= 0) {
+                        val n = if (fed >= 400) -1 else s.ex.readSampleData(dec.getInputBuffer(ib)!!, 0)
+                        if (n < 0) { dec.queueInputBuffer(ib, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); eos = true }
+                        else { dec.queueInputBuffer(ib, 0, n, s.ex.sampleTime, 0); s.ex.advance(); fed++ }
+                    }
+                }
+                val ob = dec.dequeueOutputBuffer(info, 2000)
+                if (ob >= 0) {
+                    var res: ByteArray? = null
+                    val pts = info.presentationTimeUs / 1000
+                    if (info.size > 0 && pts >= tMs) dec.getOutputImage(ob)?.use { img -> res = montar(s, img, pts, false) }
+                    dec.releaseOutputBuffer(ob, false)
+                    if (res != null) return res
+                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return null
+                }
+            }
+            soltarDecoder(h)
+            return null
+        } catch (e: Exception) {
             soltarDecoder(h)
             return null
         }
