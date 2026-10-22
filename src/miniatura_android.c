@@ -137,7 +137,7 @@ static int mQuadro(long long h, long tMs, int closest, int querJpeg, long *pts, 
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); a = NULL; }
   if (!a) return 0;
   jsize n = (*env)->GetArrayLength(env, a);
-  unsigned char *b = n > CAB + SIG_N ? malloc((size_t)n) : NULL;
+  unsigned char *b = n >= CAB + SIG_N ? malloc((size_t)n) : NULL;   // signature-only replies carry no JPEG
   if (b) (*env)->GetByteArrayRegion(env, a, 0, n, (jbyte *)b);
   (*env)->DeleteLocalRef(env, a);
   if (!b) return 0;
@@ -187,6 +187,29 @@ static long memDisponivelKB(void) {
 
 static int parou(const Job *j) { return j->parar; }
 static void dormir(const Job *j, int ms) { for (int t = 0; t < ms && !parou(j); t += 50) usleep(50000); }
+
+// The player first: nothing is read while it rebuffers, reconnects or has failed. Measured 22/10 (Dune 2, 4K
+// through a StremThru proxy): a burst of thumbnail reads on the playing link and the player's reconnects were
+// refused together (ConnectException) until it gave up.
+static void esperarPlayer(const Job *j) {
+  int avisou = 0;
+  while (!parou(j) && (bufferando || video_reconectando() || video_falhou())) {
+    if (!avisou) { printf("[miniatura] waiting: the player is buffering/reconnecting\n"); fflush(stdout); avisou = 1; }
+    dormir(j, 1000);
+  }
+}
+// Consecutive read failures: back off 5 s, 10 s, 20 s; the 4th in a row ends the job (the link is refusing us).
+static int falhasSeguidas;
+static int falhou(const Job *j, int ok) {
+  if (ok) { falhasSeguidas = 0; return 0; }
+  if (++falhasSeguidas >= 4) {
+    printf("[miniatura] stopping: %d reads in a row failed (source refusing)\n", falhasSeguidas); fflush(stdout);
+    return 1;
+  }
+  printf("[miniatura] read failed, backing off %d s\n", 5 << (falhasSeguidas - 1)); fflush(stdout);
+  dormir(j, 5000 << (falhasSeguidas - 1));
+  return 0;
+}
 
 // ---- choosing the smaller copy (OpenSeek altsource.py, on the list the app already has) ----
 static const char *EDICOES[] = { "extended", "directors", "director", "theatrical", "unrated", "imax", "remastered",
@@ -280,7 +303,10 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, Ma
     tA = (tA + GRADE_MS / 2) / GRADE_MS * GRADE_MS;
     long pA; int okA;
     unsigned char *jpg = NULL; int nj = 0;
-    if (!mQuadro(hA, tA, 1, 1, &pA, sa, &okA, &jpg, &nj)) continue;
+    esperarPlayer(j);
+    int lido = mQuadro(hA, tA, 1, 1, &pA, sa, &okA, &jpg, &nj);
+    if (falhou(j, lido)) return 0;
+    if (!lido) continue;
     // the anchor is also a finished tile when it lands on its slot
     { int k = (int)((pA + GRADE_MS / 2) / GRADE_MS);
       pthread_mutex_lock(&mu);
@@ -299,7 +325,10 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, Ma
     double cs[64], ps[64]; int nc = 0;
     for (long t = (long)centro - janela; t <= (long)centro + janela && nc < 64 && !parou(j); t += passo) {
       long tb = t < 0 ? 0 : t >= durB ? durB - 1 : t, pB; int okB;
-      if (!mQuadro(hB, tb, 1, 0, &pB, sb, &okB, NULL, NULL)) continue;
+      esperarPlayer(j);
+      int lidoB = mQuadro(hB, tb, 1, 0, &pB, sb, &okB, NULL, NULL);
+      if (falhou(j, lidoB)) return 0;
+      if (!lidoB) continue;
       chamadasB++;
       if (!okB) continue;
       int visto = 0;
@@ -367,6 +396,8 @@ static void *trabalhar(void *u) {
   Mapa mapa = {1.0, 0.0, 0.0, 0};
   int usaB = 0;
   Uint32 t0 = SDL_GetTicks();
+  falhasSeguidas = 0;
+  esperarPlayer(j);
   hA = mAbrir(j->urlA, j->cabA);
   if (!hA) {
     printf("[miniatura] could not open the playing source\n"); fflush(stdout);
@@ -386,12 +417,14 @@ static void *trabalhar(void *u) {
     printf("[miniatura] checking copy %d: %lldx%lld %.1f min\n", c + 1, ib[1], ib[2], ib[0] / 60000.0); fflush(stdout);
     Uint32 c0 = SDL_GetTicks();
     long long lA0 = mLidos(hA);
-    if (ib[0] > 0 && conferir(j, hA, hB, j->dur, (long)ib[0], &mapa)) {
+    int aceita = ib[0] > 0 && conferir(j, hA, hB, j->dur, (long)ib[0], &mapa);
+    long long lidosB = mLidos(hB);
+    if (aceita) {
       usaB = 1;
       snprintf(origem, sizeof origem, "%dp copy", j->copias[c].altura);
     } else { mFechar(hB); hB = 0; }
     printf("[miniatura] check took %.1f s, read play %.1f MB + copy %.1f MB\n", (SDL_GetTicks() - c0) / 1000.0,
-           (mLidos(hA) - lA0) / 1048576.0, hB ? mLidos(hB) / 1048576.0 : 0.0);
+           (mLidos(hA) - lA0) / 1048576.0, lidosB / 1048576.0);
     fflush(stdout);
   }
   if (!usaB) snprintf(origem, sizeof origem, "%dp (playing file)", j->alturaA);
@@ -399,7 +432,7 @@ static void *trabalhar(void *u) {
     long long hT = usaB ? hB : hA, lido0 = mLidos(hT);
     int feitosAqui = 0; unsigned long somaMs = 0;
     while (!parou(j)) {
-      if (bufferando) { mSoltar(hT); dormir(j, 1000); continue; }       // the player comes first
+      if (bufferando || video_reconectando() || video_falhou()) { mSoltar(hT); esperarPlayer(j); continue; }
       long disp = memDisponivelKB();
       if (disp >= 0 && disp < PISO_KB) { mSoltar(hT); dormir(j, 1500); continue; }
       pthread_mutex_lock(&mu);
@@ -413,6 +446,7 @@ static void *trabalhar(void *u) {
       long tB = usaB ? (long)(mapa.a * alvo + mapa.b) : alvo;
       if (tB < 0) tB = 0;
       int ok = mQuadro(hT, tB, 1, 1, &p, sig, &okS, &jpg, &nj);
+      if (falhou(j, ok)) break;
       if (ok && usaB) p = (long)((p - mapa.b) / mapa.a);              // back on the playing file's timeline
       if (ok && jpg && labs(p - alvo) <= TOL_MS) {
         int dest = (int)((p + GRADE_MS / 2) / GRADE_MS);

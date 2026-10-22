@@ -42,20 +42,31 @@ object MiniaturaMotor {
         }
         var tamanho = -1L
         var lidos = 0L
+        // Big files (4K remuxes): 1 MB blocks, so one keyframe is one or two requests instead of six.
+        private var blk = BLK
         private val cache = object : LinkedHashMap<Long, ByteArray>(32, 0.75f, true) {
-            override fun removeEldestEntry(e: MutableMap.MutableEntry<Long, ByteArray>?) = size > NBLK
+            override fun removeEldestEntry(e: MutableMap.MutableEntry<Long, ByteArray>?) = size > NBLK * BLK / blk
         }
 
-        init { pedir(0, 0) }
+        init {
+            pedir(0, 0)
+            if (tamanho > (8L shl 30)) blk = 4 * BLK
+        }
 
+        // ONE request at a time for the whole engine, at most ~3 per second, on a kept-alive connection
+        // (the stream is read to the end and closed, never disconnect()ed on success, so HttpURLConnection
+        // reuses the socket). Add-on proxies (StremThru, AIOStreams) and debrid CDNs limit connections per
+        // user; the player's own connections to the SAME link must never be the ones refused.
         private fun pedir(a: Long, b: Long): ByteArray {
+            pausar()
             var ultimo: IOException? = null
-            repeat(3) {
+            for (tentativa in 0 until 2) {
+                if (tentativa > 0) Thread.sleep(2000)
                 val c = URL(alvo).openConnection() as HttpURLConnection
                 try {
                     c.instanceFollowRedirects = true
-                    c.connectTimeout = 20000
-                    c.readTimeout = 60000
+                    c.connectTimeout = 15000
+                    c.readTimeout = 30000
                     for ((k, v) in cab) c.setRequestProperty(k, v)
                     c.setRequestProperty("Range", "bytes=$a-$b")
                     val code = c.responseCode
@@ -68,17 +79,17 @@ object MiniaturaMotor {
                     c.inputStream.use { s -> while (got < n) { val r = s.read(d, got, n - got); if (r < 0) break; got += r } }
                     if (got != n) throw IOException("short read")
                     lidos += got
+                    requisicoes++
                     return d
                 } catch (e: IOException) {
                     ultimo = e
-                } finally {
                     c.disconnect()
                 }
             }
             throw ultimo ?: IOException("read failed")
         }
 
-        private fun bloco(b: Long): ByteArray = cache[b] ?: pedir(b * BLK, minOf(tamanho - 1, b * BLK + BLK - 1)).also { cache[b] = it }
+        private fun bloco(b: Long): ByteArray = cache[b] ?: pedir(b * blk, minOf(tamanho - 1, b * blk + blk - 1)).also { cache[b] = it }
 
         override fun readAt(pos: Long, buf: ByteArray, off: Int, len: Int): Int {
             if (pos >= tamanho) return -1
@@ -86,8 +97,8 @@ object MiniaturaMotor {
                 var feito = 0
                 while (feito < len && pos + feito < tamanho) {
                     val p = pos + feito
-                    val d = bloco(p / BLK)
-                    val ini = (p % BLK).toInt()
+                    val d = bloco(p / blk)
+                    val ini = (p % blk).toInt()
                     val k = minOf(len - feito, d.size - ini)
                     if (k <= 0) break
                     System.arraycopy(d, ini, buf, off + feito, k)
@@ -113,6 +124,18 @@ object MiniaturaMotor {
 
     private val sessoes = ConcurrentHashMap<Long, Sessao>()
     private var proximo = 1L
+    private const val INTERVALO_MS = 350L          // ~3 requests per second, all sessions together
+    private var ultimaReq = 0L
+    @Volatile private var requisicoes = 0L
+
+    private fun pausar() = synchronized(this) {
+        val espera = ultimaReq + INTERVALO_MS - android.os.SystemClock.elapsedRealtime()
+        if (espera > 0) Thread.sleep(espera)
+        ultimaReq = android.os.SystemClock.elapsedRealtime()
+    }
+
+    @JvmStatic
+    fun requisicoes(): Long = requisicoes
 
     // ---- the tone curve for PQ (HDR10 / Dolby Vision) frames: nits -> SDR grey, OpenSeek's Hable ----
     private val pqLut: IntArray by lazy {
@@ -139,14 +162,14 @@ object MiniaturaMotor {
             val m = fm.getString(MediaFormat.KEY_MIME) ?: continue
             if (m.startsWith("video/")) { ex.selectTrack(i); s = Sessao(f, ex, fm, m); break }
         }
-        if (s == null) { ex.release(); 0L } else {
+        if (s == null) { Log.w(TAG, "open failed: no video track (${ex.trackCount} tracks)"); ex.release(); 0L } else {
             s.hdr = s.fmt.containsKey(MediaFormat.KEY_COLOR_TRANSFER) &&
                 s.fmt.getInteger(MediaFormat.KEY_COLOR_TRANSFER) == MediaFormat.COLOR_TRANSFER_ST2084 ||
                 s.mime == "video/dolby-vision"
             synchronized(this) { val id = proximo++; sessoes[id] = s; id }
         }
     } catch (e: Exception) {
-        Log.w(TAG, "open failed: ${e.javaClass.simpleName}")
+        Log.w(TAG, "open failed: ${e.javaClass.simpleName}: ${e.message?.take(80)?.replace(Regex("https?://\\S+"), "<url>")}")
         0L
     }
 
