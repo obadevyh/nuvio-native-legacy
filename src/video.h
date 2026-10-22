@@ -181,6 +181,13 @@ int  video_modo_live_consumir(void);
 // Numero da tentativa (1..3) enquanto uma queda esta em curso, esperando ou
 // recarregando; 0 fora disso. Enquanto nao e 0, video_falhou fica em 0.
 int    video_reconectando(void);
+#ifdef NV_TPK
+// Seek sent and not yet confirmed by the TV (video_tpk.c), and a counter of
+// seeks the TV refused (EV_BUSCA_FALHOU). Used by player.c to hold the bar on
+// the target instead of the stale position.
+int      video_busca_em_voo(void);
+unsigned video_busca_falhas(void);
+#endif
 int    video_tocando(void);
 // Pausa comprovada pelo backend da sessao atual, nao a intencao local de
 // video_pausar. Alvos sem confirmacao confiavel devolvem 0.
@@ -222,13 +229,14 @@ int video_dv_recuo_consumir(void);
 enum {
   VIDEO_DV_NAO_NADA = 0,
   VIDEO_DV_NAO_SEM_DV,    // o cabecalho do arquivo nao tem Dolby Vision
-  VIDEO_DV_NAO_PERFIL,    // perfil 7 com camada de realce (ou outro que nao 5/8)
+  VIDEO_DV_NAO_PERFIL,    // unsupported profile/layout or missing converter
   VIDEO_DV_NAO_AUDIO,     // nenhuma faixa de audio que o caminho alimenta
   VIDEO_DV_NAO_SONDA,     // o cabecalho nao veio (a sonda desistiu)
   VIDEO_DV_NAO_LENTO,     // o caminho abriu e a fonte nao acompanhou
   VIDEO_DV_NAO_FALHOU,    // o caminho nao abriu
   VIDEO_DV_NAO_PESSOA,    // a pessoa escolheu HDR10
-  VIDEO_DV_NAO_CONTENTOR  // o arquivo nao e Matroska (MP4/TS sem extensao na URL)
+  VIDEO_DV_NAO_CONTENTOR, // o arquivo nao e Matroska (MP4/TS sem extensao na URL)
+  VIDEO_DV_NAO_NATIVE     // selected profile stays on the native player
 };
 typedef struct {
   int sessao;          // muda a cada video_tocar (fonte nova)

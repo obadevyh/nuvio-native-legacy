@@ -705,7 +705,10 @@ static Uint32 heroTrailerEspera(void) { return ajustes_trailer_hero_espera_ms();
 // Destino pedido ao trailer; o furo usa o plano final aplicado em video_tpk.c.
 static GfxRect cartaoVideoRect(GfxRect c) {
 #if defined(NV_TPK) && !defined(__EMSCRIPTEN__)
-  GfxRect v; video_tpk_cartao_destino(c.x, c.y, c.w, c.h, &v.x, &v.y, &v.w, &v.h); return v;
+  float s = gfx_escala_tela_txt();
+  GfxRect v;
+  video_tpk_cartao_destino(c.x * s, c.y * s, c.w * s, c.h * s, &v.x, &v.y, &v.w, &v.h);
+  return (GfxRect){ v.x / s, v.y / s, v.w / s, v.h / s };
 #else
   return c;
 #endif
@@ -4829,7 +4832,7 @@ static GfxRect heroEditorialRect(int editorial, float aspect) {
 }
 #ifdef NV_TOUCH_UI
 static void heroTrailerAtualizaRect(GfxRect r, float saida) {
-  if (telefoneui_ativo() && saida <= 0.001f && heroTrailerItem >= 0 && heroTrailerItem == heroAtual &&
+  if (telefoneui_ativo() && !heroTrailerNoCartao && saida <= 0.001f && heroTrailerItem >= 0 && heroTrailerItem == heroAtual &&
       trailer_aberto() && !trailer_cheia() && trailer_dono() == TRAILER_DONO_HOME)
     trailer_rect(r);
 }
@@ -4853,8 +4856,10 @@ static void heroVeuLayout(int lay, float h) {
 static const char *palcoArte(const CatItem *item) {
   if (!item) return NULL;
   const char *poster = arte_por_formato(item, 0);
-  const char *art = item->backdrop;
-  if (!art[0] || artehero_mesma_foto(art, item->poster) ||
+  // Resolve the selected source before detail has enriched the catalog.
+  const char *art = artehero_url_destaque(item, ajustes_hero_fonte(),
+                                         ajustes_hero_arte_diferente());
+  if (!art || !art[0] || artehero_mesma_foto(art, item->poster) ||
       artehero_mesma_foto(art, poster) || tex_falhou(art)) return NULL;
   return art;
 }
@@ -4872,8 +4877,9 @@ static const char *palcoArteOutra(const CatItem *item, const char *centro, const
 }
 // Stage art concepts (owner 18/10): backdrops only, then the title logo.
 static void desenhaPalcoItem(const CatItem *item, float a) {
-  const char *art = palcoArte(item);
-  GLuint tex = art ? tex_obter_palco(art) : 0;
+  // Snapshots keep the resolved URL, including outgoing art after a setting change.
+  const char *art = item->backdrop;
+  GLuint tex = art[0] ? tex_obter_palco(art) : 0;
   if (!tex || a <= 0.004f) return;
   const float W = NV_TELA_W, H = NV_TELA_H;
   const int m = palcoFundoModo;
@@ -4955,7 +4961,7 @@ static void desenhaPalcoArte(void) {
     palcoMostra = palcoFundoItem;
     if (item) palcoItens[0] = *item;
     else memset(&palcoItens[0], 0, sizeof palcoItens[0]);
-    if (!art) palcoItens[0].backdrop[0] = 0;
+    snprintf(palcoItens[0].backdrop, sizeof palcoItens[0].backdrop, "%s", art ? art : "");
     palcoItemA = palcoAnterior < 0 || ajustes_animacoes_reduzidas() ? 1.0f : 0.0f;
   }
   if (palcoItemA < 1.0f)
@@ -7438,7 +7444,11 @@ static void pintarCartao(const CartaoFoco *k, float raio) {
           if (k->trailer > 0.004f) {
             GfxRect v = cartaoVideoRect(card);
 #if defined(NV_TPK) && !defined(__EMSCRIPTEN__)
-            video_tpk_cartao_furo(card.x, card.y, card.w, card.h, &v.x, &v.y, &v.w, &v.h);
+            // The native plane is in screen px; intersect there, then draw in layer px.
+            float s = gfx_escala_tela_txt();
+            video_tpk_cartao_furo(card.x * s, card.y * s, card.w * s, card.h * s,
+                                 &v.x, &v.y, &v.w, &v.h);
+            v = (GfxRect){ v.x / s, v.y / s, v.w / s, v.h / s };
 #endif
             if (v.x != card.x || v.y != card.y || v.w != card.w || v.h != card.h) {
               gfx_cor(card, raio, 0.0f, 0.0f, 0.0f, 1.0f);
@@ -7733,7 +7743,8 @@ static void home_desenhar_(Uint32 agora) {
   desenhaFundo(agora);
   float pd = detail_progresso();
   const int vazioQr = homevazio_ativo(nFileiras);   // sem add-ons: o cartao com o QR no lugar da Home
-  if ((ajustes_hero_ligado() || dinPalcoSplit()) && !vazioQr && palcoFundoAlpha > 0.004f) {
+  if ((ajustes_hero_ligado() || dinPalcoSplit() || palcoFundoModo != PALCO_ATUAL) &&
+      !vazioQr && palcoFundoAlpha > 0.004f) {
     gfx_opacidade_grupo = palcoFundoModo == PALCO_ATUAL ? palcoFundoAlpha : 1.0f;
     desenhaHero(agora, pd);
     gfx_opacidade_grupo = 1.0f;

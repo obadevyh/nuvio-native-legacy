@@ -46,6 +46,7 @@
 #include "fundo.h"
 #include "gpunivel.h"
 #include "fpscena.h"
+#include "player_pacing.h"
 #include "perftv.h"
 #include "vertudo.h"
 #include "ctxmenu.h"
@@ -804,7 +805,7 @@ static void capturaSeSolicitado(void) {
 }
 
 #ifdef __EMSCRIPTEN__
-// Cede o controle ao navegador uma vez por quadro, ESPERANDO O rAF.
+// Yield once per frame, preferring rAF with a deadline for drawn player UI.
 //
 // A primeira versao usava emscripten_sleep(0), que vira setTimeout(0). MEDIDO
 // no Chrome: 0,5 FPS, com o proprio app relatando "pior=0.0ms" — o trabalho de
@@ -812,12 +813,19 @@ static void capturaSeSolicitado(void) {
 // aba em segundo plano e estrangulado para uma chamada por segundo, e mesmo em
 // primeiro plano ele nao tem relacao nenhuma com o vsync.
 //
-// requestAnimationFrame e o unico relogio que o compositor do navegador
-// respeita. EM_ASYNC_JS suspende a funcao C (via ASYNCIFY) ate a promessa
-// resolver, entao o `while` do main continua sendo o laco do app — nada de
-// partir o corpo do quadro num callback.
-EM_ASYNC_JS(void, nv_ceder_quadro, (), {
-  await new Promise(function (r) { requestAnimationFrame(r); });
+// EM_ASYNC_JS suspends C through ASYNCIFY until either clock resolves;
+// the main loop continues to own the frame.
+EM_ASYNC_JS(void, nv_ceder_quadro, (int ui), {
+  // Bound browser frame waits while player UI is drawn over hardware video.
+  await new Promise(function (resolve) {
+    var timer, raf = requestAnimationFrame(done);
+    function done() {
+      cancelAnimationFrame(raf);
+      if (timer !== undefined) clearTimeout(timer);
+      resolve();
+    }
+    if (ui) timer = setTimeout(done, 1000 / 60);
+  });
 });
 #endif
 
@@ -1161,10 +1169,9 @@ int main(int argc, char **argv) {
   // NV_PEDIR_4K continua existindo para a build de medicao, que precisa pedir
   // sem depender de ajuste gravado.
   { int quer4k = resolucaoDaTv() && ajustes_4k();
-    // The larger output workload is an explicit device-local choice — 1080p
-    // only. "720p (leve)" must never ask for the 4K surface: it renders
-    // 1280x720 and the TV scaler upscales for free, whatever AJ_AMPLIAR_UI.
-    int uiMenor4k = resolucaoDaTv() && ajustes_ampliar_app() && ajustes_1080p();
+    // App scaling requests 4K output while retaining the selected UI target.
+    int uiMenor4k = resolucaoDaTv() && ajustes_ampliar_app() &&
+                    (ajustes_720p() || ajustes_1080p());
     int uiMenor720 = resolucaoDaTv() && ajustes_720p();
     // 4K THAT DID NOT HOLD on this TV in an earlier session (resolucao.h):
     // start at 1080p. Picking 4K again in Settings deletes the file.
@@ -1451,12 +1458,14 @@ int main(int argc, char **argv) {
 #endif
   // Capability is known only after creating the GL context. A saved app choice
   // must not leave a weak GPU paying for a 4K drawable.
-  if (resolucaoDaTv() && ajustes_ampliar_app() && ajustes_1080p() &&
-      !gpun_upscale_suportado()) {
+  if (resolucaoDaTv() && ajustes_ampliar_app() &&
+      (ajustes_720p() || ajustes_1080p()) && !gpun_upscale_suportado()) {
+    int fallbackW = ajustes_720p() ? 1280 : (int)NV_TELA_W;
+    int fallbackH = ajustes_720p() ? 720 : (int)NV_TELA_H;
 #ifdef NV_ANDROID
-    android_pedir_superficie((int)NV_TELA_W, (int)NV_TELA_H);
+    android_pedir_superficie(fallbackW, fallbackH);
 #endif
-    SDL_SetWindowSize(win, (int)NV_TELA_W, (int)NV_TELA_H);
+    SDL_SetWindowSize(win, fallbackW, fallbackH);
     printf("[gpu-nivel] app 4K unavailable: restoring TV surface\n");
   }
   // O cursor do Magic Remote e desenhado pelo app (ponteiro.c). Depois do
@@ -1479,7 +1488,7 @@ int main(int argc, char **argv) {
   SDL_GL_GetDrawableSize(win, &dw, &dh);
   SDL_GetWindowSize(win, &jw, &jh);
   ajustes_ui_saida(dw, dh);
-  if (resolucaoDaTv() && ajustes_ampliar_app() && ajustes_1080p())
+  if (resolucaoDaTv() && ajustes_ampliar_app() && (ajustes_720p() || ajustes_1080p()))
     printf("[gpu-nivel] app output requested=%dx%d drawable=%dx%d%s\n",
            pedeW, pedeH, dw, dh, dw < 3840 || dh < 2160 ? " (platform limit; TV completes 4K)" : "");
 #ifdef NV_TOUCH_UI
@@ -1607,9 +1616,9 @@ int main(int argc, char **argv) {
   if (gpuPref) gpun_preferencia(gpuPref);
   if (ajustes_720p()) gpun_forcar_720();
   else if (ajustes_1080p() && dw > (int)NV_TELA_W) gpun_alvo_1080();
-  // 720p desenha no alvo 1280x720 e a TV amplia de graca: a copia do app
-  // so vale no 1080p (alvo 1920x1080 -> 4K). Em drawable 720 ela sai sozinha.
-  gpun_ampliar_app(resolucaoDaTv() && ajustes_ampliar_app() && ajustes_1080p());
+  // Scale to the granted drawable, including 1080p when 4K is refused.
+  gpun_ampliar_app(resolucaoDaTv() && ajustes_ampliar_app() &&
+                   (ajustes_720p() || ajustes_1080p()));
 #ifdef NV_TPK
   video_tpk_zoom_roi_definir(ajustes_trailer_zoom_tpk());
 #endif
@@ -1635,7 +1644,7 @@ int main(int argc, char **argv) {
   // rAF aqui e depois de app_iniciar nao encurta nada disso; parte a tarefa
   // em tres, e o navegador (e o vigia de pagina que nao responde, se a TV tiver
   // um) ve a pagina respirar no meio. O canvas ainda nao tem nada desenhado.
-  nv_ceder_quadro();
+  nv_ceder_quadro(0);
 #endif
   // fonts/ fica ao lado de art/: derruba o ultimo componente do caminho da arte
   char dirRec[512];
@@ -1704,7 +1713,7 @@ int main(int argc, char **argv) {
   // quem usa o tema dinamico ja abre o app na cor do ultimo titulo.
   corviva_carregar();
 #ifdef __EMSCRIPTEN__
-  nv_ceder_quadro();   // o segundo ponto: ver a nota logo depois de gfx_iniciar
+  nv_ceder_quadro(0);   // o segundo ponto: ver a nota logo depois de gfx_iniciar
 #endif
   // Progresso e dado DO USUARIO: sai da pasta do pacote, que e a mesma para
   // todo mundo que usar o aparelho, e passa para a pasta da instalacao.
@@ -1791,6 +1800,7 @@ int main(int argc, char **argv) {
   double fPrep = 0, fGlClr = 0;
   int    txtNQuadro = 0, piorTxtN = 0;
   int quadros = 0, janks = 0; double pior = 0;
+  int playerUiPrevious = 0;
   SwapInt swapInt = {0};   // intervalo real entre swaps (swapint.h)
 
   // TELEMETRIA POR FASE. O quadro pior custava 22ms num alvo de 20ms e nao
@@ -1838,6 +1848,7 @@ int main(int argc, char **argv) {
 #endif
          ) {
     SDL_Event e;
+    Uint32 frameStarted = SDL_GetTicks();
     Uint64 tEv = NV_T0();
     // VIRADA DE QUADRO DO CATALOGO, antes de qualquer tela tocar em cat_item():
     // aqui nenhum ponteiro de item do quadro anterior esta mais na mao, entao
@@ -2084,9 +2095,9 @@ int main(int argc, char **argv) {
     // um dt de varios segundos e a animacao daria um salto.
     double dtAnim = dtms > 100.0 ? 100.0 : dtms;
     float dt = (float)(dtAnim / 1000.0);
-    // Quadro de mais de 1 s entra no pior MESMO nos primeiros 20 da janela:
-    // com FPS de 0,1 a janela inteira tem 1 quadro, e o pior saia 0.0.
-    if (quadros > 20 || dtms > 1000.0) {
+    // Ignore startup only, not the first 21 frames of every sample: at 5 fps
+    // a three-second window has only 15 frames and otherwise reports 0 ms.
+    if (nvPrimeiroQuadroFeito) {
       if (dtms > pior) { pior = dtms; piorTxtMs = txtMsQuadro; piorTxtN = txtNQuadro;
                          pEv=fEv; pBomb=fBomb; pUpd=fUpd; pDes=fDes; pSwap=fSwap; pAux=fAux; pClr=fClr; pPrep=fPrep; pGlClr=fGlClr;
                          pUplN=fUplN; pUplB=fUplB;
@@ -2094,7 +2105,7 @@ int main(int argc, char **argv) {
                          pNBind=fNBind; pNBusca=fNBusca; pOutMs=fOutMs; pNOut=fNOut; pFill=fFill; pNCheio=fNCheio; pTela=fTela; pTrans=fTrans; }
       if (dtms > swapint_limite_jank(&swapInt)) janks++;
     }
-    gfx_vidro_governar(dtms, swapint_periodo(&swapInt));
+    // Automatic glass belongs to the shared FPS ladder (gpunivel.h).
     // RASTRO POR QUADRO, so com /tmp/nuvio-quadros presente (conferido no
     // relatorio de 3 s): cada quadro acima de 25 ms sai com a reparticao, os
     // uploads e o texto rasterizado. O [quadro] de 3 s mostra UM pior por
@@ -2114,18 +2125,25 @@ int main(int argc, char **argv) {
     // ESPERA (clr + swap: o driver devolvendo buffer, a GPU atrasada) e CPU.
     // "Cheia" = artes na tela (o conjunto quente do cache), conferido a cada
     // meio segundo: a home vazia roda a 60 e nao diz nada sobre a GPU.
-    { static Uint32 cheiaEm; static int cheia;
+    { static Uint32 cheiaEm; static int cheia, pendentes;
+      static Uint32 gpuTransienteAte;
+      static int gpuCenaAnterior;
       if (agora - cheiaEm >= 500u) {
         int it = 0, pe = 0, qu = 0; long b = 0, bq = 0;
         tex_estatisticas(&it, &pe, &b, &qu, &bq);
-        cheia = qu >= 8; cheiaEm = agora; }
-      int home = app_na_home(), settings = !strcmp(app_tela_nome(), "ajustes");
-      int cena = home ? 1 : settings ? 2 : 0;
-      // A scene/effect change invalidates the FPS comparison, including a
-      // previously rejected trial. Settings needs no Home artwork cache.
-      if (cena) cena += 4 * (ajustes_home_layout() + 4 * (ajustes_vidro() +
-        2 * (ajustes_cor_viva() + 16 * (ajustes_vidro_fosco() + 2 * ajustes_vidro_qualidade()))));
-      int elegivel = settings || cheia;
+        cheia = qu >= 8; pendentes = pe; cheiaEm = agora; }
+      int home = app_na_home();
+      const char *screen = app_tela_nome();
+      int browse = !strcmp(screen, "explorar") ? 2 :
+                   !strcmp(screen, "biblioteca") ? 3 : !strcmp(screen, "busca") ? 4 : 0;
+      int cena = !video_ativo() && !player_aberto() && !trailer_aberto() ?
+                 (home ? 1 : browse) : 0;
+      // Scene/effect changes break consecutive report streaks.
+      if (cena) cena += 8 * (ajustes_home_layout() + 4 * ajustes_cor_viva());
+      if (cena != gpuCenaAnterior || pendentes > 0 || fUplN > 0 || fUplB > 0)
+        gpuTransienteAte = agora + 3000u;
+      gpuCenaAnterior = cena;
+      int elegivel = cheia && (Sint32)(agora - gpuTransienteAte) >= 0;
       if (!quadros) { gpuRelatoCena = cena; gpuRelatoCheia = elegivel; }
       else if (cena != gpuRelatoCena || !elegivel) gpuRelatoMisto = 1;
       gpun_medir(dtms, fClr + fSwap, fEv + fBomb + fUpd + fDes + fAux, cena, elegivel); }
@@ -2269,8 +2287,21 @@ int main(int argc, char **argv) {
     fAux = NV_DT(t0);
     gputempo_quadro_fim();
     t0 = NV_T0();
+    int playerUi = player_ui_frame(player_aberto(), gfx_n_rect, gfx_n_outros);
+    if (playerUi != playerUiPrevious) {
+#if !defined(__APPLE__) && !defined(__EMSCRIPTEN__)
+      SDL_GL_SetSwapInterval(playerUi ? 0 : 1);
+#endif
+      playerUiPrevious = playerUi;
+    }
     if (!nvPrimeiroQuadroFeito) arranque_etapa("primeiro SwapWindow");
     SDL_GL_SwapWindow(win);
+#ifndef __EMSCRIPTEN__
+    { unsigned wait = player_frame_wait(playerUi, SDL_GetTicks() - frameStarted);
+      if (wait) SDL_Delay(wait); }
+#else
+    (void)frameStarted;
+#endif
     swapint_marca(&swapInt, (double)SDL_GetPerformanceCounter() * 1000.0 / perFreq);
 #ifdef NV_ANDROID
     android_quadro();   // todo quadro apresentado, de qualquer tela (vigia #266)
@@ -2293,7 +2324,7 @@ int main(int argc, char **argv) {
       // atrasar, e o primeiro a descer.
       fio1_rodar(6.0);
 #endif
-      nv_ceder_quadro();
+      nv_ceder_quadro(playerUi);
       fimCeder = SDL_GetPerformanceCounter();
       fora = (double)(fimCeder - c0) * 1000.0 / perFreq;
       if (fora > foraMaxMs) foraMaxMs = fora; }
