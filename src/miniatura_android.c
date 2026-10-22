@@ -25,6 +25,7 @@ int miniatura_prontas_agora(void) { return 0; }
 
 #define GRADE_MS 10000L
 #define TOL_MS 5000L
+#define LOTE 8                       // keyframes per multi-range request
 #define TOL_COPIA_MS 8000L          // a copy keyframe this close stands in for its slot (labelled with its own time)
 #define PISO_KB (300L * 1024)        // MemAvailable kept free for the player and the app
 #define SIG_N (32 * 18)
@@ -92,7 +93,7 @@ static int motivoSem;            // M_FALHOU because: 0 the video would not open
 
 // ---- JNI (MiniaturaMotor.kt) ----
 static jclass cls;
-static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela;
+static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar;
 
 static int jniPreparar(void) {
   if (cls) return 1;
@@ -118,7 +119,8 @@ static int jniPreparar(void) {
     jRitmo = (*env)->GetStaticMethodID(env, c, "ritmo", "()J");
     jFalhaRede = (*env)->GetStaticMethodID(env, c, "falhaRede", "(J)I");
     jTela = (*env)->GetStaticMethodID(env, c, "tela", "()[B");
-    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela) {
+    jPreparar = (*env)->GetStaticMethodID(env, c, "preparar", "(J[J)I");
+    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar) {
       (*env)->ExceptionClear(env);
     } else {
       cls = (jclass)(*env)->NewGlobalRef(env, c);
@@ -214,6 +216,20 @@ static int mFalhaRede(long long h) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jint r = h ? (*env)->CallStaticIntMethod(env, cls, jFalhaRede, (jlong)h) : 0;
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 0; }
+  return r;
+}
+// One multi-range request for the keyframes nearest these copy times (MiniaturaMotor.preparar): >= 0 fetched,
+// -1 batches not possible for this file, -2 refused.
+static int mPreparar(long long h, const long *tempos, int n) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jlongArray a = (*env)->NewLongArray(env, n);
+  if (!a) return -1;
+  jlong v[16];
+  for (int i = 0; i < n && i < 16; i++) v[i] = tempos[i];
+  (*env)->SetLongArrayRegion(env, a, 0, n, v);
+  jint r = (*env)->CallStaticIntMethod(env, cls, jPreparar, (jlong)h, a);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = -1; }
+  (*env)->DeleteLocalRef(env, a);
   return r;
 }
 static long long mRitmo(void) {
@@ -837,15 +853,34 @@ static void *faixa(void *u) {
   Job *j = f->j;
   long long lido0 = mLidos(f->h);
   falhasSeguidas = 0; decodSeguidas = 0;
+  // Batches: claim LOTE slots, fetch their keyframes with ONE multi-range request, then decode them from memory.
+  int fila[LOTE], nfila = 0, ifila = 0, lote = f->usaB ? LOTE : 0, lotes = 0, trazidos = 0;
   while (!parou(j)) {
     if (bufferando || video_reconectando() || video_falhou() || folgaBaixa()) { mSoltar(f->h); esperarPlayer(j); continue; }
     long disp = memDisponivelKB();
     if (disp >= 0 && disp < PISO_KB) { mSoltar(f->h); dormir(j, 1500); continue; }
-    pthread_mutex_lock(&mu);
-    int k = proximo(j), exato = 0;
-    if (k >= 0) j->tentado[k] = 1;
-    else if (f->usaB && (k = proximaLacuna(j)) >= 0) { j->tentado[k] = 2; exato = 1; }   // second pass: the exact frame
-    pthread_mutex_unlock(&mu);
+    int k = -1, exato = 0;
+    if (ifila < nfila) k = fila[ifila++];
+    else {
+      pthread_mutex_lock(&mu);
+      nfila = ifila = 0;
+      for (int quer = lote > 0 ? lote : 1; nfila < quer; ) {
+        int q = proximo(j);
+        if (q < 0) break;
+        j->tentado[q] = 1; fila[nfila++] = q;
+      }
+      if (!nfila && f->usaB && (k = proximaLacuna(j)) >= 0) { j->tentado[k] = 2; exato = 1; }   // second pass: the exact frame
+      pthread_mutex_unlock(&mu);
+      if (nfila > 1 && lote > 0) {
+        long ts[LOTE];
+        for (int i = 0; i < nfila; i++) { ts[i] = (long)(f->mapa.a * fila[i] * GRADE_MS + f->mapa.b); if (ts[i] < 0) ts[i] = 0; }
+        int r = mPreparar(f->h, ts, nfila);
+        if (r == -2) { printf("[miniatura] stopping: the source refused/stalled a connection (protecting playback)\n"); fflush(stdout); break; }
+        if (r < 0) { lote = 0; printf("[miniatura] lane %d: multi-range batches not possible for this copy, one at a time\n", f->id); fflush(stdout); }
+        else { lotes++; trazidos += r; }
+      }
+      if (nfila) k = fila[ifila++];
+    }
     if (k < 0) break;
     long alvo = k * GRADE_MS, p; int okS;
     float sig[SIG_N]; unsigned char *jpg = NULL; int nj = 0;
@@ -870,8 +905,8 @@ static void *faixa(void *u) {
     f->lido = mLidos(f->h) - lido0;
     if (f->id == 1 && f->feitos % 100 == 0) salvar(j, 0);
     if (f->id == 1 && f->feitos % 30 == 0) {
-      printf("[miniatura] %d/%d tiles from %s, lane avg %lu ms, lane read %.1f MB, pace %lld/s, free %ld MB\n", j->feitos, j->n,
-             origem, f->somaMs / (unsigned long)f->feitos, f->lido / 1048576.0, mRitmo(), disp / 1024);
+      printf("[miniatura] %d/%d tiles from %s, lane avg %lu ms, lane read %.1f MB, pace %lld/s, %d batches (%d keyframes), free %ld MB\n",
+             j->feitos, j->n, origem, f->somaMs / (unsigned long)f->feitos, f->lido / 1048576.0, mRitmo(), lotes, trazidos, disp / 1024);
       fflush(stdout);
     }
     if (!f->usaB) usleep(20000);

@@ -70,16 +70,255 @@ object MiniaturaMotor {
             janela = (maiorRecente * 8 / 5 + 32 * 1024).coerceIn(128 * 1024, 384 * 1024)
         }
 
+        private fun guardar(a: Long, d: ByteArray) {
+            segs.add(a to d); guardados += d.size
+            while (guardados > limite && segs.size > 1) guardados -= segs.removeAt(0).second.size
+        }
+        private fun temByte(p: Long) = segs.any { p >= it.first && p < it.first + it.second.size }
+
+        // ---- MULTI-RANGE BATCHES (measured 22/10 on TorBox's Nexus servers: one GET with 8 ranges came back as a
+        // 206 multipart/byteranges with all 8 parts in 373 ms, vs ~190 ms for EACH single range) ----
+        // The keyframes' byte positions come from the Matroska index (Cues); a batch of thumbnails is ONE request on
+        // the same single connection, stored here, and the extractor's own seek then finds the bytes in memory.
+        @Volatile var multiOk = true          // false after one answer that was not multipart: single ranges from then on
+        private var cues: LongArray? = null   // [time ms, absolute cluster position, relative block position] x n
+        private var cuesTentado = false
+
+        private fun ler(p: Long, n: Int): ByteArray? {
+            if (p < 0 || p >= tamanho) return null
+            val b = ByteArray(minOf(n.toLong(), tamanho - p).toInt())
+            var f = 0
+            while (f < b.size) { val r = readAt(p + f, b, f, b.size - f); if (r <= 0) return null; f += r }
+            return b
+        }
+        private fun vint(b: ByteArray, i: Int, id: Boolean): Pair<Long, Int>? {   // (value, length)
+            if (i >= b.size) return null
+            val first = b[i].toInt() and 0xff
+            var len = 1; var mask = 0x80
+            while (len <= 8 && first and mask == 0) { len++; mask = mask shr 1 }
+            if (len > 8 || i + len > b.size) return null
+            var v = (if (id) first else first and (mask - 1)).toLong()
+            for (k in 1 until len) v = (v shl 8) or (b[i + k].toLong() and 0xff)
+            if (!id && v == (1L shl (7 * len)) - 1) v = -1   // unknown size
+            return v to len
+        }
+        private fun uint(b: ByteArray, i: Int, n: Int): Long { var v = 0L; for (k in 0 until n) v = (v shl 8) or (b[i + k].toLong() and 0xff); return v }
+
+        // Segment -> SeekHead -> Cues (+ Info's TimestampScale, Tracks' video track number). Null when not Matroska
+        // or anything is unexpected: the batches are then simply not used.
+        private fun carregarCues(): LongArray? {
+            if (cuesTentado) return cues
+            cuesTentado = true
+            try {
+                val h = ler(0, 64 * 1024) ?: return null
+                val (ebmlId, l0) = vint(h, 0, true) ?: return null
+                if (ebmlId != 0x1A45DFA3L) return null
+                val (ebmlSz, l1) = vint(h, l0, false) ?: return null
+                var i = (l0 + l1 + ebmlSz).toInt()
+                val (segId, s0) = vint(h, i, true) ?: return null
+                if (segId != 0x18538067L) return null
+                val (_, s1) = vint(h, i + s0, false) ?: return null
+                val segIni = (i + s0 + s1).toLong()
+                i = segIni.toInt()
+                var cuesPos = -1L; var infoPos = -1L; var tracksPos = -1L
+                // SeekHead is the first child of Segment in practice (mkvmerge, ffmpeg)
+                val (shId, h0) = vint(h, i, true) ?: return null
+                val (shSz, h1) = vint(h, i + h0, false) ?: return null
+                if (shId != 0x114D9B74L) return null
+                var j = i + h0 + h1
+                val fim = j + shSz.toInt()
+                while (j < fim && j < h.size) {
+                    val (sid, a0) = vint(h, j, true) ?: break
+                    val (ssz, a1) = vint(h, j + a0, false) ?: break
+                    var k = j + a0 + a1
+                    val kfim = k + ssz.toInt()
+                    var qual = 0L; var onde = -1L
+                    if (sid == 0x4DBBL) while (k < kfim) {
+                        val (eid, e0) = vint(h, k, true) ?: break
+                        val (esz, e1) = vint(h, k + e0, false) ?: break
+                        if (eid == 0x53ABL) qual = uint(h, k + e0 + e1, esz.toInt())
+                        if (eid == 0x53ACL) onde = uint(h, k + e0 + e1, esz.toInt())
+                        k += e0 + e1 + esz.toInt()
+                    }
+                    when (qual) { 0x1C53BB6BL -> cuesPos = segIni + onde; 0x1549A966L -> infoPos = segIni + onde; 0x1654AE6BL -> tracksPos = segIni + onde }
+                    j = kfim
+                }
+                if (cuesPos < 0) return null
+                var escala = 1_000_000L
+                if (infoPos >= 0) ler(infoPos, 4096)?.let { b ->
+                    val (_, i0) = vint(b, 0, true) ?: return@let
+                    val (isz, i1) = vint(b, i0, false) ?: return@let
+                    var k = i0 + i1
+                    while (k < minOf(b.size, i0 + i1 + isz.toInt())) {
+                        val (eid, e0) = vint(b, k, true) ?: break
+                        val (esz, e1) = vint(b, k + e0, false) ?: break
+                        if (eid == 0x2AD7B1L) escala = uint(b, k + e0 + e1, esz.toInt())
+                        k += e0 + e1 + esz.toInt()
+                    }
+                }
+                var trilhaVideo = -1L
+                if (tracksPos >= 0) ler(tracksPos, 64 * 1024)?.let { b ->
+                    val (_, t0) = vint(b, 0, true) ?: return@let
+                    val (tsz, t1) = vint(b, t0, false) ?: return@let
+                    var k = t0 + t1
+                    while (k < minOf(b.size, t0 + t1 + tsz.toInt()) && trilhaVideo < 0) {
+                        val (eid, e0) = vint(b, k, true) ?: break
+                        val (esz, e1) = vint(b, k + e0, false) ?: break
+                        if (eid == 0xAEL) {
+                            var m = k + e0 + e1; var num = -1L; var tipo = -1L
+                            while (m < k + e0 + e1 + esz.toInt() && m < b.size) {
+                                val (fid, f0) = vint(b, m, true) ?: break
+                                val (fsz, f1) = vint(b, m + f0, false) ?: break
+                                if (fid == 0xD7L) num = uint(b, m + f0 + f1, fsz.toInt())
+                                if (fid == 0x83L) tipo = uint(b, m + f0 + f1, fsz.toInt())
+                                m += f0 + f1 + fsz.toInt()
+                            }
+                            if (tipo == 1L) trilhaVideo = num
+                        }
+                        k += e0 + e1 + esz.toInt()
+                    }
+                }
+                val ch = ler(cuesPos, 16) ?: return null
+                val (cid, c0) = vint(ch, 0, true) ?: return null
+                val (csz, c1) = vint(ch, c0, false) ?: return null
+                if (cid != 0x1C53BB6BL || csz <= 0 || csz > (16L shl 20)) return null
+                val b = ler(cuesPos + c0 + c1, csz.toInt()) ?: return null
+                val out = ArrayList<Long>()
+                var k = 0
+                while (k < b.size) {
+                    val (pid, p0) = vint(b, k, true) ?: break
+                    val (psz, p1) = vint(b, k + p0, false) ?: break
+                    if (pid == 0xBBL) {
+                        var m = k + p0 + p1; var t = -1L
+                        val mfim = m + psz.toInt()
+                        while (m < mfim && m < b.size) {
+                            val (eid, e0) = vint(b, m, true) ?: break
+                            val (esz, e1) = vint(b, m + e0, false) ?: break
+                            if (eid == 0xB3L) t = uint(b, m + e0 + e1, esz.toInt())
+                            if (eid == 0xB7L) {
+                                var q = m + e0 + e1; var trilha = -1L; var cl = -1L; var rel = 0L
+                                while (q < m + e0 + e1 + esz.toInt()) {
+                                    val (gid, g0) = vint(b, q, true) ?: break
+                                    val (gsz, g1) = vint(b, q + g0, false) ?: break
+                                    when (gid) {
+                                        0xF7L -> trilha = uint(b, q + g0 + g1, gsz.toInt())
+                                        0xF1L -> cl = uint(b, q + g0 + g1, gsz.toInt())
+                                        0xF0L -> rel = uint(b, q + g0 + g1, gsz.toInt())
+                                    }
+                                    q += g0 + g1 + gsz.toInt()
+                                }
+                                if (t >= 0 && cl >= 0 && (trilhaVideo < 0 || trilha == trilhaVideo)) {
+                                    out += t * escala / 1_000_000L; out += segIni + cl; out += rel
+                                }
+                            }
+                            m += e0 + e1 + esz.toInt()
+                        }
+                    }
+                    k += p0 + p1 + psz.toInt()
+                }
+                if (out.size < 30) return null
+                cues = out.toLongArray()
+                Log.i(TAG, "keyframe index: ${out.size / 3} entries (Matroska Cues), multi-range batches on")
+                return cues
+            } catch (e: Exception) {
+                return null
+            }
+        }
+
+        // Prefetch the keyframes nearest these times (the extractor's SEEK_TO_CLOSEST_SYNC picks the same ones) in ONE
+        // multi-range request. Returns how many were fetched, 0 nothing to do, -1 batches not possible for this file.
+        fun prefetch(tempos: LongArray): Int {
+            if (!multiOk || !manter) return -1
+            val c = carregarCues() ?: return -1
+            val n = c.size / 3
+            val faixas = ArrayList<LongArray>()
+            for (t in tempos) {
+                var lo = 0; var hi = n - 1
+                while (lo < hi) { val mid = (lo + hi) / 2; if (c[mid * 3] < t) lo = mid + 1 else hi = mid }
+                val k = if (lo > 0 && t - c[(lo - 1) * 3] < c[lo * 3] - t) lo - 1 else lo
+                val ini = c[k * 3 + 1]
+                if (temByte(ini)) continue
+                val fim = minOf(tamanho - 1, ini + c[k * 3 + 2] + janela - 1)
+                if (faixas.none { it[0] == ini }) faixas += longArrayOf(ini, fim)
+            }
+            if (faixas.isEmpty()) return 0
+            faixas.sortBy { it[0] }
+            val partes = synchronized(VOO) { pedirVarios(faixas) } ?: return -1
+            for ((a, d) in partes) guardar(a, d)
+            return partes.size
+        }
+
+        private fun pedirVarios(faixas: List<LongArray>): List<Pair<Long, ByteArray>>? {
+            if (recusado) throw IOException("refused earlier")
+            pausar()
+            val c = URL(alvo).openConnection() as HttpURLConnection
+            val ini = android.os.SystemClock.elapsedRealtime()
+            try {
+                c.instanceFollowRedirects = true
+                c.connectTimeout = 6000
+                c.readTimeout = 6000
+                for ((k, v) in cab) c.setRequestProperty(k, v)
+                c.setRequestProperty("Accept-Encoding", "identity")
+                c.setRequestProperty("Range", "bytes=" + faixas.joinToString(",") { "${it[0]}-${it[1]}" })
+                val code = c.responseCode
+                val tipo = c.contentType ?: ""
+                if (code != 206 || !tipo.lowercase().startsWith("multipart/byteranges")) {
+                    multiOk = false   // single range or whole file: never again for this file (and read nothing more)
+                    Log.w(TAG, "multi-range not served here (http $code, $tipo): single ranges from now on")
+                    c.disconnect()
+                    return null
+                }
+                val fronteira = Regex("boundary=\"?([^\";]+)").find(tipo)?.groupValues?.get(1) ?: run { multiOk = false; c.disconnect(); return null }
+                val corpo = c.inputStream.use { it.readBytes() }
+                lidos += corpo.size
+                requisicoes++
+                resultado(android.os.SystemClock.elapsedRealtime() - ini, true, corpo.size)
+                val partes = ArrayList<Pair<Long, ByteArray>>()
+                val marca = ("--$fronteira").toByteArray()
+                var p = indice(corpo, marca, 0)
+                while (p >= 0) {
+                    val cabFim = indice(corpo, "\r\n\r\n".toByteArray(), p)
+                    if (cabFim < 0) break
+                    val cabTxt = String(corpo, p, cabFim - p, Charsets.ISO_8859_1)
+                    val m = Regex("Content-Range:\\s*bytes (\\d+)-(\\d+)/", RegexOption.IGNORE_CASE).find(cabTxt) ?: break
+                    val a = m.groupValues[1].toLong(); val b = m.groupValues[2].toLong()
+                    val dIni = cabFim + 4; val dLen = (b - a + 1).toInt()
+                    if (dIni + dLen > corpo.size) break
+                    partes += a to corpo.copyOfRange(dIni, dIni + dLen)
+                    p = indice(corpo, marca, dIni + dLen)
+                }
+                if (partes.isEmpty()) { multiOk = false; return null }
+                return partes
+            } catch (e: IOException) {
+                resultado(0, false)
+                c.disconnect()
+                if (e is java.net.ConnectException || e is java.net.SocketTimeoutException) {
+                    recusado = true
+                    Log.w(TAG, "connection ${if (e is java.net.ConnectException) "refused" else "timed out"}: stopping this title")
+                }
+                throw e
+            }
+        }
+
+        private fun indice(h: ByteArray, agulha: ByteArray, de: Int): Int {
+            var i = de
+            while (i <= h.size - agulha.size) {
+                var k = 0
+                while (k < agulha.size && h[i + k] == agulha[k]) k++
+                if (k == agulha.size) return i
+                i++
+            }
+            return -1
+        }
+
         private fun segmento(p: Long): Pair<Long, ByteArray> {
             for (i in segs.indices.reversed()) {
                 val s = segs[i]
                 if (p >= s.first && p < s.first + s.second.size) { if (i != segs.size - 1) { segs.removeAt(i); segs.add(s) }; return s }
             }
             val d = pedir(p, minOf(tamanho - 1, p + janela - 1))
-            val s = p to d
-            segs.add(s); guardados += d.size
-            while (guardados > limite && segs.size > 1) guardados -= segs.removeAt(0).second.size
-            return s
+            guardar(p, d)
+            return p to d
         }
 
         // ONE request at a time for the whole engine, at most ~4 per second, on one kept-alive connection
@@ -260,6 +499,14 @@ object MiniaturaMotor {
 
     @JvmStatic
     fun lidos(h: Long): Long = sessoes[h]?.fonte?.lidos ?: 0L
+
+    // Prefetch the keyframes for these copy times in one multi-range request. >= 0 fetched, -1 not possible for this
+    // file (not Matroska, no index, server answered single ranges), -2 the connection was refused (stop the title).
+    @JvmStatic
+    fun preparar(h: Long, tempos: LongArray): Int {
+        val f = sessoes[h]?.fonte ?: return -1
+        return try { f.prefetch(tempos) } catch (e: IOException) { if (f.recusado) -2 else -1 }
+    }
 
     private fun decoder(s: Sessao): MediaCodec? {
         s.dec?.let { return it }
