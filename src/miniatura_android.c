@@ -27,6 +27,13 @@ int miniatura_prontas_agora(void) { return 0; }
 #define GRADE_MS 10000L
 #define TOL_MS 5000L
 #define LOTE 8                       // keyframes per multi-range request
+// Copy choice and the optimistic start, named so a test can tune them (22/10, converged with the review):
+#define RAZAO_1080 0.80              // a 1080p copy only when <= 80 % of the best 720p's size
+#define RAZAO_MESMA_RES 0.50         // a copy at the playing file's resolution only when <= half its size
+#define PISO_MBPS_1080 4.0           // bitrate floors: a tiny bad encode must not win on size alone
+#define PISO_MBPS_720 2.0
+#define PISO_MBPS_SD 1.0
+#define OFFSET_MANTER_MS 3000.0      // optimistic thumbnails are kept (relabelled) up to this offset, redone above
 #define TOL_COPIA_MS 8000L          // a copy keyframe this close stands in for its slot (labelled with its own time)
 #define PISO_KB (300L * 1024)        // MemAvailable kept free for the player and the app
 #define SIG_N (32 * 18)
@@ -52,7 +59,10 @@ int miniatura_prontas_agora(void) { return 0; }
 
 enum { M_PARADO = 0, M_BUSCANDO, M_PRONTO, M_FALHOU };
 
-typedef struct { unsigned char *jpg; int n; long pts; } Tile;
+typedef struct { double a, b, erro; int inliers; } Mapa;
+// prov = made at offset 0 while the copy's check was still running (optimistic start): relabelled or discarded
+// when the check decides.
+typedef struct { unsigned char *jpg; int n; long pts; unsigned char prov; } Tile;
 // What the playing file showed at each check anchor: decoded ONCE per title and reused for every copy checked
 // (the 4K decode is what the player feels; a second copy must not pay it again).
 typedef struct { int estado; long pA; int ok; float sig[SIG_N]; } Ancora;   // estado: 0 not yet, 1 read, -1 failed
@@ -61,6 +71,7 @@ typedef struct { int estado; long pA; int ok; float sig[SIG_N]; } Ancora;   // e
 typedef struct {
   char url[4096], cab[512];
   int altura;
+  unsigned long long tamanho;
   char nome[160];
 } Copia;
 
@@ -76,6 +87,14 @@ typedef struct {
   char arq[640];             // the saved set on this device ("" = cannot save)
   int feitos;
   Uint32 lacunaDesde;        // when the exact-frame gap pass started (0 = not yet)
+  Mapa mapa;                 // copy time = a x play time + b, read by the lanes (under mu)
+  int otimista;              // lanes are running at offset 0 before the check decided
+  volatile int pararFaixas;  // stop the lanes only (a rejected copy), the job goes on
+  // per-title summary (one SUMMARY line at the end: the acceptance record of a test)
+  char titulo[48], motivos[320], escolhida[200];
+  double offset;
+  int refeito;
+  long long cont0[3];
   volatile int parar;
   int vivo;
 } Job;
@@ -89,13 +108,14 @@ static volatile long posMs, playheadMs;
 static volatile int scrubbing, bufferando;
 static char origem[48] = "";      // what the thumbnails came from (log + label)
 static volatile unsigned avisoPronto;
+static volatile int evRebuffer, evErro;   // playback events during the title (summary)
 static Uint32 prontoDesde;          // when the playing title's set completed (the player shows it 4 s)
 static int motivoSem;            // M_FALHOU because: 0 the video would not open, 1 no smaller copy usable
    // generation whose set just completed (pPedir shows the notice)
 
 // ---- JNI (MiniaturaMotor.kt) ----
 static jclass cls;
-static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar;
+static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo;
 
 static int jniPreparar(void) {
   if (cls) return 1;
@@ -122,7 +142,9 @@ static int jniPreparar(void) {
     jFalhaRede = (*env)->GetStaticMethodID(env, c, "falhaRede", "(J)I");
     jTela = (*env)->GetStaticMethodID(env, c, "tela", "()[B");
     jPreparar = (*env)->GetStaticMethodID(env, c, "preparar", "(J[J)I");
-    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar) {
+    jCont = (*env)->GetStaticMethodID(env, c, "contadores", "()[J");
+    jAlvo = (*env)->GetStaticMethodID(env, c, "alvo", "(J)Ljava/lang/String;");
+    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jCont || !jAlvo) {
       (*env)->ExceptionClear(env);
     } else {
       cls = (jclass)(*env)->NewGlobalRef(env, c);
@@ -234,6 +256,27 @@ static int mPreparar(long long h, const long *tempos, int n) {
   (*env)->DeleteLocalRef(env, a);
   return r;
 }
+// [requests sent, decoders created, bytes read] since the app started.
+static void mContadores(long long out[3]) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  memset(out, 0, 3 * sizeof *out);
+  jlongArray a = (jlongArray)(*env)->CallStaticObjectMethod(env, cls, jCont);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return; }
+  if (a) { (*env)->GetLongArrayRegion(env, a, 0, 3, (jlong *)out); (*env)->DeleteLocalRef(env, a); }
+}
+// The copy's link after the add-on's redirect, so further sessions do not make the add-on mint another debrid link.
+static void mAlvo(long long h, const char *reserva, char *out, size_t n) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  snprintf(out, n, "%s", reserva);
+  jstring sj = (jstring)(*env)->CallStaticObjectMethod(env, cls, jAlvo, (jlong)h);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return; }
+  if (sj) {
+    const char *c = (*env)->GetStringUTFChars(env, sj, NULL);
+    if (c && c[0]) snprintf(out, n, "%s", c);
+    if (c) (*env)->ReleaseStringUTFChars(env, sj, c);
+    (*env)->DeleteLocalRef(env, sj);
+  }
+}
 static long long mRitmo(void) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jlong r = (*env)->CallStaticLongMethod(env, cls, jRitmo);
@@ -250,7 +293,7 @@ static long memDisponivelKB(void) {
   return v;
 }
 
-static int parou(const Job *j) { return j->parar; }
+static int parou(const Job *j) { return j->parar || j->pararFaixas; }
 static void dormir(const Job *j, int ms) { for (int t = 0; t < ms && !parou(j); t += 50) usleep(50000); }
 
 // The player first: nothing is read while it rebuffers, reconnects or has failed. Measured 22/10 (Dune 2, 4K
@@ -318,50 +361,81 @@ static unsigned edicoes(const Stream *s) {
 static unsigned long long tamanho(const Stream *s) {
   return s->tamanhoBytes ? s->tamanhoBytes : (unsigned long long)s->tamanhoMB << 20;
 }
-static int escolherCopias(const Stream *play, Copia *out) {
-  int idx[TENTATIVAS], n = 0;
+// Size first: the cheapest copy that can be the same video, with guards (same edition words, cached, no samples,
+// a resolution below the playing file's, or the same one at <= half its size, the 1080p 0.80 rule, bitrate floors).
+// Up to TENTATIVAS, smallest first; unknown sizes last. `motivos` gets the counts behind the choice.
+static int escolherCopias(const Stream *play, Copia *out, long durMs, char *motivos, size_t nmot) {
+  enum { R_CACHE, R_RES, R_EDICAO, R_AMOSTRA, R_REPETIDA, R_BITRATE, R_1080, R_N };
+  static const char *NOMES[R_N] = { "not-cached", "resolution", "edition", "sample", "duplicate", "bitrate", "1080-rule" };
+  int rej[R_N] = {0}, nv = 0, cap = stream_n() > 0 ? stream_n() : 1;
+  int *v = malloc(sizeof(int) * (size_t)cap);
   unsigned edA = edicoes(play);
+  unsigned long long tamA = tamanho(play);
+  if (!v) return 0;
   for (int i = 0; i < stream_n(); i++) {
     const Stream *c = stream_item(i);
-    if (!c || i == stream_atual() || c->naoVideo || !c->url[0]) continue;
-    if (!(c->emCache || c->cacheNativo)) continue;                       // never start a download for thumbnails
-    if (c->altura < 480 || c->altura > 1080 || (play->altura > 0 && c->altura >= play->altura)) continue;
-    if (edicoes(c) != edA) continue;
-    if (!strcmp(c->url, play->url)) continue;
-    // Sample clips (measured 22/10: the two "copies" of a 21.6 min episode were 30 s samples): by name, or under
-    // 50 MB. A bigger sample is still caught by the runtime check, from the header alone (~1 s, ~0.4 MB).
-    if (strcasestr(c->arquivo, "sample") || strcasestr(c->rotulo, "sample")) continue;
-    if (tamanho(c) && tamanho(c) < (50ULL << 20)) continue;
+    if (!c || i == stream_atual() || c->naoVideo || !c->url[0] || !strcmp(c->url, play->url)) continue;
+    if (!(c->emCache || c->cacheNativo)) { rej[R_CACHE]++; continue; }   // never start a download for thumbnails
+    unsigned long long tc = tamanho(c);
+    int resOk = c->altura >= 480 && c->altura <= 1080 &&
+                (play->altura <= 0 || c->altura < play->altura ||
+                 (c->altura == play->altura && tc && tamA && tc <= (unsigned long long)(tamA * RAZAO_MESMA_RES)));
+    if (!resOk) { rej[R_RES]++; continue; }
+    if (edicoes(c) != edA) { rej[R_EDICAO]++; continue; }
+    // Sample clips (22/10: the two "copies" of a 21.6 min episode were 30 s samples): by name, or under 50 MB.
+    // A bigger sample is still caught by the runtime check, from the header alone (~1 s, ~0.4 MB).
+    if (strcasestr(c->arquivo, "sample") || strcasestr(c->rotulo, "sample") || (tc && tc < (50ULL << 20))) { rej[R_AMOSTRA]++; continue; }
+    if (tc && durMs > 60000) {
+      double mbps = tc * 8.0 / (durMs / 1000.0) / 1e6;
+      double piso = c->altura >= 1080 ? PISO_MBPS_1080 : c->altura >= 720 ? PISO_MBPS_720 : PISO_MBPS_SD;
+      if (mbps < piso) { rej[R_BITRATE]++; continue; }
+    }
     int repetida = 0;                   // the same file from another add-on: checking it twice is pure waste
-    for (int k = 0; k < n && !repetida; k++) {
-      const Stream *o = stream_item(idx[k]);
-      repetida = (tamanho(c) && tamanho(c) == tamanho(o)) || (c->arquivo[0] && !strcmp(c->arquivo, o->arquivo));
+    for (int k = 0; k < nv && !repetida; k++) {
+      const Stream *o = stream_item(v[k]);
+      repetida = (tc && tc == tamanho(o)) || (c->arquivo[0] && !strcmp(c->arquivo, o->arquivo));
     }
-    if (repetida) continue;
-    // keep the best TENTATIVAS: closest to 720p, then smallest
-    int pos = n;
-    for (int k = 0; k < n; k++) {
-      const Stream *o = stream_item(idx[k]);
-      int dc = abs(c->altura - 720), dk = abs(o->altura - 720);
-      if (dc < dk || (dc == dk && tamanho(c) < tamanho(o))) { pos = k; break; }
-    }
-    if (pos >= TENTATIVAS) continue;
-    if (n < TENTATIVAS) n++;
-    for (int k = n - 1; k > pos; k--) idx[k] = idx[k - 1];
-    idx[pos] = i;
+    if (repetida) { rej[R_REPETIDA]++; continue; }
+    v[nv++] = i;
   }
+  unsigned long long min720 = 0;
+  for (int k = 0; k < nv; k++) {
+    const Stream *c = stream_item(v[k]);
+    if (c->altura == 720 && tamanho(c) && (!min720 || tamanho(c) < min720)) min720 = tamanho(c);
+  }
+  int m = 0;
+  for (int k = 0; k < nv; k++) {
+    const Stream *c = stream_item(v[k]);
+    if (c->altura >= 1080 && min720 && (!tamanho(c) || tamanho(c) > (unsigned long long)(min720 * RAZAO_1080))) { rej[R_1080]++; continue; }
+    v[m++] = v[k];
+  }
+  nv = m;
+  for (int x = 1; x < nv; x++) {        // smallest first, unknown sizes last (insertion sort: lists are short)
+    int y = x, cur = v[x];
+    unsigned long long tcur = tamanho(stream_item(cur));
+    while (y > 0) {
+      unsigned long long tp = tamanho(stream_item(v[y - 1]));
+      if (!(tcur && (!tp || tcur < tp))) break;
+      v[y] = v[y - 1]; y--;
+    }
+    v[y] = cur;
+  }
+  int n = nv < TENTATIVAS ? nv : TENTATIVAS;
   for (int k = 0; k < n; k++) {
-    const Stream *c = stream_item(idx[k]);
+    const Stream *c = stream_item(v[k]);
     snprintf(out[k].url, sizeof out[k].url, "%s", c->url);
     snprintf(out[k].cab, sizeof out[k].cab, "%s", c->cabecalhos);
     out[k].altura = c->altura;
+    out[k].tamanho = tamanho(c);
     snprintf(out[k].nome, sizeof out[k].nome, "%s", c->arquivo[0] ? c->arquivo : c->rotulo);
   }
+  size_t o = (size_t)snprintf(motivos, nmot, "eligible %d (trying %d), rejected:", nv, n);
+  for (int r = 0; r < R_N && o < nmot; r++) if (rej[r]) o += (size_t)snprintf(motivos + o, nmot - o, " %s %d", NOMES[r], rej[r]);
+  free(v);
   return n;
 }
 
 // ---- the timeline check (OpenSeek timeline.verify_alignment) ----
-typedef struct { double a, b, erro; int inliers; } Mapa;
 typedef struct { double pa, pb; } Par;
 
 static int cmpDouble(const void *x, const void *y) { double a = *(const double *)x, b = *(const double *)y; return (a > b) - (a < b); }
@@ -873,7 +947,8 @@ static int proximaLacuna(const Job *j) {
 }
 
 // One lane of thumbnail making (see trabalhar). Slots are claimed under the lock, so two lanes never make the same one.
-typedef struct { Job *j; long long h; int usaB; Mapa mapa; int id; int feitos; unsigned long somaMs; long long lido; } Faixa;
+typedef struct { Job *j; long long h; int usaB; int id; int feitos; unsigned long somaMs; long long lido; } Faixa;
+static Mapa mapaAtual(Job *j) { pthread_mutex_lock(&mu); Mapa m = j->mapa; pthread_mutex_unlock(&mu); return m; }
 static void *faixa(void *u) {
   Faixa *f = u;
   Job *j = f->j;
@@ -902,7 +977,8 @@ static void *faixa(void *u) {
       pthread_mutex_unlock(&mu);
       if (nfila > 1 && lote > 0) {
         long ts[LOTE];
-        for (int i = 0; i < nfila; i++) { ts[i] = (long)(f->mapa.a * fila[i] * GRADE_MS + f->mapa.b); if (ts[i] < 0) ts[i] = 0; }
+        Mapa mp = mapaAtual(j);
+        for (int i = 0; i < nfila; i++) { ts[i] = (long)(mp.a * fila[i] * GRADE_MS + mp.b); if (ts[i] < 0) ts[i] = 0; }
         int r = mPreparar(f->h, ts, nfila);
         if (r == -2) { printf("[miniatura] stopping: the source refused/stalled a connection (protecting playback)\n"); fflush(stdout); break; }
         if (r < 0) { lote = 0; printf("[miniatura] lane %d: multi-range batches not possible for this copy, one at a time\n", f->id); fflush(stdout); }
@@ -914,17 +990,21 @@ static void *faixa(void *u) {
     long alvo = k * GRADE_MS, p; int okS;
     float sig[SIG_N]; unsigned char *jpg = NULL; int nj = 0;
     Uint32 s = SDL_GetTicks();
-    long tB = f->usaB ? (long)(f->mapa.a * alvo + f->mapa.b) : alvo;
+    Mapa mp = mapaAtual(j);
+    long tB = f->usaB ? (long)(mp.a * alvo + mp.b) : alvo;
     if (tB < 0) tB = 0;
     int ok = exato ? mExato(f->h, tB, &p, sig, &okS, &jpg, &nj) : mQuadro(f->h, tB, 1, 1, &p, sig, &okS, &jpg, &nj);
     if (falhou(j, ok, f->h)) break;
-    if (ok && f->usaB) p = (long)((p - f->mapa.b) / f->mapa.a);       // back on the playing file's timeline
+    if (ok && f->usaB) p = (long)((p - mp.b) / mp.a);                 // back on the playing file's timeline
     long tol = f->usaB && !exato ? TOL_COPIA_MS : TOL_MS;
     if (ok && jpg && labs(p - alvo) <= tol) {
       int dest = (int)((p + GRADE_MS / 2) / GRADE_MS);
       pthread_mutex_lock(&mu);
       if (dest < 0 || dest >= j->n || (j->tiles[dest].jpg && dest != k)) dest = k;
-      if (!j->tiles[dest].jpg) { j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; jpg = NULL; j->feitos++; }
+      if (!j->tiles[dest].jpg) {
+        j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; j->tiles[dest].prov = (unsigned char)j->otimista;
+        jpg = NULL; j->feitos++;
+      }
       j->tentado[dest] = 1;
       if (job == j) estado = M_PRONTO;
       pthread_mutex_unlock(&mu);
@@ -932,7 +1012,7 @@ static void *faixa(void *u) {
     free(jpg);
     f->feitos++; f->somaMs += SDL_GetTicks() - s;
     f->lido = mLidos(f->h) - lido0;
-    if (f->id == 1 && f->feitos % 100 == 0) salvar(j, 0);
+    if (f->id == 1 && f->feitos % 100 == 0 && !j->otimista) salvar(j, 0);   // never save unverified (optimistic) thumbnails
     if (f->id == 1 && f->feitos % 30 == 0) {
       printf("[miniatura] %d/%d tiles from %s, lane avg %lu ms, lane read %.1f MB, pace %lld/s, %d batches (%d keyframes), free %ld MB\n",
              j->feitos, j->n, origem, f->somaMs / (unsigned long)f->feitos, f->lido / 1048576.0, mRitmo(), lotes, trazidos, disp / 1024);
@@ -951,6 +1031,8 @@ static void *trabalhar(void *u) {
   int usaB = 0, copiaUsada = 0;
   Uint32 t0 = SDL_GetTicks();
   falhasSeguidas = 0; decodSeguidas = 0;
+  mContadores(j->cont0);
+  evRebuffer = evErro = 0;
   if (j->arq[0]) limparCache(j->arq);           // other titles' sets older than 2 h go now
   if (carregar(j)) goto fim;                    // a complete saved set: no network at all
   if (j->nCopias == 0) {                        // nothing smaller to make them from: the playing file is not opened
@@ -965,31 +1047,101 @@ static void *trabalhar(void *u) {
   printf("[miniatura] playing %dp %.1f min; %d smaller cop%s in the list\n", j->alturaA, j->dur / 60000.0, j->nCopias,
          j->nCopias == 1 ? "y" : "ies");
   fflush(stdout);
+  Faixa f1, f2;
+  memset(&f1, 0, sizeof f1); memset(&f2, 0, sizeof f2);
+  pthread_t t1, t2;
+  int roda1 = 0, roda2 = 0;
+  char alvoB[4096];
   for (int c = 0; c < j->nCopias && !usaB && !parou(j); c++) {
     hB = mAbrir(j->copias[c].url, j->copias[c].cab, 1);
-    if (!hB) { printf("[miniatura] copy %d (%dp) would not open\n", c + 1, j->copias[c].altura); continue; }
+    if (!hB) {
+      printf("[miniatura] copy %d (%dp) would not open\n", c + 1, j->copias[c].altura);
+      snprintf(j->motivos + strlen(j->motivos), sizeof j->motivos - strlen(j->motivos), " | c%d:no-open", c + 1);
+      continue;
+    }
     long long ib[5];
     mInfo(hB, ib);
+    mAlvo(hB, j->copias[c].url, alvoB, sizeof alvoB);
     printf("[miniatura] checking copy %d: %lldx%lld %.1f min\n", c + 1, ib[1], ib[2], ib[0] / 60000.0); fflush(stdout);
+    int igual = ib[0] > 0 && labs((long)ib[0] - j->dur) <= TELA_DUR_IGUAL_MS;
+    if (igual && !roda1) {
+      // OPTIMISTIC START: same length within 2.5 s, so one lane starts at offset 0 while the screen check runs; the
+      // check then relabels (offset <= 3 s) or discards (larger, or rejected) what it made.
+      pthread_mutex_lock(&mu);
+      j->mapa.a = 1.0; j->mapa.b = 0.0; j->otimista = 1;
+      pthread_mutex_unlock(&mu);
+      snprintf(origem, sizeof origem, "%dp copy", j->copias[c].altura);
+      f1.j = j; f1.usaB = 1; f1.id = 1; f1.feitos = 0; f1.somaMs = 0; f1.lido = 0;
+      f1.h = mAbrir(alvoB, j->copias[c].cab, 1);
+      if (f1.h) roda1 = pthread_create(&t1, NULL, faixa, &f1) == 0;
+      if (!roda1) { mFechar(f1.h); f1.h = 0; }
+      else { printf("[miniatura] optimistic start: thumbnails from copy %d at offset 0 while the check runs\n", c + 1); fflush(stdout); }
+    }
     Uint32 c0 = SDL_GetTicks();
     long long lA0 = mLidos(hA);
     int aceita = 0, tela = -1;
-    if (ib[0] > 0 && labs((long)ib[0] - j->dur) <= TELA_DUR_IGUAL_MS) tela = conferirTela(j, hB, (long)ib[0], &mapa);
+    const char *metodo = "none";
+    if (igual) { tela = conferirTela(j, hB, (long)ib[0], &mapa); metodo = "screen"; }
     if (tela == 1) aceita = 1;
     else if (tela == -1 && ib[0] > 0 && j->alturaA > 1080 && !parou(j)) {   // never decode a <= 1080p playing file
-      // runtime differs (maybe another cut: anchors across the whole film), or the screen gave no frames
-      printf("[miniatura] %s: checking with the playing file's own frames\n", labs((long)ib[0] - j->dur) > TELA_DUR_IGUAL_MS ?
-             "runtime differs" : "no screen frames");
+      // ROUTER (MAX_RAZAO_ERRO, 10 %): runtime differs (maybe another cut: anchors across the whole film), or the
+      // screen gave no frames; beyond 10 % the 4K-anchor check refuses at once
+      printf("[miniatura] %s: checking with the playing file's own frames\n", igual ? "no screen frames" : "runtime differs");
       fflush(stdout);
+      metodo = "4k-anchors";
       if (!hA) { hA = mAbrir(j->urlA, j->cabA, 0); if (hA) { mInfo(hA, info); lA0 = mLidos(hA); } }
       if (hA) aceita = conferir(j, hA, hB, j->dur, (long)ib[0], j->anc, &mapa, info[3] != 0);
     }
     long long lidosB = mLidos(hB);
+    size_t o = strlen(j->motivos);
     if (aceita) {
       usaB = 1;
       copiaUsada = c;
       snprintf(origem, sizeof origem, "%dp copy", j->copias[c].altura);
-    } else { mFechar(hB); hB = 0; }
+      pthread_mutex_lock(&mu);
+      if (j->otimista) {
+        if (mapa.a == 1.0 && fabs(mapa.b) <= OFFSET_MANTER_MS) {
+          int n = 0;
+          for (int k = 0; k < j->n; k++) if (j->tiles[k].jpg && j->tiles[k].prov) { j->tiles[k].pts -= (long)mapa.b; j->tiles[k].prov = 0; n++; }
+          printf("[miniatura] optimistic thumbnails kept: %d relabelled by %+.2fs\n", n, -mapa.b / 1000);
+        } else {
+          for (int k = 0; k < j->n; k++)
+            if (!j->tiles[k].jpg || j->tiles[k].prov) {
+              if (j->tiles[k].jpg) { free(j->tiles[k].jpg); j->tiles[k].jpg = NULL; j->feitos--; }
+              j->tentado[k] = 0;
+            }
+          j->refeito = 1;
+          printf("[miniatura] offset %+.2fs is over %.0fs: optimistic thumbnails redone\n", mapa.b / 1000, OFFSET_MANTER_MS / 1000);
+        }
+        j->otimista = 0;
+      }
+      j->mapa = mapa;
+      j->offset = mapa.b;
+      pthread_mutex_unlock(&mu);
+      fflush(stdout);
+      snprintf(j->escolhida, sizeof j->escolhida, "%dp %.0f MB %s (via %s)", j->copias[c].altura, j->copias[c].tamanho / 1048576.0,
+               j->copias[c].nome, metodo);
+      snprintf(j->motivos + o, sizeof j->motivos - o, " | c%d:ACCEPTED", c + 1);
+    } else {
+      if (roda1) {                       // the optimistic lane was making a wrong copy's thumbnails: stop, discard
+        j->pararFaixas = 1;
+        pthread_join(t1, NULL);
+        roda1 = 0;
+        j->pararFaixas = 0;
+        mFechar(f1.h); f1.h = 0;
+        pthread_mutex_lock(&mu);
+        for (int k = 0; k < j->n; k++)
+          if (!j->tiles[k].jpg || j->tiles[k].prov) {
+            if (j->tiles[k].jpg) { free(j->tiles[k].jpg); j->tiles[k].jpg = NULL; j->feitos--; }
+            j->tentado[k] = 0;
+          }
+        j->otimista = 0;
+        pthread_mutex_unlock(&mu);
+      }
+      mFechar(hB); hB = 0;
+      snprintf(j->motivos + o, sizeof j->motivos - o, " | c%d:%s", c + 1,
+               ib[0] <= 0 ? "no-duration" : !igual && j->alturaA <= 1080 ? "runtime" : tela == 0 ? "screen-rejected" : "rejected");
+    }
     printf("[miniatura] check took %.1f s, read play %.1f MB + copy %.1f MB\n", (SDL_GetTicks() - c0) / 1000.0,
            (mLidos(hA) - lA0) / 1048576.0, lidosB / 1048576.0);
     fflush(stdout);
@@ -997,40 +1149,53 @@ static void *trabalhar(void *u) {
   // Never thumbnails from the PLAYING file, at any resolution: decoding the very video the player decodes is what
   // preceded the player's own decoder failing (4003) and the source switches (22/10, a 1080p remux episode).
   if (!usaB) {
-    // Never thumbnails from the 4K itself (owner, 22/10: GBs of reads next to the player). The check's anchors stay.
     printf("[miniatura] no copy passed the check: stopping (thumbnails are never made from the playing file)\n");
     fflush(stdout);
     pthread_mutex_lock(&mu); if (job == j && !j->feitos) { estado = M_FALHOU; motivoSem = 1; } pthread_mutex_unlock(&mu);
     goto fim;
   }
-  if (!usaB) snprintf(origem, sizeof origem, "%dp (playing file)", j->alturaA);
   {
-    // From the small copy: two lanes, each with its own reader and decoder, so a request is always in flight while
-    // the other lane decodes (one request takes ~0.3 s through an add-on proxy; the pacing in MiniaturaMotor is
-    // shared and adaptive). From the playing 4K file: one lane only (the decode is what the player feels).
-    Faixa f1 = { j, usaB ? hB : hA, usaB, mapa, 1, 0, 0, 0 }, f2 = { j, 0, usaB, mapa, 2, 0, 0, 0 };
-    pthread_t t2;
-    int duas = 0;
-    if (usaB && !parou(j)) {
-      f2.h = mAbrir(j->copias[copiaUsada].url, j->copias[copiaUsada].cab, 1);
-      if (f2.h) duas = pthread_create(&t2, NULL, faixa, &f2) == 0;
-      if (!duas) { mFechar(f2.h); f2.h = 0; }
+    // Two lanes on the copy, each with its own reader and decoder (both on the copy's resolved link: no new debrid
+    // link minted), sharing ONE request in flight (MiniaturaMotor): one decodes while the other's batch is on the wire.
+    mAlvo(hB, j->copias[copiaUsada].url, alvoB, sizeof alvoB);
+    mFechar(hB); hB = 0;                 // the check's session is done
+    if (!roda1 && !parou(j)) {
+      f1.j = j; f1.usaB = 1; f1.id = 1; f1.feitos = 0; f1.somaMs = 0; f1.lido = 0;
+      f1.h = mAbrir(alvoB, j->copias[copiaUsada].cab, 1);
+      if (f1.h) roda1 = pthread_create(&t1, NULL, faixa, &f1) == 0;
+      if (!roda1) { mFechar(f1.h); f1.h = 0; }
     }
-    faixa(&f1);
-    if (duas) pthread_join(t2, NULL);
-    mFechar(f2.h);
+    if (!parou(j)) {
+      f2.j = j; f2.usaB = 1; f2.id = 2;
+      f2.h = mAbrir(alvoB, j->copias[copiaUsada].cab, 1);
+      if (f2.h) roda2 = pthread_create(&t2, NULL, faixa, &f2) == 0;
+      if (!roda2) { mFechar(f2.h); f2.h = 0; }
+    }
+    if (roda1) pthread_join(t1, NULL);
+    if (roda2) pthread_join(t2, NULL);
+    mFechar(f1.h); mFechar(f2.h);
     pthread_mutex_lock(&mu);
-    int completo = proximo(j) < 0 && (!usaB || !lacunaPermitida(j) || proximaLacuna(j) < 0) && !parou(j);
+    int completo = proximo(j) < 0 && (!lacunaPermitida(j) || proximaLacuna(j) < 0) && !parou(j);
     pthread_mutex_unlock(&mu);
     salvar(j, completo);
     if (completo) avisoPronto = j->g;
     printf("[miniatura] done: %d/%d tiles from %s in %.0f s (%d lane%s), read %.1f MB, pace now %lld/s\n", j->feitos, j->n,
-           origem, (SDL_GetTicks() - t0) / 1000.0, duas ? 2 : 1, duas ? "s" : "", (f1.lido + f2.lido) / 1048576.0, mRitmo());
+           origem, (SDL_GetTicks() - t0) / 1000.0, roda1 + roda2, roda1 + roda2 == 1 ? "" : "s", (f1.lido + f2.lido) / 1048576.0, mRitmo());
     fflush(stdout);
   }
 fim:
   mFechar(hB);
   mFechar(hA);
+  {
+    long long cont[3];
+    mContadores(cont);
+    printf("[miniatura] SUMMARY %s | play %dp %.1f min | candidates: %s | chosen: %s | offset %+.2fs, redo %s | "
+           "decoders %lld, requests %lld, %.1f MB | tiles %d/%d in %.0f s | playback: %d rebuffers, %d player errors\n",
+           j->titulo, j->alturaA, j->dur / 60000.0, j->motivos, j->escolhida[0] ? j->escolhida : "none", j->offset / 1000,
+           j->refeito ? "yes" : "no", cont[1] - j->cont0[1], cont[0] - j->cont0[0], (cont[2] - j->cont0[2]) / 1048576.0,
+           j->feitos, j->n, (SDL_GetTicks() - t0) / 1000.0, evRebuffer, evErro);
+    fflush(stdout);
+  }
   pthread_mutex_lock(&mu);
   j->vivo = 0;
   int orfao = job != j;
@@ -1136,6 +1301,11 @@ static void pPedir(const SeekrFonte *f) {
     prontoDesde = SDL_GetTicks();
   }
   bufferando = video_bufferando_ms() > 0;
+  { static int bAntes, eAntes;
+    int e = video_falhou();
+    if (bufferando && !bAntes) evRebuffer++;
+    if (e && !eAntes) evErro++;
+    bAntes = bufferando; eAntes = e; }
   if (!f->url || strncmp(f->url, "http", 4) || f->durMs < 60000) return;
   if (!strcmp(urlAtual, f->url)) return;                       // the same title: the worker is on it
   encerrar();
@@ -1153,7 +1323,8 @@ static void pPedir(const SeekrFonte *f) {
   snprintf(j->cabA, sizeof j->cabA, "%s", f->cabecalhos ? f->cabecalhos : "");
   const Stream *st = stream_item(stream_atual());
   j->alturaA = st ? st->altura : 0;
-  j->nCopias = st ? escolherCopias(st, j->copias) : 0;
+  j->nCopias = st ? escolherCopias(st, j->copias, f->durMs, j->motivos, sizeof j->motivos) : 0;
+  snprintf(j->titulo, sizeof j->titulo, "%s %d:%d", f->imdb ? f->imdb : "", f->t, f->e);
   pthread_mutex_lock(&mu);
   j->g = ++geracao;
   j->vivo = 1;

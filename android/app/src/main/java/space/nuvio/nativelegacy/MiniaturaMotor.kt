@@ -271,6 +271,7 @@ object MiniaturaMotor {
                 val fronteira = Regex("boundary=\"?([^\";]+)").find(tipo)?.groupValues?.get(1) ?: run { multiOk = false; c.disconnect(); return null }
                 val corpo = c.inputStream.use { it.readBytes() }
                 lidos += corpo.size
+                lidosTotal += corpo.size
                 requisicoes++
                 resultado(android.os.SystemClock.elapsedRealtime() - ini, true, corpo.size)
                 val partes = ArrayList<Pair<Long, ByteArray>>()
@@ -353,6 +354,7 @@ object MiniaturaMotor {
                     c.inputStream.use { s -> while (got < n) { val r = s.read(d, got, n - got); if (r < 0) break; got += r } }
                     if (got != n) throw IOException("short read")
                     lidos += got
+                    lidosTotal += got
                     requisicoes++
                     resultado(android.os.SystemClock.elapsedRealtime() - ini, true, got)
                     if (!manter) c.disconnect()
@@ -456,6 +458,18 @@ object MiniaturaMotor {
     @JvmStatic
     fun requisicoes(): Long = requisicoes
 
+    @Volatile private var criados = 0L
+
+    // For the per-title summary: [requests sent, decoders created] since the app started (the C side takes deltas).
+    @JvmStatic
+    fun contadores(): LongArray = longArrayOf(requisicoes, criados, lidosTotal)
+    @Volatile private var lidosTotal = 0L
+
+    // The link AFTER the add-on/debrid redirect (the CDN address): later sessions on the same copy open it directly,
+    // so the add-on mints one debrid link per copy, not one per session.
+    @JvmStatic
+    fun alvo(h: Long): String = sessoes[h]?.fonte?.alvo ?: ""
+
     // ---- the tone curve for PQ (HDR10 / Dolby Vision) frames: nits -> SDR grey, OpenSeek's Hable ----
     private val pqLut: IntArray by lazy {
         fun hable(x: Double): Double { val a = 0.15; val b = 0.5; val c = 0.1; val d = 0.2; val e = 0.02; val f = 0.3
@@ -545,6 +559,7 @@ object MiniaturaMotor {
                 c.configure(f, null, null, 0)
                 c.start()
                 s.dec = c; s.soft = soft
+                criados++
                 Log.i(TAG, "decoder ${c.name} (${if (soft) "software" else "hardware"})")
                 return c
             } catch (e: Exception) {
