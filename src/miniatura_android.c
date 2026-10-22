@@ -562,7 +562,10 @@ static int picoExato(Job *j, long long hB, const float *sa, double centro, const
     if (alvo < 0) alvo = 0;
     esperarPlayer(j);
     int lido = mExato(hB, alvo, &p, sb, &ok, NULL, NULL);
-    if (falhou(j, lido, hB)) return -1;
+    // A check frame that did not come (a slow forward decode) only skips this probe; a READ failure still backs
+    // off, and a refused connection still ends the title (23/10: three exact-frame time-outs ended a good copy).
+    if (!lido && mFalhaRede(hB) && falhou(j, lido, hB)) return -1;
+    if (lido) falhou(j, lido, hB);
     if (!lido || !ok) continue;
     double c = 0;
     for (int k = 0; k < SIG_N; k++) c += sa[k] * sb[k];

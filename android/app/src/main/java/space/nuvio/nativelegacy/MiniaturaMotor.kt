@@ -325,7 +325,12 @@ object MiniaturaMotor {
                 val s = segs[i]
                 if (p >= s.first && p < s.first + s.second.size) { if (i != segs.size - 1) { segs.removeAt(i); segs.add(s) }; return s }
             }
-            val d = pedir(p, minOf(tamanho - 1, p + janela - 1))
+            // A read that continues right where a cached segment ends is a FORWARD decode (an exact frame: the
+            // check's fine pass, the gap fills): 1 MB at a time then, not a keyframe-sized window. Measured 23/10:
+            // with ~190 KB windows, exact frames needed ~25 requests each, queued behind the batches, and timed out.
+            val seguido = segs.any { it.first + it.second.size == p }
+            val n = if (seguido && manter) maxOf(janela, 1 shl 20) else janela
+            val d = pedir(p, minOf(tamanho - 1, p + n - 1))
             guardar(p, d)
             return p to d
         }
@@ -700,7 +705,7 @@ object MiniaturaMotor {
             var fed = 0
             var eos = false
             val ini = System.currentTimeMillis()
-            while (System.currentTimeMillis() - ini < 10000) {
+            while (System.currentTimeMillis() - ini < 15000) {   // forward decode through a GOP: reads queue behind the batches
                 if (!eos) {
                     val ib = dec.dequeueInputBuffer(2000)
                     if (ib >= 0) {
