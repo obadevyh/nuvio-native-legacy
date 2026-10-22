@@ -1,3 +1,4 @@
+#define _GNU_SOURCE   // strcasestr
 // SEEK-BAR THUMBNAILS MADE ON THIS DEVICE (Android, test): see miniatura_android.h.
 #include "miniatura_android.h"
 
@@ -47,7 +48,7 @@ int miniatura_prontas_agora(void) { return 0; }
 #define MIN_DESVIO 4.0
 #define MIN_POR_QUARTO 2
 #define TOMADA_MS 8000               // candidates this far from the best are another shot
-#define TENTATIVAS 2                 // smaller copies tried per title
+#define TENTATIVAS 4                 // smaller copies tried per title (a wrong runtime costs only the header)
 
 enum { M_PARADO = 0, M_BUSCANDO, M_PRONTO, M_FALHOU };
 
@@ -327,6 +328,10 @@ static int escolherCopias(const Stream *play, Copia *out) {
     if (c->altura < 480 || c->altura > 1080 || (play->altura > 0 && c->altura >= play->altura)) continue;
     if (edicoes(c) != edA) continue;
     if (!strcmp(c->url, play->url)) continue;
+    // Sample clips (measured 22/10: the two "copies" of a 21.6 min episode were 30 s samples): by name, or under
+    // 50 MB. A bigger sample is still caught by the runtime check, from the header alone (~1 s, ~0.4 MB).
+    if (strcasestr(c->arquivo, "sample") || strcasestr(c->rotulo, "sample")) continue;
+    if (tamanho(c) && tamanho(c) < (50ULL << 20)) continue;
     int repetida = 0;                   // the same file from another add-on: checking it twice is pure waste
     for (int k = 0; k < n && !repetida; k++) {
       const Stream *o = stream_item(idx[k]);
