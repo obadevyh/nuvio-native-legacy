@@ -170,12 +170,13 @@ static long long mAbrir(const char *url, const char *cab, int manter) {
   (*env)->DeleteLocalRef(env, u); (*env)->DeleteLocalRef(env, c);
   return h;
 }
-static void mInfo(long long h, long long out[5]) {
+// [duration ms, width, height, hdr, bytes read, codec usable (H.264/HEVC/DV)]
+static void mInfo(long long h, long long out[6]) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
-  memset(out, 0, 5 * sizeof *out);
+  memset(out, 0, 6 * sizeof *out);
   jlongArray a = (jlongArray)(*env)->CallStaticObjectMethod(env, cls, jInfo, (jlong)h);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return; }
-  if (a) { (*env)->GetLongArrayRegion(env, a, 0, 5, (jlong *)out); (*env)->DeleteLocalRef(env, a); }
+  if (a) { (*env)->GetLongArrayRegion(env, a, 0, 6, (jlong *)out); (*env)->DeleteLocalRef(env, a); }
 }
 // Unpacks MiniaturaMotor's reply: pts (ms), signature (unit-norm, mean-removed; 0 when flat), JPEG (malloc'd).
 static int desempacotar(JNIEnv *env, jbyteArray a, long *pts, float sig[SIG_N], int *temSig, unsigned char **jpg, int *nJpg);
@@ -1038,7 +1039,7 @@ static void *faixa(void *u) {
 
 static void *trabalhar(void *u) {
   Job *j = u;
-  long long hA = 0, hB = 0, info[5];
+  long long hA = 0, hB = 0, info[6];
   Mapa mapa = {1.0, 0.0, 0.0, 0};
   int usaB = 0, copiaUsada = 0;
   Uint32 t0 = SDL_GetTicks();
@@ -1071,10 +1072,16 @@ static void *trabalhar(void *u) {
       snprintf(j->motivos + strlen(j->motivos), sizeof j->motivos - strlen(j->motivos), " | c%d:no-open", c + 1);
       continue;
     }
-    long long ib[5];
+    long long ib[6];
     mInfo(hB, ib);
     mAlvo(hB, j->copias[c].url, alvoB, sizeof alvoB);
     printf("[miniatura] checking copy %d: %lldx%lld %.1f min\n", c + 1, ib[1], ib[2], ib[0] / 60000.0); fflush(stdout);
+    if (!ib[5]) {                       // not H.264/HEVC: rejected from the header, before any decoder exists
+      printf("[miniatura] copy %d: codec not usable for thumbnails (only H.264/HEVC)\n", c + 1); fflush(stdout);
+      snprintf(j->motivos + strlen(j->motivos), sizeof j->motivos - strlen(j->motivos), " | c%d:codec", c + 1);
+      mFechar(hB); hB = 0;
+      continue;
+    }
     int igual = ib[0] > 0 && labs((long)ib[0] - j->dur) <= TELA_DUR_IGUAL_MS;
     if (igual && !roda1) {
       // OPTIMISTIC START: same length within 2.5 s, so one lane starts at offset 0 while the screen check runs; the

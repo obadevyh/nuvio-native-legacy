@@ -533,13 +533,16 @@ object MiniaturaMotor {
         0L
     }
 
-    // [duration ms, width, height, hdr, bytes read so far]
+    // [duration ms, width, height, hdr, bytes read so far, codec usable (1 = H.264/HEVC/Dolby Vision)]
+    // Only those: 23/10 a 1080p film's copy was MPEG-4 Part 2 (XviD) in Matroska and Android's software decoder
+    // failed on every frame; OpenSeek accepts the same two codecs.
     @JvmStatic
     fun info(h: Long): LongArray {
-        val s = sessoes[h] ?: return LongArray(5)
+        val s = sessoes[h] ?: return LongArray(6)
         val d = if (s.fmt.containsKey(MediaFormat.KEY_DURATION)) s.fmt.getLong(MediaFormat.KEY_DURATION) / 1000 else 0L
+        val codecOk = s.mime == "video/avc" || s.mime == "video/hevc" || s.mime == "video/dolby-vision"
         return longArrayOf(d, s.fmt.getInteger(MediaFormat.KEY_WIDTH).toLong(), s.fmt.getInteger(MediaFormat.KEY_HEIGHT).toLong(),
-            if (s.hdr) 1 else 0, s.fonte.lidos)
+            if (s.hdr) 1 else 0, s.fonte.lidos, if (codecOk) 1 else 0)
     }
 
     @JvmStatic
