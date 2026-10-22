@@ -11,7 +11,7 @@ int android_instalar_apk(const char *c) { (void)c; return 0; }
 static int falhas = 0;
 #define CONFERE(c, ...) do { if (!(c)) { falhas++; printf("FALHA: " __VA_ARGS__); printf("\n"); } } while (0)
 
-#define REPO "https://github.com/Tolu-Walop-E/nuvio-native-legacy/releases/download/v1.7.0/"
+#define REPO "https://github.com/obadevyh/nuvio-native-legacy/releases/download/v1.7.0/"
 #define ASSET(nome, dig) "{\"name\":\"" nome "\",\"size\":1,\"digest\":\"sha256:" dig "\",\"download_count\":0," \
   "\"browser_download_url\":\"" REPO nome "\"}"
 

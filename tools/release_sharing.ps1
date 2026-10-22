@@ -15,7 +15,7 @@ param(
   [Parameter(Mandatory = $true)][string]$Version,
   [Parameter(Mandatory = $true)][string]$Notes,
   [switch]$DryRun,
-  [string]$Repo = "Tolu-Walop-E/nuvio-native-legacy",
+  [string]$Repo = "obadevyh/nuvio-native-legacy",
   [string]$KeyDir = "C:\Users\Samue\.nuvio-sharing",
   [string]$SdkDir = "C:\Users\Samue\AppData\Local\Android\Sdk"
 )

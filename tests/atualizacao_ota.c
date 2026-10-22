@@ -5,7 +5,7 @@
 static int falhas = 0;
 #define CONFERE(c, ...) do { if (!(c)) { falhas++; printf("FALHA: " __VA_ARGS__); printf("\n"); } } while (0)
 
-#define REPO "https://github.com/Tolu-Walop-E/nuvio-native-legacy/releases/download/"
+#define REPO "https://github.com/obadevyh/nuvio-native-legacy/releases/download/"
 #define SUF "-sharing.apk"
 #define ASSET(nome, dig, url) "{\"name\":\"" nome "\",\"size\":1,\"digest\":\"sha256:" dig "\",\"download_count\":0," \
   "\"browser_download_url\":\"" url "\"}"
@@ -32,13 +32,13 @@ int main(void) {
   // ---- origem errada
   CONFERE(!acha(REL(ASSET("Nuvio-2.0.8-sharing.apk", "abcd", "https://evil.example/Nuvio-2.0.8-sharing.apk")), url, hash), "outro host");
   CONFERE(url[0] == 0 && hash[0] == 0, "saidas vazias");
-  CONFERE(!acha(REL(ASSET("x-sharing.apk", "abcd", "https://github.com/Tolu-Walop-E/nuvio-native-legacy.evil/releases/download/v1/x-sharing.apk")), url, hash), "repo parecido");
-  CONFERE(!acha(REL(ASSET("x-sharing.apk", "abcd", "https://github.com.evil.example/Tolu-Walop-E/nuvio-native-legacy/releases/download/v1/x-sharing.apk")), url, hash), "host parecido");
-  CONFERE(!acha(REL(ASSET("x-sharing.apk", "abcd", "http://github.com/Tolu-Walop-E/nuvio-native-legacy/releases/download/v1/x-sharing.apk")), url, hash), "http");
+  CONFERE(!acha(REL(ASSET("x-sharing.apk", "abcd", "https://github.com/obadevyh/nuvio-native-legacy.evil/releases/download/v1/x-sharing.apk")), url, hash), "repo parecido");
+  CONFERE(!acha(REL(ASSET("x-sharing.apk", "abcd", "https://github.com.evil.example/obadevyh/nuvio-native-legacy/releases/download/v1/x-sharing.apk")), url, hash), "host parecido");
+  CONFERE(!acha(REL(ASSET("x-sharing.apk", "abcd", "http://github.com/obadevyh/nuvio-native-legacy/releases/download/v1/x-sharing.apk")), url, hash), "http");
   CONFERE(!acha(REL(ASSET("x-sharing.apk", "abcd", REPO "../../../evil/repo/releases/download/v1/x-sharing.apk")), url, hash), "..");
   CONFERE(!acha(REL(ASSET("x-sharing.apk", "abcd", REPO "v1/x-sharing.apk?redirect=https://evil")), url, hash), "query nao termina no sufixo");
   CONFERE(!acha(REL(ASSET("x-sharing.apk", "abcd", REPO "v1/%2e%2e/x-sharing.apk")), url, hash), "percent-2e");
-  CONFERE(!acha(REL(ASSET("x-sharing.apk", "abcd", "https://user@github.com/Tolu-Walop-E/nuvio-native-legacy/releases/download/v1/x-sharing.apk")), url, hash), "usuario@");
+  CONFERE(!acha(REL(ASSET("x-sharing.apk", "abcd", "https://user@github.com/obadevyh/nuvio-native-legacy/releases/download/v1/x-sharing.apk")), url, hash), "usuario@");
   // ---- sufixo
   CONFERE(!acha(REL(ASSET("a", "abcd", REPO "v1/Nuvio-2.0.8-sharing.apk.exe")), url, hash), "sufixo + extensao");
   CONFERE(!acha(REL(ASSET("a", "abcd", REPO "v1/Nuvio-2.0.8-sharing.apkx")), url, hash), "sufixo colado");

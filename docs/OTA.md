@@ -6,8 +6,8 @@ A card says a new version is available with *Update now*, *Later* and the change
 Settings has a manual "check for updates". Offline or failing checks are silent.
 
 ## Trust model (what must ALL be true before the system installer is even shown)
-1. The release comes from the pinned repository `Tolu-Walop-E/nuvio-native-legacy` (GitHub API `releases/latest`: stable channel only, drafts and prereleases are invisible).
-2. The asset is named `Nuvio-<version>-sharing.apk` and its download URL starts with `https://github.com/Tolu-Walop-E/nuvio-native-legacy/releases/download/`
+1. The release comes from the pinned repository `obadevyh/nuvio-native-legacy` (GitHub API `releases/latest`: stable channel only, drafts and prereleases are invisible).
+2. The asset is named `Nuvio-<version>-sharing.apk` and its download URL starts with `https://github.com/obadevyh/nuvio-native-legacy/releases/download/`
    (no `..`, query, fragment, `@`, `%`, backslash). Anything else is ignored.
 3. The release JSON carries the asset's SHA-256 digest (computed by GitHub); a release without a digest is ignored, and the digest of a neighbouring asset is never borrowed.
 4. The tag is exactly `x.y.z` and its versionCode (`x*10000+y*100+z`) is strictly higher than the installed one.
