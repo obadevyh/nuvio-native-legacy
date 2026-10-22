@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Za mała pewność; nic nie zmieniono"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "Brak konta Xtream w tym profilu: testowane kanały pochodzą z dodatków."),
   T("Sem conta do Trakt neste aparelho.", "Brak konta Trakt na tym urządzeniu."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Brak danych"),
   T("Sem dados de gênero", "Brak danych o gatunkach"),
   T("Sem dados desta temporada", "Brak danych dla tego sezonu"),

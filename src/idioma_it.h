@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Affidabilità insufficiente; nulla è stato modificato"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "Nessun account Xtream in questo profilo: i canali provati vengono dagli add-on."),
   T("Sem conta do Trakt neste aparelho.", "Nessun account Trakt su questo dispositivo."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Nessun dato"),
   T("Sem dados de gênero", "Nessun dato sui generi"),
   T("Sem dados desta temporada", "Nessun dato per questa stagione"),

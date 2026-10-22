@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "الثقة غير كافية؛ لم يتغير شيء"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "لا يوجد حساب Xtream في هذا الملف الشخصي: القنوات المختبرة تأتي من الإضافات."),
   T("Sem conta do Trakt neste aparelho.", "لا يوجد حساب Trakt على هذا الجهاز."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "لا بيانات"),
   T("Sem dados de gênero", "لا بيانات عن الأنواع"),
   T("Sem dados desta temporada", "لا بيانات لهذا الموسم"),

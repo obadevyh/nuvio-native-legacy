@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Yeterince emin değil; hiçbir şey değişmedi"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "Bu profilde Xtream hesabı yok: test edilen kanallar eklentilerden."),
   T("Sem conta do Trakt neste aparelho.", "Bu cihazda Trakt hesabı yok."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Veri yok"),
   T("Sem dados de gênero", "Tür verisi yok"),
   T("Sem dados desta temporada", "Bu sezon için veri yok"),

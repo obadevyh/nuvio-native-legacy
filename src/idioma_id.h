@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Kurang yakin; tidak ada yang diubah"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "Tidak ada akun Xtream di profil ini: kanal yang diuji berasal dari addon."),
   T("Sem conta do Trakt neste aparelho.", "Tidak ada akun Trakt di perangkat ini."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Tidak ada data"),
   T("Sem dados de gênero", "Tidak ada data genre"),
   T("Sem dados desta temporada", "Tidak ada data untuk musim ini"),

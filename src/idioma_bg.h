@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Недостатъчна сигурност; нищо не е променено"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "В този профил няма акаунт в Xtream: тестваните канали са от добавките."),
   T("Sem conta do Trakt neste aparelho.", "На това устройство няма акаунт в Trakt."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Няма данни"),
   T("Sem dados de gênero", "Няма данни за жанрове"),
   T("Sem dados desta temporada", "Няма данни за този сезон"),

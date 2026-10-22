@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Ανεπαρκής βεβαιότητα, δεν άλλαξε τίποτα"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "Δεν υπάρχει λογαριασμός Xtream σε αυτό το προφίλ: τα κανάλια που δοκιμάζονται είναι από τα πρόσθετα."),
   T("Sem conta do Trakt neste aparelho.", "Δεν υπάρχει λογαριασμός Trakt σε αυτή τη συσκευή."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Χωρίς δεδομένα"),
   T("Sem dados de gênero", "Δεν υπάρχουν δεδομένα ειδών"),
   T("Sem dados desta temporada", "Δεν υπάρχουν δεδομένα για αυτή τη σεζόν"),

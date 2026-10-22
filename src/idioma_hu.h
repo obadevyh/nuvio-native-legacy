@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Nem elég biztos; semmi sem változott"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "Ebben a profilban nincs Xtream-fiók: a tesztelt csatornák a bővítményekből jönnek."),
   T("Sem conta do Trakt neste aparelho.", "Ezen az eszközön nincs Trakt-fiók."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Nincs adat"),
   T("Sem dados de gênero", "Nincs műfajadat"),
   T("Sem dados desta temporada", "Ehhez az évadhoz nincs adat"),

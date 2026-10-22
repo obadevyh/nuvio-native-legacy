@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Niet zeker genoeg; er is niets gewijzigd"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "Geen Xtream-account in dit profiel: de geteste kanalen komen van add-ons."),
   T("Sem conta do Trakt neste aparelho.", "Geen Trakt-account op dit apparaat."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Geen gegevens"),
   T("Sem dados de gênero", "Geen genregegevens"),
   T("Sem dados desta temporada", "Geen gegevens voor dit seizoen"),

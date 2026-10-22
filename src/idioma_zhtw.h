@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "可信度不足，未做任何變更"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "此個人檔案沒有 Xtream 帳號：測試的頻道來自附加元件。"),
   T("Sem conta do Trakt neste aparelho.", "這台裝置上沒有 Trakt 帳號。"),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "無資料"),
   T("Sem dados de gênero", "無類型資料"),
   T("Sem dados desta temporada", "沒有本季的資料"),

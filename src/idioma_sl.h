@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Premalo zanesljivo; nič ni spremenjeno"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "V tem profilu ni računa Xtream: preizkušeni kanali so iz dodatkov."),
   T("Sem conta do Trakt neste aparelho.", "Na tej napravi ni računa Trakt."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Ni podatka"),
   T("Sem dados de gênero", "Ni podatkov o žanrih"),
   T("Sem dados desta temporada", "Za to sezono ni podatkov"),

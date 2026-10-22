@@ -4789,6 +4789,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Încredere insuficientă; nimic nu a fost modificat"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "Nu există cont Xtream în acest profil: canalele testate vin din addon-uri."),
   T("Sem conta do Trakt neste aparelho.", "Niciun cont Trakt pe acest dispozitiv."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Fără date"),
   T("Sem dados de gênero", "Fără date despre gen"),
   T("Sem dados desta temporada", "Fără date pentru acest sezon"),

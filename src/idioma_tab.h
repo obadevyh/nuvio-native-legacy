@@ -4789,6 +4789,7 @@
   { "Sem confiança suficiente; nada foi alterado", "Not confident enough; nothing changed" },
   { "Sem conta Xtream neste perfil: os canais testados são dos addons.", "No Xtream account on this profile: the channels tested come from add-ons." },
   { "Sem conta do Trakt neste aparelho.", "No Trakt account on this device." },
+  { "Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from" },
   { "Sem dado", "No data" },
   { "Sem dados de gênero", "No genre data" },
   { "Sem dados desta temporada", "No data for this season" },

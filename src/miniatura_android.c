@@ -86,7 +86,9 @@ static char urlAtual[4096];
 static volatile long posMs, playheadMs;
 static volatile int scrubbing, bufferando;
 static char origem[48] = "";      // what the thumbnails came from (log + label)
-static volatile unsigned avisoPronto;   // generation whose set just completed (pPedir shows the notice)
+static volatile unsigned avisoPronto;
+static int motivoSem;            // M_FALHOU because: 0 the video would not open, 1 no smaller copy usable
+   // generation whose set just completed (pPedir shows the notice)
 
 // ---- JNI (MiniaturaMotor.kt) ----
 static jclass cls;
@@ -304,6 +306,12 @@ static int escolherCopias(const Stream *play, Copia *out) {
     if (c->altura < 480 || c->altura > 1080 || (play->altura > 0 && c->altura >= play->altura)) continue;
     if (edicoes(c) != edA) continue;
     if (!strcmp(c->url, play->url)) continue;
+    int repetida = 0;                   // the same file from another add-on: checking it twice is pure waste
+    for (int k = 0; k < n && !repetida; k++) {
+      const Stream *o = stream_item(idx[k]);
+      repetida = (tamanho(c) && tamanho(c) == tamanho(o)) || (c->arquivo[0] && !strcmp(c->arquivo, o->arquivo));
+    }
+    if (repetida) continue;
     // keep the best TENTATIVAS: closest to 720p, then smallest
     int pos = n;
     for (int k = 0; k < n; k++) {
@@ -364,7 +372,7 @@ static void esperarFolga(const Job *j) {
 #define REFINAR 8
 #define MIN_REFINADOS 5
 static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int ni, double a, double b, long durA,
-                   double *b2, double *erro, int *nref) {
+                   double *b2, double *erro, int *nref, double minCorr) {
   static const long DES[5] = { -2000, -1000, 0, 1000, 2000 };
   Par ord[N_ANCORAS], ref[REFINAR];
   int n = 0;
@@ -391,7 +399,7 @@ static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int n
     if (nc < 3) continue;
     int m = 0;
     for (int k = 1; k < nc; k++) if (cs[k] > cs[m]) m = k;
-    if (cs[m] < MIN_CORR) continue;
+    if (cs[m] < minCorr) continue;
     double t = ps[m];
     if (m > 0 && m < nc - 1 && ps[m + 1] > ps[m - 1]) {                 // parabola through the peak and its neighbours
       double den = cs[m - 1] - 2 * cs[m] + cs[m + 1];
@@ -416,7 +424,8 @@ static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int n
   return 1;
 }
 
-static int conferir(Job *j, long long hA, long long hB, long durA, long durB, Ancora *anc, Mapa *mapa) {
+static int conferir(Job *j, long long hA, long long hB, long durA, long durB, Ancora *anc, Mapa *mapa, int hdr) {
+  double minCorr = hdr ? 0.50 : MIN_CORR;
   double razao = (double)durB / (double)durA;
   Par matches[N_ANCORAS];
   int nm = 0, chamadasB = 0;
@@ -475,7 +484,7 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, An
     }
     double segundo = -1;
     for (int k = 0; k < nc; k++) if (fabs(ps[k] - pMelhor) > TOMADA_MS && cs[k] > segundo) segundo = cs[k];
-    int casou = nc && melhor >= MIN_CORR && melhor - segundo >= MIN_MARGEM;
+    int casou = nc && melhor >= minCorr && melhor - segundo >= MIN_MARGEM;
     if (casou) { matches[nm].pa = pA; matches[nm].pb = pMelhor; nm++; }
     printf("[miniatura] check anchor %d/%d at %lds: best r=%.2f next r=%.2f %s (offset %+.1fs)\n", v + 1, N_ANCORAS,
            pA / 1000, melhor, segundo, casou ? "match" : "no", nc ? (pMelhor - pA) / 1000.0 : 0.0);
@@ -525,7 +534,7 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, An
       for (int k = 0; k < ni; k++) bs[k] = in[k].pb - slopes[1] * in[k].pa;
       bh = mediana(bs, ni);
     }
-    if (refinar(j, hB, anc, in, ni, slopes[h], bh, durA, &b2, &erro, &nref) && fabs(b2 - bh) <= MAX_RESIDUO_MS && erro < melhorErro) {
+    if (refinar(j, hB, anc, in, ni, slopes[h], bh, durA, &b2, &erro, &nref, minCorr) && fabs(b2 - bh) <= MAX_RESIDUO_MS && erro < melhorErro) {
       melhorErro = erro; melhorA = slopes[h]; melhorB = b2; melhorN = nref;
     }
     printf("[miniatura] fine pass (speed %.4f): %d anchors refined%s\n", slopes[h], nref,
@@ -737,6 +746,11 @@ static void *trabalhar(void *u) {
   falhasSeguidas = 0; decodSeguidas = 0;
   if (j->arq[0]) limparCache(j->arq);           // other titles' sets older than 2 h go now
   if (carregar(j)) goto fim;                    // a complete saved set: no network at all
+  if (j->nCopias == 0 && j->alturaA > 1080) {    // nothing smaller to make them from: the 4K is not even opened
+    printf("[miniatura] no smaller copy in the list: no thumbnails for a %dp file\n", j->alturaA); fflush(stdout);
+    pthread_mutex_lock(&mu); if (job == j) { estado = M_FALHOU; motivoSem = 1; } pthread_mutex_unlock(&mu);
+    goto fim;
+  }
   esperarPlayer(j);
   hA = mAbrir(j->urlA, j->cabA, 0);
   if (!hA) {
@@ -757,7 +771,7 @@ static void *trabalhar(void *u) {
     printf("[miniatura] checking copy %d: %lldx%lld %.1f min\n", c + 1, ib[1], ib[2], ib[0] / 60000.0); fflush(stdout);
     Uint32 c0 = SDL_GetTicks();
     long long lA0 = mLidos(hA);
-    int aceita = ib[0] > 0 && conferir(j, hA, hB, j->dur, (long)ib[0], j->anc, &mapa);
+    int aceita = ib[0] > 0 && conferir(j, hA, hB, j->dur, (long)ib[0], j->anc, &mapa, info[3] != 0);
     long long lidosB = mLidos(hB);
     if (aceita) {
       usaB = 1;
@@ -767,6 +781,13 @@ static void *trabalhar(void *u) {
     printf("[miniatura] check took %.1f s, read play %.1f MB + copy %.1f MB\n", (SDL_GetTicks() - c0) / 1000.0,
            (mLidos(hA) - lA0) / 1048576.0, lidosB / 1048576.0);
     fflush(stdout);
+  }
+  if (!usaB && (info[2] > 1088 || j->alturaA > 1080)) {
+    // Never thumbnails from the 4K itself (owner, 22/10: GBs of reads next to the player). The check's anchors stay.
+    printf("[miniatura] no copy passed the check: stopping (thumbnails are never made from the %lldp file)\n", info[2]);
+    fflush(stdout);
+    pthread_mutex_lock(&mu); if (job == j && !j->feitos) { estado = M_FALHOU; motivoSem = 1; } pthread_mutex_unlock(&mu);
+    goto fim;
   }
   if (!usaB) snprintf(origem, sizeof origem, "%dp (playing file)", j->alturaA);
   {
@@ -903,6 +924,7 @@ static void pPedir(const SeekrFonte *f) {
   if (!f->url || strncmp(f->url, "http", 4) || f->durMs < 60000) return;
   if (!strcmp(urlAtual, f->url)) return;                       // the same title: the worker is on it
   encerrar();
+  motivoSem = 0;
   if (!jniPreparar()) { estado = M_FALHOU; snprintf(urlAtual, sizeof urlAtual, "%s", f->url); return; }
   Job *j = calloc(1, sizeof *j);
   if (!j) return;
@@ -942,7 +964,7 @@ static const char *pRotulo(int est) {
   switch (est) {
     case SEEKR_BUSCANDO: return "Fazendo miniaturas neste aparelho";
     case SEEKR_PRONTO: return "Miniaturas disponíveis";
-    case SEEKR_SEM_PREVIA: return "Este aparelho não conseguiu ler este vídeo";
+    case SEEKR_SEM_PREVIA: return motivoSem ? "Sem cópia menor para fazer as miniaturas" : "Este aparelho não conseguiu ler este vídeo";
     default: return "Fazendo miniaturas neste aparelho";
   }
 }

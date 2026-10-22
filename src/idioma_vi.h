@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Chưa đủ tin cậy; không thay đổi gì"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "Hồ sơ này không có tài khoản Xtream: các kênh được kiểm tra lấy từ tiện ích."),
   T("Sem conta do Trakt neste aparelho.", "Không có tài khoản Trakt trên thiết bị này."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Không có dữ liệu"),
   T("Sem dados de gênero", "Không có dữ liệu thể loại"),
   T("Sem dados desta temporada", "Không có dữ liệu cho mùa này"),

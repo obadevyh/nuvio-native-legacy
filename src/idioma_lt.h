@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Nepakankamas patikimumas; niekas nepakeista"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "Šiame profilyje nėra Xtream paskyros: tikrinami kanalai iš papildinių."),
   T("Sem conta do Trakt neste aparelho.", "Šiame įrenginyje nėra Trakt paskyros."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Nėra duomenų"),
   T("Sem dados de gênero", "Nėra žanrų duomenų"),
   T("Sem dados desta temporada", "Šiam sezonui duomenų nėra"),

@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Nedostatečná jistota; nic se nezměnilo"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "V tomto profilu není účet Xtream: testované kanály jsou z doplňků."),
   T("Sem conta do Trakt neste aparelho.", "Na tomto zařízení není účet Trakt."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Bez dat"),
   T("Sem dados de gênero", "Žádná data o žánrech"),
   T("Sem dados desta temporada", "Pro tuto sezónu nejsou data"),

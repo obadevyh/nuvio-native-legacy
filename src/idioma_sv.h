@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "Inte säker nog; inget ändrades"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "Inget Xtream-konto i den här profilen: de testade kanalerna kommer från add-ons."),
   T("Sem conta do Trakt neste aparelho.", "Inget Trakt-konto på den här enheten."),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "Ingen data"),
   T("Sem dados de gênero", "Inga genredata"),
   T("Sem dados desta temporada", "Inga data för den här säsongen"),

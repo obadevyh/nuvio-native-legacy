@@ -4790,6 +4790,7 @@
   T("Sem confiança suficiente; nada foi alterado", "確信度が不十分なため、何も変更していません"),
   T("Sem conta Xtream neste perfil: os canais testados são dos addons.", "このプロフィールには Xtream アカウントがありません。テストするチャンネルはアドオンのものです。"),
   T("Sem conta do Trakt neste aparelho.", "この端末に Trakt アカウントがありません。"),
+  T("Sem cópia menor para fazer as miniaturas", "No smaller copy to make thumbnails from"),
   T("Sem dado", "データなし"),
   T("Sem dados de gênero", "ジャンルのデータなし"),
   T("Sem dados desta temporada", "このシーズンのデータはありません"),
