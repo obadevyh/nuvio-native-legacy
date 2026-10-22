@@ -435,6 +435,7 @@ object MiniaturaMotor {
     // not a struggling link; measured 22/10, it cut the pace to 1/s for the rest of a 3 h film). Recovery is
     // multiplicative: 10 good answers take 25 % off the gap, so ~50 requests from the floor back to full pace.
     private fun resultado(ms: Long, ok: Boolean, bytes: Int = 0) = synchronized(this) {
+        if (ok && bytes <= 1) return@synchronized          // the 0-0 size probe: its latency says nothing about the link
         if (!ok || ms > LENTO_MS + bytes / 1500) {
             val antes = intervalo
             intervalo = minOf(INTERVALO_MAX_MS, intervalo * 2)
@@ -512,13 +513,14 @@ object MiniaturaMotor {
         s.dec?.let { return it }
         val altura = s.fmt.getInteger(MediaFormat.KEY_HEIGHT)
         val tentativas = mutableListOf<Pair<String?, Boolean>>()
-        if (s.travadas < 2 || altura > 1088) tentativas += null to false
         val mime = if (s.mime == "video/dolby-vision") "video/hevc" else s.mime
-        for (ci in MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos) {
-            if (ci.isEncoder) continue
-            if ((ci.name.startsWith("OMX.google.") || ci.name.startsWith("c2.android.")) && ci.supportedTypes.any { it.equals(mime, true) })
-                tentativas += ci.name to true
-        }
+        val softs = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.filter { ci ->
+            !ci.isEncoder && (ci.name.startsWith("OMX.google.") || ci.name.startsWith("c2.android.")) && ci.supportedTypes.any { it.equals(mime, true) }
+        }.map { it.name to true }
+        // Up to 1080p the CPU decodes a keyframe in ~50-100 ms (Shield): software FIRST, so thumbnails never take a
+        // hardware session next to the player (the Shield's H.264 one gave no frames there, 22/10). Above: hardware.
+        if (altura <= 1088) { tentativas += softs; tentativas += null to false }
+        else { if (s.travadas < 2) tentativas += null to false; tentativas += softs }
         for ((nome, soft) in tentativas) {
             var c: MediaCodec? = null
             try {

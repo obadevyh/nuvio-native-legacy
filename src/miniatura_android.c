@@ -452,7 +452,7 @@ static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int n
 #define TELA_ANCORAS 5
 #define TELA_MIN_CORR 0.55
 #define TELA_ESPACO_MS 4000L
-#define TELA_ACORDO_MS 1500.0
+#define TELA_ACORDO_MS 3000.0      // measured 22/10: real matches spread 1.7-1.9 s (screen timing + 1 s exact steps)
 #define TELA_PRAZO_MS 120000u
 #define TELA_DUR_IGUAL_MS 2500L
 
@@ -552,6 +552,17 @@ static int conferirTela(Job *j, long long hB, long durB, Mapa *mapa) {
   }
   if (!telas) return -1;
   if (nm < 4) { printf("[miniatura] screen check: rejected (%d of %d agree)\n", nm, provas); fflush(stdout); return 0; }
+  // the median offset; the one anchor farthest from it is dropped when 5+ agreed (a static scene can peak wrong)
+  double offs[TELA_ANCORAS];
+  for (int k = 0; k < nm; k++) offs[k] = m[k].pb - m[k].pa;
+  b = mediana(offs, nm);
+  if (nm >= 5) {
+    int pior = 0;
+    for (int k = 1; k < nm; k++) if (fabs(m[k].pb - m[k].pa - b) > fabs(m[pior].pb - m[pior].pa - b)) pior = k;
+    m[pior] = m[--nm];
+    for (int k = 0; k < nm; k++) offs[k] = m[k].pb - m[k].pa;
+    b = mediana(offs, nm);
+  }
   double lo = 1e18, hi = -1e18, s2 = 0, aMin = 1e18, aMax = -1e18;
   for (int k = 0; k < nm; k++) {
     double o = m[k].pb - m[k].pa;
@@ -971,7 +982,8 @@ static void *trabalhar(void *u) {
   }
   if (!usaB && (info[2] > 1088 || j->alturaA > 1080 || !hA)) {
     // Never thumbnails from the 4K itself (owner, 22/10: GBs of reads next to the player). The check's anchors stay.
-    printf("[miniatura] no copy passed the check: stopping (thumbnails are never made from the %lldp file)\n", info[2]);
+    printf("[miniatura] no copy passed the check: stopping (thumbnails are never made from the %dp file)\n",
+           info[2] > 0 ? (int)info[2] : j->alturaA);
     fflush(stdout);
     pthread_mutex_lock(&mu); if (job == j && !j->feitos) { estado = M_FALHOU; motivoSem = 1; } pthread_mutex_unlock(&mu);
     goto fim;
