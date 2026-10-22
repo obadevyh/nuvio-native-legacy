@@ -2930,6 +2930,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Vorschaubilder beim Spulen in der Zeitleiste. Einstellungen › Wiedergabe › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Vorschaubilder auf der Zeitleiste im Player."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "Vorschaubilder auf der Zeitleiste"),
   T("Miniaturas não solicitadas", "Thumbnails not requested"),
   T("Minucioso", "Gründlich"),

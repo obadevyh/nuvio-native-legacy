@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Miniaturer når du spoler i tidslinjen. Indstillinger › Afspilning › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Miniaturer på tidslinjen i afspilleren."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "Miniaturer på tidslinjen"),
   T("Miniaturas não solicitadas", "Thumbnails not requested"),
   T("Minucioso", "Grundig"),

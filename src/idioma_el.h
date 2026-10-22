@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Μικρογραφίες καθώς μετακινείσαι στη γραμμή χρόνου. Ρυθμίσεις › Αναπαραγωγή › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Μικρογραφίες στη γραμμή χρόνου του player."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "Μικρογραφίες στη γραμμή χρόνου"),
   T("Miniaturas não solicitadas", "Thumbnails not requested"),
   T("Minucioso", "Λεπτομερώς"),

@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "拖动时间条时显示缩略图。设置 › 播放 › Seekr。"),
   T("Miniaturas da barra de tempo no player.", "播放器时间条上的缩略图。"),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "时间条缩略图"),
   T("Miniaturas não solicitadas", "Thumbnails not requested"),
   T("Minucioso", "精细"),

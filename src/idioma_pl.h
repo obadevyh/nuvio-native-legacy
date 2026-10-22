@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Miniatury przy przewijaniu paska czasu. Ustawienia › Odtwarzanie › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Miniatury na pasku czasu w odtwarzaczu."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "Miniatury na pasku czasu"),
   T("Miniaturas não solicitadas", "Thumbnails not requested"),
   T("Minucioso", "Dokładnie"),

@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "صور مصغرة أثناء التمرير على شريط التقديم. الإعدادات › التشغيل › Seekr."),
   T("Miniaturas da barra de tempo no player.", "صور مصغرة لشريط التقديم في المشغل."),
   T("Miniaturas disponíveis", "الصور المصغرة متاحة"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "الصور المصغرة لشريط التقديم"),
   T("Miniaturas não solicitadas", "لم تُطلب الصور المصغرة"),
   T("Minucioso", "دقيق"),

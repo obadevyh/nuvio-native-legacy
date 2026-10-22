@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Sličice dok premotavaš traku vremena. Podešavanja › Reprodukcija › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Sličice na traci vremena u playeru."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "Sličice na traci vremena"),
   T("Miniaturas não solicitadas", "Thumbnails not requested"),
   T("Minucioso", "Temeljito"),

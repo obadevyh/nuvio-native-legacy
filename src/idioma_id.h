@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Gambar mini saat menggeser bilah waktu. Pengaturan › Pemutaran › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Thumbnail di bilah waktu pemutar."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "Thumbnail di bilah waktu"),
   T("Miniaturas não solicitadas", "Thumbnails not requested"),
   T("Minucioso", "Teliti"),

@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Zaman çubuğunda gezinirken küçük resimler. Ayarlar › Oynatma › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Oynatıcıdaki zaman çubuğunda küçük resimler."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "Zaman çubuğunda küçük resimler"),
   T("Miniaturas não solicitadas", "Thumbnails not requested"),
   T("Minucioso", "Ayrıntılı"),

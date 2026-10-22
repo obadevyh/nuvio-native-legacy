@@ -5,6 +5,8 @@
 const SeekrProvedor *miniatura_provedor(void) { return NULL; }
 #else
 #include "dados.h"
+#include "idioma.h"
+#include "ilha.h"
 #include "streams.h"
 #include "video.h"
 #include <dirent.h>
@@ -83,6 +85,7 @@ static char urlAtual[4096];
 static volatile long posMs, playheadMs;
 static volatile int scrubbing, bufferando;
 static char origem[48] = "";      // what the thumbnails came from (log + label)
+static volatile unsigned avisoPronto;   // generation whose set just completed (pPedir shows the notice)
 
 // ---- JNI (MiniaturaMotor.kt) ----
 static jclass cls;
@@ -105,7 +108,7 @@ static int jniPreparar(void) {
     jAbrir = (*env)->GetStaticMethodID(env, c, "abrir", "(Ljava/lang/String;Ljava/lang/String;)J");
     jInfo = (*env)->GetStaticMethodID(env, c, "info", "(J)[J");
     jQuadro = (*env)->GetStaticMethodID(env, c, "quadro", "(JJZZ)[B");
-    jExato = (*env)->GetStaticMethodID(env, c, "quadroExato", "(JJ)[B");
+    jExato = (*env)->GetStaticMethodID(env, c, "quadroExato", "(JJZ)[B");
     jSoltar = (*env)->GetStaticMethodID(env, c, "soltarDecoder", "(J)V");
     jFechar = (*env)->GetStaticMethodID(env, c, "fechar", "(J)V");
     jLidos = (*env)->GetStaticMethodID(env, c, "lidos", "(J)J");
@@ -154,11 +157,11 @@ static int mQuadro(long long h, long tMs, int closest, int querJpeg, long *pts, 
   return desempacotar(env, a, pts, sig, temSig, jpg, nJpg);
 }
 // The frame AT tMs (decoded forward from the keyframe), signature only: the fine pass of the check.
-static int mExato(long long h, long tMs, long *pts, float sig[SIG_N], int *temSig) {
+static int mExato(long long h, long tMs, long *pts, float sig[SIG_N], int *temSig, unsigned char **jpg, int *nJpg) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
-  jbyteArray a = (jbyteArray)(*env)->CallStaticObjectMethod(env, cls, jExato, (jlong)h, (jlong)tMs);
+  jbyteArray a = (jbyteArray)(*env)->CallStaticObjectMethod(env, cls, jExato, (jlong)h, (jlong)tMs, jpg ? JNI_TRUE : JNI_FALSE);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); a = NULL; }
-  return desempacotar(env, a, pts, sig, temSig, NULL, NULL);
+  return desempacotar(env, a, pts, sig, temSig, jpg, nJpg);
 }
 static int desempacotar(JNIEnv *env, jbyteArray a, long *pts, float sig[SIG_N], int *temSig, unsigned char **jpg, int *nJpg) {
   if (!a) return 0;
@@ -367,7 +370,7 @@ static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int n
       long t = (long)(a * ord[q].pa + b) + DES[d], p; int ok;
       if (t < 0) t = 0;
       esperarPlayer(j);
-      int lido = mExato(hB, t, &p, sb, &ok);
+      int lido = mExato(hB, t, &p, sb, &ok, NULL, NULL);
       if (falhou(j, lido, hB)) return 0;
       if (!lido || !ok) continue;
       double c = 0;
@@ -656,6 +659,14 @@ static int proximo(const Job *j) {
   return -1;
 }
 
+// A slot the keyframe pass left empty (the copy's keyframes too far apart), nearest to the playhead first.
+static int proximaLacuna(const Job *j) {
+  int ph = (int)(playheadMs / GRADE_MS), melhor = -1;
+  for (int k = 0; k < j->n; k++)
+    if (j->tentado[k] == 1 && !j->tiles[k].jpg && (melhor < 0 || abs(k - ph) < abs(melhor - ph))) melhor = k;
+  return melhor;
+}
+
 // One lane of thumbnail making (see trabalhar). Slots are claimed under the lock, so two lanes never make the same one.
 typedef struct { Job *j; long long h; int usaB; Mapa mapa; int id; int feitos; unsigned long somaMs; long long lido; } Faixa;
 static void *faixa(void *u) {
@@ -668,8 +679,9 @@ static void *faixa(void *u) {
     long disp = memDisponivelKB();
     if (disp >= 0 && disp < PISO_KB) { mSoltar(f->h); dormir(j, 1500); continue; }
     pthread_mutex_lock(&mu);
-    int k = proximo(j);
+    int k = proximo(j), exato = 0;
     if (k >= 0) j->tentado[k] = 1;
+    else if (f->usaB && (k = proximaLacuna(j)) >= 0) { j->tentado[k] = 2; exato = 1; }   // second pass: the exact frame
     pthread_mutex_unlock(&mu);
     if (k < 0) break;
     long alvo = k * GRADE_MS, p; int okS;
@@ -677,7 +689,7 @@ static void *faixa(void *u) {
     Uint32 s = SDL_GetTicks();
     long tB = f->usaB ? (long)(f->mapa.a * alvo + f->mapa.b) : alvo;
     if (tB < 0) tB = 0;
-    int ok = mQuadro(f->h, tB, 1, 1, &p, sig, &okS, &jpg, &nj);
+    int ok = exato ? mExato(f->h, tB, &p, sig, &okS, &jpg, &nj) : mQuadro(f->h, tB, 1, 1, &p, sig, &okS, &jpg, &nj);
     if (falhou(j, ok, f->h)) break;
     if (ok && f->usaB) p = (long)((p - f->mapa.b) / f->mapa.a);       // back on the playing file's timeline
     if (ok && jpg && labs(p - alvo) <= TOL_MS) {
@@ -761,9 +773,10 @@ static void *trabalhar(void *u) {
     if (duas) pthread_join(t2, NULL);
     mFechar(f2.h);
     pthread_mutex_lock(&mu);
-    int completo = proximo(j) < 0;
+    int completo = proximo(j) < 0 && (!usaB || proximaLacuna(j) < 0) && !parou(j);
     pthread_mutex_unlock(&mu);
-    salvar(j, completo && !parou(j));
+    salvar(j, completo);
+    if (completo) avisoPronto = j->g;
     printf("[miniatura] done: %d/%d tiles from %s in %.0f s (%d lane%s), read %.1f MB, pace now %lld/s\n", j->feitos, j->n,
            origem, (SDL_GetTicks() - t0) / 1000.0, duas ? 2 : 1, duas ? "s" : "", (f1.lido + f2.lido) / 1048576.0, mRitmo());
     fflush(stdout);
@@ -870,6 +883,10 @@ static void encerrar(void) {
 
 static void pPedir(const SeekrFonte *f) {
   posMs = f->posMs; playheadMs = f->playheadMs; scrubbing = f->scrubbing;
+  if (avisoPronto && avisoPronto == geracao) {          // the playing title's set is complete
+    avisoPronto = 0;
+    ilha_avisar("miniaturas-prontas", ILHA_OK, "aj_film", i18n("Miniaturas geradas"), 4000u, 0);
+  }
   bufferando = video_bufferando_ms() > 0;
   if (!f->url || strncmp(f->url, "http", 4) || f->durMs < 60000) return;
   if (!strcmp(urlAtual, f->url)) return;                       // the same title: the worker is on it

@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Bélyegképek az idősávon léptetve. Beállítások › Lejátszás › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Miniatűrök az idősávon a lejátszóban."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "Miniatűrök az idősávon"),
   T("Miniaturas não solicitadas", "Thumbnails not requested"),
   T("Minucioso", "Alapos"),

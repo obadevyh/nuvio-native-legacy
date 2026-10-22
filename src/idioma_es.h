@@ -2930,6 +2930,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Miniaturas al recorrer la barra de tiempo. Ajustes › Reproducción › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Miniaturas en la barra de tiempo del reproductor."),
   T("Miniaturas disponíveis", "Miniaturas disponibles"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "Miniaturas en la barra de tiempo"),
   T("Miniaturas não solicitadas", "Miniaturas no solicitadas"),
   T("Minucioso", "Minucioso"),

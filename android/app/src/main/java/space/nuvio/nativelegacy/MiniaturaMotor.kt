@@ -325,7 +325,7 @@ object MiniaturaMotor {
     // whose time is >= tMs. Signature only. For the fine pass of the timeline check, on the small copy only
     // (a 720p GOP is cheap to run through; a 4K one is not).
     @JvmStatic
-    fun quadroExato(h: Long, tMs: Long): ByteArray? {
+    fun quadroExato(h: Long, tMs: Long, jpeg: Boolean): ByteArray? {
         val s = sessoes[h] ?: return null
         s.fonte.erroRede = false
         try {
@@ -351,7 +351,7 @@ object MiniaturaMotor {
                 if (ob >= 0) {
                     var res: ByteArray? = null
                     val pts = info.presentationTimeUs / 1000
-                    if (info.size > 0 && pts >= tMs) dec.getOutputImage(ob)?.use { img -> res = montar(s, img, pts, false) }
+                    if (info.size > 0 && pts >= tMs) dec.getOutputImage(ob)?.use { img -> res = montar(s, img, pts, jpeg) }
                     dec.releaseOutputBuffer(ob, false)
                     if (res != null) return res
                     if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return null

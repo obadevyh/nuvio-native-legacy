@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Náhledy při posouvání časové osy. Nastavení › Přehrávání › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Náhledy na časové ose v přehrávači."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "Náhledy na časové ose"),
   T("Miniaturas não solicitadas", "Thumbnails not requested"),
   T("Minucioso", "Důkladně"),

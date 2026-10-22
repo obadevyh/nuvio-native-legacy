@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Миниатюри при превъртане на лентата за време. Настройки › Възпроизвеждане › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Миниатюри на лентата за време в плейъра."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas na barra de tempo", "Миниатюри на лентата за време"),
   T("Miniaturas não solicitadas", "Thumbnails not requested"),
   T("Minucioso", "Внимателно"),
