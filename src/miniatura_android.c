@@ -26,6 +26,7 @@ const SeekrProvedor *miniatura_provedor(void) { return NULL; }
 
 #define GRADE_MS 10000L
 #define TOL_MS 5000L
+#define TOL_COPIA_MS 8000L          // a copy keyframe this close stands in for its slot (labelled with its own time)
 #define PISO_KB (300L * 1024)        // MemAvailable kept free for the player and the app
 #define SIG_N (32 * 18)
 #define CAB 9                        // result header: 8 bytes pts + 1 flag
@@ -105,7 +106,7 @@ static int jniPreparar(void) {
   jclass c = (jclass)(*env)->CallObjectMethod(env, loader, lcm, nome);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); c = NULL; }
   if (c) {
-    jAbrir = (*env)->GetStaticMethodID(env, c, "abrir", "(Ljava/lang/String;Ljava/lang/String;)J");
+    jAbrir = (*env)->GetStaticMethodID(env, c, "abrir", "(Ljava/lang/String;Ljava/lang/String;Z)J");
     jInfo = (*env)->GetStaticMethodID(env, c, "info", "(J)[J");
     jQuadro = (*env)->GetStaticMethodID(env, c, "quadro", "(JJZZ)[B");
     jExato = (*env)->GetStaticMethodID(env, c, "quadroExato", "(JJZ)[B");
@@ -130,10 +131,11 @@ static int jniPreparar(void) {
   return cls != NULL;
 }
 
-static long long mAbrir(const char *url, const char *cab) {
+// `manter`: keep the socket between requests (the copy). The playing file closes it after every request.
+static long long mAbrir(const char *url, const char *cab, int manter) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jstring u = (*env)->NewStringUTF(env, url), c = (*env)->NewStringUTF(env, cab ? cab : "");
-  jlong h = (*env)->CallStaticLongMethod(env, cls, jAbrir, u, c);
+  jlong h = (*env)->CallStaticLongMethod(env, cls, jAbrir, u, c, manter ? JNI_TRUE : JNI_FALSE);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); h = 0; }
   (*env)->DeleteLocalRef(env, u); (*env)->DeleteLocalRef(env, c);
   return h;
@@ -233,9 +235,13 @@ static void dormir(const Job *j, int ms) { for (int t = 0; t < ms && !parou(j); 
 // The player first: nothing is read while it rebuffers, reconnects or has failed. Measured 22/10 (Dune 2, 4K
 // through a StremThru proxy): a burst of thumbnail reads on the playing link and the player's reconnects were
 // refused together (ConnectException) until it gave up.
+static int folgaBaixa(void) {
+  double bf = video_buffer_fim(), pos = video_pos();
+  return bf > 0.5 && bf - pos < 20.0;
+}
 static void esperarPlayer(const Job *j) {
   int avisou = 0;
-  while (!parou(j) && (bufferando || video_reconectando() || video_falhou())) {
+  while (!parou(j) && (bufferando || video_reconectando() || video_falhou() || folgaBaixa())) {
     if (!avisou) { printf("[miniatura] waiting: the player is buffering/reconnecting\n"); fflush(stdout); avisou = 1; }
     dormir(j, 1000);
   }
@@ -246,7 +252,12 @@ static __thread int falhasSeguidas, decodSeguidas;   // per lane
 static int mFalhaRede(long long h);
 static int falhou(const Job *j, int ok, long long h) {
   if (ok) { falhasSeguidas = 0; decodSeguidas = 0; return 0; }
-  if (!mFalhaRede(h)) {
+  int rede = mFalhaRede(h);
+  if (rede == 2) {                      // refused or silent: the debrid is at its connection limit; the player comes first
+    printf("[miniatura] stopping: the source refused/stalled a connection (protecting playback)\n"); fflush(stdout);
+    return 1;
+  }
+  if (!rede) {
     if (++decodSeguidas >= 8) { printf("[miniatura] stopping: %d frames in a row would not decode\n", decodSeguidas); fflush(stdout); return 1; }
     return 0;
   }
@@ -675,7 +686,7 @@ static void *faixa(void *u) {
   long long lido0 = mLidos(f->h);
   falhasSeguidas = 0; decodSeguidas = 0;
   while (!parou(j)) {
-    if (bufferando || video_reconectando() || video_falhou()) { mSoltar(f->h); esperarPlayer(j); continue; }
+    if (bufferando || video_reconectando() || video_falhou() || folgaBaixa()) { mSoltar(f->h); esperarPlayer(j); continue; }
     long disp = memDisponivelKB();
     if (disp >= 0 && disp < PISO_KB) { mSoltar(f->h); dormir(j, 1500); continue; }
     pthread_mutex_lock(&mu);
@@ -692,10 +703,11 @@ static void *faixa(void *u) {
     int ok = exato ? mExato(f->h, tB, &p, sig, &okS, &jpg, &nj) : mQuadro(f->h, tB, 1, 1, &p, sig, &okS, &jpg, &nj);
     if (falhou(j, ok, f->h)) break;
     if (ok && f->usaB) p = (long)((p - f->mapa.b) / f->mapa.a);       // back on the playing file's timeline
-    if (ok && jpg && labs(p - alvo) <= TOL_MS) {
+    long tol = f->usaB && !exato ? TOL_COPIA_MS : TOL_MS;
+    if (ok && jpg && labs(p - alvo) <= tol) {
       int dest = (int)((p + GRADE_MS / 2) / GRADE_MS);
       pthread_mutex_lock(&mu);
-      if (dest < 0 || dest >= j->n) dest = k;
+      if (dest < 0 || dest >= j->n || (j->tiles[dest].jpg && dest != k)) dest = k;
       if (!j->tiles[dest].jpg) { j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; jpg = NULL; j->feitos++; }
       j->tentado[dest] = 1;
       if (job == j) estado = M_PRONTO;
@@ -726,7 +738,7 @@ static void *trabalhar(void *u) {
   if (j->arq[0]) limparCache(j->arq);           // other titles' sets older than 2 h go now
   if (carregar(j)) goto fim;                    // a complete saved set: no network at all
   esperarPlayer(j);
-  hA = mAbrir(j->urlA, j->cabA);
+  hA = mAbrir(j->urlA, j->cabA, 0);
   if (!hA) {
     printf("[miniatura] could not open the playing source\n"); fflush(stdout);
     pthread_mutex_lock(&mu); if (job == j) estado = M_FALHOU; pthread_mutex_unlock(&mu);
@@ -738,7 +750,7 @@ static void *trabalhar(void *u) {
          j->dur / 60000.0, j->nCopias, j->nCopias == 1 ? "y" : "ies");
   fflush(stdout);
   for (int c = 0; c < j->nCopias && !usaB && !parou(j); c++) {
-    hB = mAbrir(j->copias[c].url, j->copias[c].cab);
+    hB = mAbrir(j->copias[c].url, j->copias[c].cab, 1);
     if (!hB) { printf("[miniatura] copy %d (%dp) would not open\n", c + 1, j->copias[c].altura); continue; }
     long long ib[5];
     mInfo(hB, ib);
@@ -765,7 +777,7 @@ static void *trabalhar(void *u) {
     pthread_t t2;
     int duas = 0;
     if (usaB && !parou(j)) {
-      f2.h = mAbrir(j->copias[copiaUsada].url, j->copias[copiaUsada].cab);
+      f2.h = mAbrir(j->copias[copiaUsada].url, j->copias[copiaUsada].cab, 1);
       if (f2.h) duas = pthread_create(&t2, NULL, faixa, &f2) == 0;
       if (!duas) { mFechar(f2.h); f2.h = 0; }
     }

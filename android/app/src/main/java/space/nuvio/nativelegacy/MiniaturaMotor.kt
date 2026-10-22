@@ -35,29 +35,52 @@ object MiniaturaMotor {
     const val SW = 32
     const val SH = 18
 
-    private class Fonte(url: String, cabecalhos: String) : MediaDataSource() {
+    // `manter` = keep the socket alive between requests (the copy, read all the time). The PLAYING file is read
+    // only for the check: each of its requests closes its socket, so no idle connection to the player's own link
+    // stays open next to the player's (debrid CDNs limit connections per user; measured 22/10 on TorBox: past the
+    // limit, the player's reconnects are refused and playback stops).
+    private class Fonte(url: String, cabecalhos: String, val manter: Boolean) : MediaDataSource() {
         var alvo = url
+        @Volatile var recusado = false    // a connection was refused or timed out: stop reading this title at all
         val cab = cabecalhos.split('\n').mapNotNull { l ->
             val i = l.indexOf(':'); if (i <= 0) null else l.substring(0, i).trim() to l.substring(i + 1).trim()
         }
         var tamanho = -1L
         var lidos = 0L
-        // Big files (4K remuxes): 1 MB blocks, so one keyframe is one or two requests instead of six.
-        private var blk = BLK
-        private val cache = object : LinkedHashMap<Long, ByteArray>(32, 0.75f, true) {
-            override fun removeEldestEntry(e: MutableMap.MutableEntry<Long, ByteArray>?) = size > NBLK * BLK / blk
-        }
+        // Reads start where the extractor asks (the keyframe), not at a block boundary: a 720p keyframe (~100-150 KB)
+        // is ONE request of 384 KB instead of two aligned 256 KB blocks half the time (measured 1.46 requests per
+        // thumbnail with blocks). Big files (4K remuxes, keyframes of 1.5-3 MB): 2 MB windows.
+        private var janela = 384 * 1024
+        private var limite = 6L shl 20
+        private val segs = ArrayList<Pair<Long, ByteArray>>()   // most recently used last
+        private var guardados = 0L
 
         init {
             pedir(0, 0)
-            if (tamanho > (8L shl 30)) blk = 4 * BLK
+            if (tamanho > (8L shl 30)) { janela = 2 shl 20; limite = 12L shl 20 }
         }
 
-        // ONE request at a time for the whole engine, at most ~3 per second, on a kept-alive connection
+        private fun segmento(p: Long): Pair<Long, ByteArray> {
+            for (i in segs.indices.reversed()) {
+                val s = segs[i]
+                if (p >= s.first && p < s.first + s.second.size) { if (i != segs.size - 1) { segs.removeAt(i); segs.add(s) }; return s }
+            }
+            val d = pedir(p, minOf(tamanho - 1, p + janela - 1))
+            val s = p to d
+            segs.add(s); guardados += d.size
+            while (guardados > limite && segs.size > 1) guardados -= segs.removeAt(0).second.size
+            return s
+        }
+
+        // ONE request at a time for the whole engine, at most ~4 per second, on one kept-alive connection
         // (the stream is read to the end and closed, never disconnect()ed on success, so HttpURLConnection
-        // reuses the socket). Add-on proxies (StremThru, AIOStreams) and debrid CDNs limit connections per
-        // user; the player's own connections to the SAME link must never be the ones refused.
-        private fun pedir(a: Long, b: Long): ByteArray {
+        // reuses the socket). A refused or silent connection is never retried: the title stops (see recusado).
+        // Every session (both lanes, the check's readers) waits for this: ONE request in flight for the whole engine,
+        // so the lanes share one pooled socket per host and one lane decodes while the other's request is on the wire.
+        private fun pedir(a: Long, b: Long): ByteArray = synchronized(VOO) { pedirUm(a, b) }
+
+        private fun pedirUm(a: Long, b: Long): ByteArray {
+            if (recusado) throw IOException("refused earlier")
             pausar()
             var ultimo: IOException? = null
             for (tentativa in 0 until 2) {
@@ -66,10 +89,11 @@ object MiniaturaMotor {
                 val ini = android.os.SystemClock.elapsedRealtime()
                 try {
                     c.instanceFollowRedirects = true
-                    c.connectTimeout = 15000
-                    c.readTimeout = 30000
+                    c.connectTimeout = 6000
+                    c.readTimeout = 6000
                     for ((k, v) in cab) c.setRequestProperty(k, v)
                     c.setRequestProperty("Range", "bytes=$a-$b")
+                    if (!manter) c.setRequestProperty("Connection", "close")
                     val code = c.responseCode
                     if (code != 206) throw IOException("http $code")
                     alvo = c.url.toString()   // after debrid/add-on redirects: later reads go straight to the CDN
@@ -82,17 +106,21 @@ object MiniaturaMotor {
                     lidos += got
                     requisicoes++
                     resultado(android.os.SystemClock.elapsedRealtime() - ini, true)
+                    if (!manter) c.disconnect()
                     return d
                 } catch (e: IOException) {
                     ultimo = e
                     resultado(0, false)
                     c.disconnect()
+                    if (e is java.net.ConnectException || e is java.net.SocketTimeoutException) {
+                        recusado = true
+                        Log.w(TAG, "connection ${if (e is java.net.ConnectException) "refused" else "timed out"}: stopping this title")
+                        break
+                    }
                 }
             }
             throw ultimo ?: IOException("read failed")
         }
-
-        private fun bloco(b: Long): ByteArray = cache[b] ?: pedir(b * blk, minOf(tamanho - 1, b * blk + blk - 1)).also { cache[b] = it }
 
         override fun readAt(pos: Long, buf: ByteArray, off: Int, len: Int): Int {
             if (pos >= tamanho) return -1
@@ -100,8 +128,8 @@ object MiniaturaMotor {
                 var feito = 0
                 while (feito < len && pos + feito < tamanho) {
                     val p = pos + feito
-                    val d = bloco(p / blk)
-                    val ini = (p % blk).toInt()
+                    val (ini0, d) = segmento(p)
+                    val ini = (p - ini0).toInt()
                     val k = minOf(len - feito, d.size - ini)
                     if (k <= 0) break
                     System.arraycopy(d, ini, buf, off + feito, k)
@@ -132,12 +160,15 @@ object MiniaturaMotor {
 
     private val sessoes = ConcurrentHashMap<Long, Sessao>()
     private var proximo = 1L
-    // Request pacing for ALL sessions together, adaptive. Starts at ~6/s (170 ms apart; measured 22/10: one request
-    // to a StremThru proxy takes ~0.29 s, so two lanes keep ~6 in flight per second on 2 kept-alive sockets). Any
+    private val VOO = Any()
+
+    // Request pacing for ALL sessions together, adaptive. At most ~4/s (250 ms apart; one request takes ~0.29 s, so
+    // in practice the single in-flight request is the limit, ~3.4/s). Two parallel connections next to the player
+    // got its reconnects refused by TorBox (22/10), so there is never more than one. Any
     // failure or a slow answer (> 1.5 s) doubles the gap at once (up to 1.4 s, ~0.7/s); 20 quick answers in a row
     // take 20 ms off again. The first Shield run showed what crowding the link does: the player's own reconnects
     // were refused.
-    private const val INTERVALO_MIN_MS = 170L
+    private const val INTERVALO_MIN_MS = 250L
     private const val INTERVALO_MAX_MS = 1400L
     private const val LENTO_MS = 1500L
     private var intervalo = INTERVALO_MIN_MS
@@ -184,8 +215,8 @@ object MiniaturaMotor {
     }
 
     @JvmStatic
-    fun abrir(url: String, cabecalhos: String): Long = try {
-        val f = Fonte(url, cabecalhos)
+    fun abrir(url: String, cabecalhos: String, manter: Boolean): Long = try {
+        val f = Fonte(url, cabecalhos, manter)
         val ex = MediaExtractor()
         ex.setDataSource(f)
         var s: Sessao? = null
@@ -271,7 +302,10 @@ object MiniaturaMotor {
     // 1 when the last quadro/quadroExato of this session failed because a READ failed (back off), 0 otherwise
     // (a frame that would not decode: skip it).
     @JvmStatic
-    fun falhaRede(h: Long): Int = if (sessoes[h]?.fonte?.erroRede == true) 1 else 0
+    fun falhaRede(h: Long): Int {
+        val f = sessoes[h]?.fonte ?: return 0
+        return if (f.recusado) 2 else if (f.erroRede) 1 else 0   // 2 = refused/silent: stop the title
+    }
 
     private fun motivo(s: Sessao, tMs: Long, m: String): ByteArray? {
         Log.w(TAG, "no frame at ${tMs / 1000}s: $m${if (s.fonte.erroRede) " (read failed)" else ""}")
