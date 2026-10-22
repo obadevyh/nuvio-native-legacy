@@ -105,7 +105,7 @@ object MiniaturaMotor {
                     if (got != n) throw IOException("short read")
                     lidos += got
                     requisicoes++
-                    resultado(android.os.SystemClock.elapsedRealtime() - ini, true)
+                    resultado(android.os.SystemClock.elapsedRealtime() - ini, true, got)
                     if (!manter) c.disconnect()
                     return d
                 } catch (e: IOException) {
@@ -182,14 +182,17 @@ object MiniaturaMotor {
         ultimaReq = android.os.SystemClock.elapsedRealtime()
     }
 
-    private fun resultado(ms: Long, ok: Boolean) = synchronized(this) {
-        if (!ok || ms > LENTO_MS) {
+    // "Slow" is judged against the size: 1.5 s plus ~0.7 s per MB (a 2 MB 4K window at 2.7 s is a normal download,
+    // not a struggling link; measured 22/10, it cut the pace to 1/s for the rest of a 3 h film). Recovery is
+    // multiplicative: 10 good answers take 25 % off the gap, so ~50 requests from the floor back to full pace.
+    private fun resultado(ms: Long, ok: Boolean, bytes: Int = 0) = synchronized(this) {
+        if (!ok || ms > LENTO_MS + bytes / 1500) {
             val antes = intervalo
             intervalo = minOf(INTERVALO_MAX_MS, intervalo * 2)
             rapidas = 0
-            if (intervalo != antes) Log.i(TAG, "slowing down: ${if (ok) "slow answer ${ms} ms" else "failed request"}, now ${1000 / intervalo}/s")
-        } else if (++rapidas >= 20 && intervalo > INTERVALO_MIN_MS) {
-            intervalo = maxOf(INTERVALO_MIN_MS, intervalo - 20)
+            if (intervalo != antes) Log.i(TAG, "slowing down: ${if (ok) "slow answer ${ms} ms for ${bytes / 1024} KB" else "failed request"}, now ${1000 / intervalo}/s")
+        } else if (++rapidas >= 10 && intervalo > INTERVALO_MIN_MS) {
+            intervalo = maxOf(INTERVALO_MIN_MS, intervalo * 3 / 4)
             rapidas = 0
         }
     }
