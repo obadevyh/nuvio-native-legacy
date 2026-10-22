@@ -26,7 +26,7 @@ int miniatura_prontas_agora(void) { return 0; }
 
 #define GRADE_MS 10000L
 #define TOL_MS 5000L
-#define LOTE 8                       // keyframes per multi-range request
+#define LOTE 32                      // most keyframes per multi-range request (the engine sizes each batch to ~4 MB)
 // Copy choice and the optimistic start, named so a test can tune them (22/10, converged with the review):
 #define RAZAO_1080 0.80              // a 1080p copy only when <= 80 % of the best 720p's size
 #define RAZAO_MESMA_RES 0.50         // a copy at the playing file's resolution only when <= half its size
@@ -94,7 +94,7 @@ typedef struct {
   char titulo[48], motivos[320], escolhida[200];
   double offset;
   int refeito;
-  long long cont0[3];
+  long long cont0[10];
   volatile int parar;
   int vivo;
 } Job;
@@ -115,7 +115,7 @@ static int motivoSem;            // M_FALHOU because: 0 the video would not open
 
 // ---- JNI (MiniaturaMotor.kt) ----
 static jclass cls;
-static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo;
+static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo, jLote;
 
 static int jniPreparar(void) {
   if (cls) return 1;
@@ -144,7 +144,8 @@ static int jniPreparar(void) {
     jPreparar = (*env)->GetStaticMethodID(env, c, "preparar", "(J[J)I");
     jCont = (*env)->GetStaticMethodID(env, c, "contadores", "()[J");
     jAlvo = (*env)->GetStaticMethodID(env, c, "alvo", "(J)Ljava/lang/String;");
-    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jCont || !jAlvo) {
+    jLote = (*env)->GetStaticMethodID(env, c, "lote", "(J)I");
+    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jCont || !jAlvo || !jLote) {
       (*env)->ExceptionClear(env);
     } else {
       cls = (jclass)(*env)->NewGlobalRef(env, c);
@@ -248,21 +249,28 @@ static int mPreparar(long long h, const long *tempos, int n) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jlongArray a = (*env)->NewLongArray(env, n);
   if (!a) return -1;
-  jlong v[16];
-  for (int i = 0; i < n && i < 16; i++) v[i] = tempos[i];
+  jlong v[LOTE];
+  for (int i = 0; i < n && i < LOTE; i++) v[i] = tempos[i];
   (*env)->SetLongArrayRegion(env, a, 0, n, v);
   jint r = (*env)->CallStaticIntMethod(env, cls, jPreparar, (jlong)h, a);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = -1; }
   (*env)->DeleteLocalRef(env, a);
   return r;
 }
-// [requests sent, decoders created, bytes read] since the app started.
-static void mContadores(long long out[3]) {
+// MiniaturaMotor.contadores() since the app started; the summary takes deltas.
+#define NCONT 10
+static int mLote(long long h) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
-  memset(out, 0, 3 * sizeof *out);
+  jint r = (*env)->CallStaticIntMethod(env, cls, jLote, (jlong)h);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 8; }
+  return r < 4 ? 4 : r > LOTE ? LOTE : r;
+}
+static void mContadores(long long out[NCONT]) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  memset(out, 0, NCONT * sizeof *out);
   jlongArray a = (jlongArray)(*env)->CallStaticObjectMethod(env, cls, jCont);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return; }
-  if (a) { (*env)->GetLongArrayRegion(env, a, 0, 3, (jlong *)out); (*env)->DeleteLocalRef(env, a); }
+  if (a) { (*env)->GetLongArrayRegion(env, a, 0, NCONT, (jlong *)out); (*env)->DeleteLocalRef(env, a); }
 }
 // The copy's link after the add-on's redirect, so further sessions do not make the add-on mint another debrid link.
 static void mAlvo(long long h, const char *reserva, char *out, size_t n) {
@@ -535,7 +543,7 @@ static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int n
 #define TELA_ESPACO_MS 4000L
 #define TELA_ACORDO_MS 3000.0      // measured 22/10: real matches spread 1.7-1.9 s (screen timing + 1 s exact steps)
 #define TELA_PRAZO_MS 120000u
-#define TELA_DUR_IGUAL_MS 2500L
+#define TELA_DUR_IGUAL_MS 4000L     // was 2.5 s: the screen check measures the real offset anyway (<= 3 s kept)
 
 static int mTela(long *pts, float sig[SIG_N], int *temSig) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
@@ -965,6 +973,7 @@ static void *faixa(void *u) {
     else {
       pthread_mutex_lock(&mu);
       nfila = ifila = 0;
+      if (lote > 0) lote = mLote(f->h);   // sized to ~4 MB of this copy's keyframe windows
       for (int quer = lote > 0 ? lote : 1; nfila < quer; ) {
         int q = proximo(j);
         if (q < 0) break;
@@ -1187,12 +1196,17 @@ fim:
   mFechar(hB);
   mFechar(hA);
   {
-    long long cont[3];
+    long long cont[NCONT];
     mContadores(cont);
+    long long nl = cont[5] - j->cont0[5], nk = cont[9] - j->cont0[9];
     printf("[miniatura] SUMMARY %s | play %dp %.1f min | candidates: %s | chosen: %s | offset %+.2fs, redo %s | "
-           "decoders %lld, requests %lld, %.1f MB | tiles %d/%d in %.0f s | playback: %d rebuffers, %d player errors\n",
+           "decoders %lld, requests %lld, %.1f MB | time: network %.1f s, frames %.1f s | batches %lld (avg %.1f keyframes, %.2f MB), "
+           "keyframe avg %.0f KB | tiles %d/%d in %.0f s | playback: %d rebuffers, %d player errors\n",
            j->titulo, j->alturaA, j->dur / 60000.0, j->motivos, j->escolhida[0] ? j->escolhida : "none", j->offset / 1000,
            j->refeito ? "yes" : "no", cont[1] - j->cont0[1], cont[0] - j->cont0[0], (cont[2] - j->cont0[2]) / 1048576.0,
+           (cont[3] - j->cont0[3]) / 1000.0, (cont[4] - j->cont0[4]) / 1000.0, nl,
+           nl ? (double)(cont[7] - j->cont0[7]) / nl : 0.0, nl ? (cont[6] - j->cont0[6]) / 1048576.0 / nl : 0.0,
+           nk ? (cont[8] - j->cont0[8]) / 1024.0 / nk : 0.0,
            j->feitos, j->n, (SDL_GetTicks() - t0) / 1000.0, evRebuffer, evErro);
     fflush(stdout);
   }
@@ -1324,7 +1338,8 @@ static void pPedir(const SeekrFonte *f) {
   const Stream *st = stream_item(stream_atual());
   j->alturaA = st ? st->altura : 0;
   j->nCopias = st ? escolherCopias(st, j->copias, f->durMs, j->motivos, sizeof j->motivos) : 0;
-  snprintf(j->titulo, sizeof j->titulo, "%s %d:%d", f->imdb ? f->imdb : "", f->t, f->e);
+  if (f->imdb && strchr(f->imdb, ':')) snprintf(j->titulo, sizeof j->titulo, "%s", f->imdb);
+  else snprintf(j->titulo, sizeof j->titulo, "%s%s%d:%d", f->imdb ? f->imdb : "", f->t ? " " : "", f->t, f->e);
   pthread_mutex_lock(&mu);
   j->g = ++geracao;
   j->vivo = 1;

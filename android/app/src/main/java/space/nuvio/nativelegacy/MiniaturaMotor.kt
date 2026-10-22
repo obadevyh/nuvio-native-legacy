@@ -63,12 +63,18 @@ object MiniaturaMotor {
         // The copy's window follows its keyframes: ~1.6x the largest of the recent ones (+32 KB for the container's
         // block headers), 128-384 KB. Measured 22/10: a fixed 384 KB read ~0.43 MB per 720p thumbnail, about 3x the
         // keyframe. A keyframe bigger than the window simply costs a second request, never a wrong frame.
-        private var maiorRecente = 0
+        // Sized from the TYPICAL keyframe (running mean x 1.3 + 32 KB, 96-384 KB), not 1.6x the largest: measured
+        // 22/10, an H.264 copy read ~0.5 MB per thumbnail for ~0.2 MB keyframes. A bigger keyframe costs one more
+        // small request, never a wrong frame.
+        private var media = 0
         fun ajustarJanela(amostra: Int) {
+            somaKf += amostra; nKf++
             if (!manter || tamanho > (8L shl 30)) return
-            maiorRecente = maxOf(amostra, maiorRecente * 7 / 8)
-            janela = (maiorRecente * 8 / 5 + 32 * 1024).coerceIn(128 * 1024, 384 * 1024)
+            media = if (media == 0) amostra else (media * 7 + amostra) / 8
+            janela = (media * 13 / 10 + 32 * 1024).coerceIn(96 * 1024, 384 * 1024)
         }
+        // keyframes per multi-range request: as many as ~4 MB of windows (4-32)
+        fun loteIdeal(): Int = ((4 shl 20) / janela).coerceIn(4, 32)
 
         private fun guardar(a: Long, d: ByteArray) {
             segs.add(a to d); guardados += d.size
@@ -273,6 +279,8 @@ object MiniaturaMotor {
                 lidos += corpo.size
                 lidosTotal += corpo.size
                 requisicoes++
+                msRede += android.os.SystemClock.elapsedRealtime() - ini
+                nLotes++; bytesLotes += corpo.size; kfLotes += faixas.size
                 resultado(android.os.SystemClock.elapsedRealtime() - ini, true, corpo.size)
                 val partes = ArrayList<Pair<Long, ByteArray>>()
                 val marca = ("--$fronteira").toByteArray()
@@ -356,6 +364,7 @@ object MiniaturaMotor {
                     lidos += got
                     lidosTotal += got
                     requisicoes++
+                    msRede += android.os.SystemClock.elapsedRealtime() - ini
                     resultado(android.os.SystemClock.elapsedRealtime() - ini, true, got)
                     if (!manter) c.disconnect()
                     return d
@@ -462,8 +471,19 @@ object MiniaturaMotor {
 
     // For the per-title summary: [requests sent, decoders created] since the app started (the C side takes deltas).
     @JvmStatic
-    fun contadores(): LongArray = longArrayOf(requisicoes, criados, lidosTotal)
+    // [requests, decoders created, bytes, network ms, frame ms, batches, batch bytes, batch keyframes, keyframe bytes, keyframes]
+    fun contadores(): LongArray = longArrayOf(requisicoes, criados, lidosTotal, msRede, msQuadros, nLotes, bytesLotes, kfLotes, somaKf, nKf)
     @Volatile private var lidosTotal = 0L
+    @Volatile private var msRede = 0L
+    @Volatile private var msQuadros = 0L
+    @Volatile private var nLotes = 0L
+    @Volatile private var bytesLotes = 0L
+    @Volatile private var kfLotes = 0L
+    @Volatile private var somaKf = 0L
+    @Volatile private var nKf = 0L
+
+    @JvmStatic
+    fun lote(h: Long): Int = sessoes[h]?.fonte?.loteIdeal() ?: 8
 
     // The link AFTER the add-on/debrid redirect (the CDN address): later sessions on the same copy open it directly,
     // so the add-on mints one debrid link per copy, not one per session.
@@ -603,6 +623,11 @@ object MiniaturaMotor {
 
     @JvmStatic
     fun quadro(h: Long, tMs: Long, closest: Boolean, jpeg: Boolean): ByteArray? {
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        try { return quadroUm(h, tMs, closest, jpeg) } finally { msQuadros += android.os.SystemClock.elapsedRealtime() - t0 }
+    }
+
+    private fun quadroUm(h: Long, tMs: Long, closest: Boolean, jpeg: Boolean): ByteArray? {
         val s = sessoes[h] ?: return null
         s.fonte.erroRede = false
         try {
