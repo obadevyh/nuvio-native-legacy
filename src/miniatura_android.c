@@ -29,7 +29,7 @@ int miniatura_prontas_agora(void) { return 0; }
 #define LOTE 32                      // most keyframes per multi-range request (the engine sizes each batch to ~4 MB)
 // Copy choice and the optimistic start, named so a test can tune them (22/10, converged with the review):
 #define RAZAO_1080 0.80              // a 1080p copy only when <= 80 % of the best 720p's size
-#define RAZAO_MESMA_RES 0.50         // a copy at the playing file's resolution only when <= half its size
+#define RAZAO_MESMA_RES 0.70         // a copy at the playing file's resolution only when <= 70 % of its size
 #define PISO_MBPS_1080 4.0           // bitrate floors: a tiny bad encode must not win on size alone
 #define PISO_MBPS_720 2.0
 #define PISO_MBPS_SD 1.0
@@ -55,7 +55,7 @@ int miniatura_prontas_agora(void) { return 0; }
 #define MIN_DESVIO 4.0
 #define MIN_POR_QUARTO 2
 #define TOMADA_MS 8000               // candidates this far from the best are another shot
-#define TENTATIVAS 4                 // smaller copies tried per title (a wrong runtime costs only the header)
+#define TENTATIVAS 8                 // smaller copies tried per title (a wrong runtime/codec costs only the header, ~1 s)
 
 enum { M_PARADO = 0, M_BUSCANDO, M_PRONTO, M_FALHOU };
 
@@ -94,6 +94,8 @@ typedef struct {
   char titulo[48], motivos[320], escolhida[200];
   double offset;
   int refeito;
+  int nRecheck, falhasRecheck, resumido;   // re-check while watching; summary printed once
+  long caiuEm;                             // play time where the copy stopped matching (0 = never)
   long long cont0[10];
   volatile int parar;
   int vivo;
@@ -544,7 +546,9 @@ static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int n
 #define TELA_ESPACO_MS 4000L
 #define TELA_ACORDO_MS 3000.0      // measured 22/10: real matches spread 1.7-1.9 s (screen timing + 1 s exact steps)
 #define TELA_PRAZO_MS 120000u
-#define TELA_DUR_IGUAL_MS 4000L     // was 2.5 s: the screen check measures the real offset anyway (<= 3 s kept)
+#define TELA_DUR_IGUAL_MS 30000L    // copies up to 30 s longer/shorter go to the screen check, which measures the offset
+                                    // (22/10: a Bond film's only same-codec copy was 12 s off: logo/intro variants)
+#define OTIMISTA_DUR_MS 4000L       // the optimistic start only for (nearly) the same length
 
 static int mTela(long *pts, float sig[SIG_N], int *temSig) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
@@ -610,11 +614,14 @@ static int conferirTela(Job *j, long long hB, long durB, Mapa *mapa) {
     double t, r = -2;
     int achou;
     if (nm == 0) {
-      // first anchor: the copy's KEYFRAMES +-12 s around the same time find the region, then the exact frames
+      // first anchor: the copy's KEYFRAMES +-8 s around the same time AND around the length difference (an intro
+      // or logo of another length shifts the whole film by it) find the region, then the exact frames
       double melhor = -2, pMelhor = pA;
-      long ultimoKf = -1;
-      for (long d = -12000; d <= 12000 && !parou(j); d += 2000) {
-        long alvo = pA + d, p; int okB;
+      long ultimoKf = -1, dif = durB - j->dur;
+      int centros = labs(dif) > 4000 ? 2 : 1;
+      for (int ci = 0; ci < centros; ci++)
+      for (long d = -8000; d <= 8000 && !parou(j); d += 2000) {
+        long alvo = pA + (ci ? dif : 0) + d, p; int okB;
         if (alvo < 0 || alvo >= durB) continue;
         esperarPlayer(j);
         int lido = mQuadro(hB, alvo, 1, 0, &p, sb, &okB, NULL, NULL);
@@ -676,6 +683,29 @@ static int conferirTela(Job *j, long long hB, long durB, Mapa *mapa) {
          b / 1000, nm, (aMax - aMin) / 1000, erro / 1000, (SDL_GetTicks() - ini) / 1000.0);
   fflush(stdout);
   return 1;
+}
+
+// One re-check: the frame on screen against the copy's exact frames at the mapped time (-1, 0, +1 s). 1 = matches,
+// 0 = does not (best r < RECHECK_MIN), -1 = no usable screen frame or copy frame (paused, flat scene, read failure).
+#define RECHECK_MS 180000u
+#define RECHECK_MIN 0.45
+static int reconferir(Job *j, long long h, Mapa m, long *pA) {
+  float sa[SIG_N], sb[SIG_N];
+  int ok, vistos = 0;
+  long p;
+  if (!h || !mTela(pA, sa, &ok) || !ok || *pA < 5000) return -1;
+  double melhor = -2;
+  for (long d = -1000; d <= 1000 && !parou(j); d += 1000) {
+    long alvo = (long)(m.a * *pA + m.b) + d;
+    int okB;
+    if (alvo < 0 || !mExato(h, alvo, &p, sb, &okB, NULL, NULL) || !okB) continue;
+    vistos++;
+    double c = 0;
+    for (int k = 0; k < SIG_N; k++) c += sa[k] * sb[k];
+    if (c > melhor) melhor = c;
+  }
+  if (!vistos) return -1;
+  return melhor >= RECHECK_MIN ? 1 : 0;
 }
 
 static int conferir(Job *j, long long hA, long long hB, long durA, long durB, Ancora *anc, Mapa *mapa, int hdr) {
@@ -959,7 +989,7 @@ static int proximaLacuna(const Job *j) {
 }
 
 // One lane of thumbnail making (see trabalhar). Slots are claimed under the lock, so two lanes never make the same one.
-typedef struct { Job *j; long long h; int usaB; int id; int feitos; unsigned long somaMs; long long lido; } Faixa;
+typedef struct { Job *j; long long h; int usaB; int id; int feitos; unsigned long somaMs; long long lido; volatile int acabou; } Faixa;
 static Mapa mapaAtual(Job *j) { pthread_mutex_lock(&mu); Mapa m = j->mapa; pthread_mutex_unlock(&mu); return m; }
 static void *faixa(void *u) {
   Faixa *f = u;
@@ -1034,7 +1064,40 @@ static void *faixa(void *u) {
     if (!f->usaB) usleep(20000);
   }
   f->lido = mLidos(f->h) - lido0;
+  f->acabou = 1;
   return NULL;
+}
+
+static void resumo(Job *j, Uint32 t0) {
+  if (j->resumido) return;
+  j->resumido = 1;
+  long long cont[NCONT];
+  mContadores(cont);
+  long long nl = cont[5] - j->cont0[5], nk = cont[9] - j->cont0[9];
+  printf("[miniatura] SUMMARY %s | play %dp %.1f min | candidates: %s | chosen: %s | offset %+.2fs, redo %s | "
+         "decoders %lld, requests %lld, %.1f MB | time: network %.1f s, frames %.1f s | batches %lld (avg %.1f keyframes, %.2f MB), "
+         "keyframe avg %.0f KB | tiles %d/%d in %.0f s | playback: %d rebuffers, %d player errors | re-checks %d (misses %d)%s\n",
+         j->titulo, j->alturaA, j->dur / 60000.0, j->motivos, j->escolhida[0] ? j->escolhida : "none", j->offset / 1000,
+         j->refeito ? "yes" : "no", cont[1] - j->cont0[1], cont[0] - j->cont0[0], (cont[2] - j->cont0[2]) / 1048576.0,
+         (cont[3] - j->cont0[3]) / 1000.0, (cont[4] - j->cont0[4]) / 1000.0, nl,
+         nl ? (double)(cont[7] - j->cont0[7]) / nl : 0.0, nl ? (cont[6] - j->cont0[6]) / 1048576.0 / nl : 0.0,
+         nk ? (cont[8] - j->cont0[8]) / 1024.0 / nk : 0.0,
+         j->feitos, j->n, (SDL_GetTicks() - t0) / 1000.0, evRebuffer, evErro, j->nRecheck, j->falhasRecheck,
+         j->caiuEm ? ", copy dropped mid-film" : "");
+  fflush(stdout);
+}
+
+// The lanes finished (or were stopped): save, raise the "generated" notice when complete, log, summary.
+static void fecharLote(Job *j, Uint32 t0, Faixa *f1, Faixa *f2, int faixas) {
+  pthread_mutex_lock(&mu);
+  int completo = proximo(j) < 0 && (!lacunaPermitida(j) || proximaLacuna(j) < 0) && !parou(j);
+  pthread_mutex_unlock(&mu);
+  salvar(j, completo);
+  if (completo) avisoPronto = j->g;
+  printf("[miniatura] done: %d/%d tiles from %s in %.0f s (%d lane%s), read %.1f MB, pace now %lld/s\n", j->feitos, j->n,
+         origem, (SDL_GetTicks() - t0) / 1000.0, faixas, faixas == 1 ? "" : "s", (f1->lido + f2->lido) / 1048576.0, mRitmo());
+  fflush(stdout);
+  resumo(j, t0);
 }
 
 static void *trabalhar(void *u) {
@@ -1083,7 +1146,7 @@ static void *trabalhar(void *u) {
       continue;
     }
     int igual = ib[0] > 0 && labs((long)ib[0] - j->dur) <= TELA_DUR_IGUAL_MS;
-    if (igual && !roda1) {
+    if (igual && !roda1 && labs((long)ib[0] - j->dur) <= OTIMISTA_DUR_MS) {
       // OPTIMISTIC START: same length within 2.5 s, so one lane starts at offset 0 while the screen check runs; the
       // check then relabels (offset <= 3 s) or discards (larger, or rejected) what it made.
       pthread_mutex_lock(&mu);
@@ -1177,7 +1240,7 @@ static void *trabalhar(void *u) {
     // Two lanes on the copy, each with its own reader and decoder (both on the copy's resolved link: no new debrid
     // link minted), sharing ONE request in flight (MiniaturaMotor): one decodes while the other's batch is on the wire.
     mAlvo(hB, j->copias[copiaUsada].url, alvoB, sizeof alvoB);
-    mFechar(hB); hB = 0;                 // the check's session is done
+    // hB stays open for the re-check while watching (below)
     if (!roda1 && !parou(j)) {
       f1.j = j; f1.usaB = 1; f1.id = 1; f1.feitos = 0; f1.somaMs = 0; f1.lido = 0;
       f1.h = mAbrir(alvoB, j->copias[copiaUsada].cab, 1);
@@ -1190,36 +1253,62 @@ static void *trabalhar(void *u) {
       if (f2.h) roda2 = pthread_create(&t2, NULL, faixa, &f2) == 0;
       if (!roda2) { mFechar(f2.h); f2.h = 0; }
     }
-    if (roda1) pthread_join(t1, NULL);
-    if (roda2) pthread_join(t2, NULL);
+    // RE-CHECK WHILE WATCHING: the screen check only saw the first minute. Every 3 min of playback one frame on screen
+    // is compared with the copy at the mapped time (a single exact frame, no 4K read). Two misses in a row (the second
+    // 20 s after the first) mean the copy stopped matching (a scene cut or added in a same-length copy): the lanes
+    // stop and every thumbnail after the last good check is dropped.
+    int juntou = 0, falhasR = 0;
+    long bomAte = 0;
+    Uint32 proxR = SDL_GetTicks() + RECHECK_MS;
+    while (!j->parar) {
+      if (!juntou && (!roda1 || f1.acabou) && (!roda2 || f2.acabou)) {
+        if (roda1) pthread_join(t1, NULL);
+        if (roda2) pthread_join(t2, NULL);
+        juntou = 1;
+        fecharLote(j, t0, &f1, &f2, roda1 + roda2);
+      }
+      if (!scrubbing && !bufferando && SDL_GetTicks() >= proxR) {
+        long pA = 0;
+        int r = reconferir(j, hB, mapaAtual(j), &pA);
+        if (r == 1) { falhasR = 0; bomAte = pA; proxR = SDL_GetTicks() + RECHECK_MS; j->nRecheck++; }
+        else if (r == 0) {
+          j->nRecheck++; j->falhasRecheck++;
+          printf("[miniatura] re-check at %lds: copy did not match (%d in a row)\n", pA / 1000, falhasR + 1); fflush(stdout);
+          if (++falhasR >= 2) {
+            j->caiuEm = pA;
+            j->pararFaixas = 1;
+            if (!juntou) {
+              if (roda1) pthread_join(t1, NULL);
+              if (roda2) pthread_join(t2, NULL);
+              juntou = 1;
+            }
+            j->pararFaixas = 0;
+            pthread_mutex_lock(&mu);
+            int tirados = 0;
+            for (int k = 0; k < j->n; k++)
+              if (j->tiles[k].jpg && j->tiles[k].pts > bomAte) { free(j->tiles[k].jpg); j->tiles[k].jpg = NULL; j->feitos--; tirados++; }
+            pthread_mutex_unlock(&mu);
+            printf("[miniatura] the copy stopped matching after %lds: %d thumbnails after it dropped\n", bomAte / 1000, tirados);
+            fflush(stdout);
+            salvar(j, 0);
+            break;
+          }
+          proxR = SDL_GetTicks() + 20000;
+        } else proxR = SDL_GetTicks() + 10000;   // nothing on screen yet (paused): try again soon
+      }
+      dormir(j, 1000);
+    }
+    if (!juntou) {                       // the title was closed while the lanes ran
+      if (roda1) pthread_join(t1, NULL);
+      if (roda2) pthread_join(t2, NULL);
+      fecharLote(j, t0, &f1, &f2, roda1 + roda2);
+    }
     mFechar(f1.h); mFechar(f2.h);
-    pthread_mutex_lock(&mu);
-    int completo = proximo(j) < 0 && (!lacunaPermitida(j) || proximaLacuna(j) < 0) && !parou(j);
-    pthread_mutex_unlock(&mu);
-    salvar(j, completo);
-    if (completo) avisoPronto = j->g;
-    printf("[miniatura] done: %d/%d tiles from %s in %.0f s (%d lane%s), read %.1f MB, pace now %lld/s\n", j->feitos, j->n,
-           origem, (SDL_GetTicks() - t0) / 1000.0, roda1 + roda2, roda1 + roda2 == 1 ? "" : "s", (f1.lido + f2.lido) / 1048576.0, mRitmo());
-    fflush(stdout);
   }
 fim:
   mFechar(hB);
   mFechar(hA);
-  {
-    long long cont[NCONT];
-    mContadores(cont);
-    long long nl = cont[5] - j->cont0[5], nk = cont[9] - j->cont0[9];
-    printf("[miniatura] SUMMARY %s | play %dp %.1f min | candidates: %s | chosen: %s | offset %+.2fs, redo %s | "
-           "decoders %lld, requests %lld, %.1f MB | time: network %.1f s, frames %.1f s | batches %lld (avg %.1f keyframes, %.2f MB), "
-           "keyframe avg %.0f KB | tiles %d/%d in %.0f s | playback: %d rebuffers, %d player errors\n",
-           j->titulo, j->alturaA, j->dur / 60000.0, j->motivos, j->escolhida[0] ? j->escolhida : "none", j->offset / 1000,
-           j->refeito ? "yes" : "no", cont[1] - j->cont0[1], cont[0] - j->cont0[0], (cont[2] - j->cont0[2]) / 1048576.0,
-           (cont[3] - j->cont0[3]) / 1000.0, (cont[4] - j->cont0[4]) / 1000.0, nl,
-           nl ? (double)(cont[7] - j->cont0[7]) / nl : 0.0, nl ? (cont[6] - j->cont0[6]) / 1048576.0 / nl : 0.0,
-           nk ? (cont[8] - j->cont0[8]) / 1024.0 / nk : 0.0,
-           j->feitos, j->n, (SDL_GetTicks() - t0) / 1000.0, evRebuffer, evErro);
-    fflush(stdout);
-  }
+  resumo(j, t0);
   pthread_mutex_lock(&mu);
   j->vivo = 0;
   int orfao = job != j;
