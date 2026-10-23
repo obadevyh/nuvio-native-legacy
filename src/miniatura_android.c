@@ -96,7 +96,9 @@ typedef struct {
   int refeito;
   int nRecheck, falhasRecheck, resumido;   // re-check while watching; summary printed once
   long caiuEm;                             // play time where the copy stopped matching (0 = never)
-  long long cont0[10];
+  long ultimoBom;                          // last play time the copy was CONFIRMED to match (check anchors, re-checks)
+  int reancoras;                           // times a new offset was found after the copy stopped matching
+  long long cont0[12];
   volatile int parar;
   int vivo;
 } Job;
@@ -261,7 +263,7 @@ static int mPreparar(long long h, const long *tempos, int n) {
   return r;
 }
 // MiniaturaMotor.contadores() since the app started; the summary takes deltas.
-#define NCONT 10
+#define NCONT 12
 static int mLote(long long h) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jint r = (*env)->CallStaticIntMethod(env, cls, jLote, (jlong)h);
@@ -679,6 +681,7 @@ static int conferirTela(Job *j, long long hB, long durB, Mapa *mapa) {
   }
   double erro = 3 * sqrt(s2 / nm) / sqrt(nm) + 500.0;
   mapa->a = 1.0; mapa->b = b; mapa->erro = erro; mapa->inliers = nm;
+  j->ultimoBom = (long)aMax;           // the latest playback time this copy was seen to match
   printf("[miniatura] screen check: ACCEPTED t_copy = t_play %+.2fs (%d anchors over %.0fs, +-%.1fs) in %.1f s, no 4K read\n",
          b / 1000, nm, (aMax - aMin) / 1000, erro / 1000, (SDL_GetTicks() - ini) / 1000.0);
   fflush(stdout);
@@ -706,6 +709,53 @@ static int reconferir(Job *j, long long h, Mapa m, long *pA) {
   }
   if (!vistos) return -1;
   return melhor >= RECHECK_MIN ? 1 : 0;
+}
+
+// After the copy stopped matching (an opening, a scene or credits of another length): find its NEW offset. Two screen
+// frames, each searched over the copy's keyframes +-30 s around the old prediction (fetched in ONE multi-range batch),
+// then exact frames around the best; accepted when the two offsets agree within 2 s. 1 = found (*novoB).
+// Measured 22/10 (Bond, 164 min): the offset was -4.8 s for the opening, then the copy diverged.
+static int reancorar(Job *j, long long h, Mapa m, double *novoB) {
+  static const long LARGO[] = { -2000, -1000, 0, 1000, 2000 };
+  double offs[2];
+  int n = 0, provas = 0;
+  long ultimo = -1000000;
+  float sa[SIG_N], sb[SIG_N];
+  Uint32 ini = SDL_GetTicks();
+  while (n < 2 && provas < 6 && !parou(j) && SDL_GetTicks() - ini < 120000u) {
+    esperarPlayer(j);
+    if (scrubbing) { dormir(j, 500); continue; }
+    long pA; int ok;
+    if (!mTela(&pA, sa, &ok) || !ok || labs(pA - ultimo) < 3000) { dormir(j, 1000); continue; }
+    ultimo = pA; provas++;
+    double centro = m.a * pA + m.b, melhor = -2, pMelhor = 0;
+    long ts[31]; int nt = 0;
+    for (long d = -30000; d <= 30000; d += 2000) if ((long)centro + d >= 0) ts[nt++] = (long)centro + d;
+    if (nt > 1) mPreparar(h, ts, nt);                      // the whole window in one request
+    long ultimoKf = -1;
+    for (int i = 0; i < nt && !parou(j); i++) {
+      long p; int okB;
+      if (!mQuadro(h, ts[i], 1, 0, &p, sb, &okB, NULL, NULL) || !okB || p == ultimoKf) continue;
+      ultimoKf = p;
+      double c = 0;
+      for (int k = 0; k < SIG_N; k++) c += sa[k] * sb[k];
+      if (c > melhor) { melhor = c; pMelhor = p; }
+    }
+    double t = 0, r = -2;
+    int achou = melhor >= TELA_MIN_CORR && picoExato(j, h, sa, pMelhor, LARGO, 5, TELA_MIN_CORR, &t, &r) == 1;
+    printf("[miniatura] re-anchor probe at %lds: best r=%.2f %s\n", pA / 1000, achou ? r : melhor,
+           achou ? "match" : "no");
+    fflush(stdout);
+    if (achou) {
+      char extra[48] = "";
+      offs[n++] = t - pA;
+      if (n == 2) snprintf(extra, sizeof extra, " / %+.2fs", offs[1] / 1000);
+      printf("[miniatura] re-anchor offset %+.2fs%s\n", offs[0] / 1000, extra); fflush(stdout);
+    }
+  }
+  if (n < 2 || fabs(offs[0] - offs[1]) > 2000) return 0;
+  *novoB = (offs[0] + offs[1]) / 2;
+  return 1;
 }
 
 static int conferir(Job *j, long long hA, long long hB, long durA, long durB, Ancora *anc, Mapa *mapa, int hdr) {
@@ -1076,14 +1126,14 @@ static void resumo(Job *j, Uint32 t0) {
   long long nl = cont[5] - j->cont0[5], nk = cont[9] - j->cont0[9];
   printf("[miniatura] SUMMARY %s | play %dp %.1f min | candidates: %s | chosen: %s | offset %+.2fs, redo %s | "
          "decoders %lld, requests %lld, %.1f MB | time: network %.1f s, frames %.1f s | batches %lld (avg %.1f keyframes, %.2f MB), "
-         "keyframe avg %.0f KB | tiles %d/%d in %.0f s | playback: %d rebuffers, %d player errors | re-checks %d (misses %d)%s\n",
+         "keyframe avg %.0f KB | keyframe thumbnails: decode %.1f s, resize+JPEG %.1f s | tiles %d/%d in %.0f s | playback: %d rebuffers, %d player errors | re-checks %d (misses %d), re-anchored %d%s\n",
          j->titulo, j->alturaA, j->dur / 60000.0, j->motivos, j->escolhida[0] ? j->escolhida : "none", j->offset / 1000,
          j->refeito ? "yes" : "no", cont[1] - j->cont0[1], cont[0] - j->cont0[0], (cont[2] - j->cont0[2]) / 1048576.0,
          (cont[3] - j->cont0[3]) / 1000.0, (cont[4] - j->cont0[4]) / 1000.0, nl,
          nl ? (double)(cont[7] - j->cont0[7]) / nl : 0.0, nl ? (cont[6] - j->cont0[6]) / 1048576.0 / nl : 0.0,
-         nk ? (cont[8] - j->cont0[8]) / 1024.0 / nk : 0.0,
+         nk ? (cont[8] - j->cont0[8]) / 1024.0 / nk : 0.0, (cont[10] - j->cont0[10]) / 1000.0, (cont[11] - j->cont0[11]) / 1000.0,
          j->feitos, j->n, (SDL_GetTicks() - t0) / 1000.0, evRebuffer, evErro, j->nRecheck, j->falhasRecheck,
-         j->caiuEm ? ", copy dropped mid-film" : "");
+         j->reancoras, j->caiuEm ? ", copy dropped mid-film" : "");
   fflush(stdout);
 }
 
@@ -1258,7 +1308,7 @@ static void *trabalhar(void *u) {
     // 20 s after the first) mean the copy stopped matching (a scene cut or added in a same-length copy): the lanes
     // stop and every thumbnail after the last good check is dropped.
     int juntou = 0, falhasR = 0;
-    long bomAte = 0;
+    long bomAte = j->ultimoBom;        // was 0: a drop then removed EVERY thumbnail (22/10, Bond: 931 of 931)
     Uint32 proxR = SDL_GetTicks() + RECHECK_MS;
     while (!j->parar) {
       if (!juntou && (!roda1 || f1.acabou) && (!roda2 || f2.acabou)) {
@@ -1275,7 +1325,9 @@ static void *trabalhar(void *u) {
           j->nRecheck++; j->falhasRecheck++;
           printf("[miniatura] re-check at %lds: copy did not match (%d in a row)\n", pA / 1000, falhasR + 1); fflush(stdout);
           if (++falhasR >= 2) {
-            j->caiuEm = pA;
+            // The lanes stop (nothing may be made with the old offset meanwhile), then: a NEW offset found -> every
+            // thumbnail after the last confirmed match is redone with it (a piecewise map, segment by segment as
+            // re-checks find them); none -> those thumbnails are dropped and the title stops.
             j->pararFaixas = 1;
             if (!juntou) {
               if (roda1) pthread_join(t1, NULL);
@@ -1283,12 +1335,35 @@ static void *trabalhar(void *u) {
               juntou = 1;
             }
             j->pararFaixas = 0;
+            double nb = 0;
+            int novo = reancorar(j, hB, mapaAtual(j), &nb);
             pthread_mutex_lock(&mu);
             int tirados = 0;
+            double antigo = j->mapa.b;
             for (int k = 0; k < j->n; k++)
-              if (j->tiles[k].jpg && j->tiles[k].pts > bomAte) { free(j->tiles[k].jpg); j->tiles[k].jpg = NULL; j->feitos--; tirados++; }
+              if ((long)k * GRADE_MS > bomAte) {
+                if (j->tiles[k].jpg) { free(j->tiles[k].jpg); j->tiles[k].jpg = NULL; j->feitos--; tirados++; }
+                j->tentado[k] = 0;
+              }
+            if (novo) { j->mapa.b = nb; j->offset = nb; j->reancoras++; }
             pthread_mutex_unlock(&mu);
-            printf("[miniatura] the copy stopped matching after %lds: %d thumbnails after it dropped\n", bomAte / 1000, tirados);
+            if (novo && !parou(j)) {
+              printf("[miniatura] re-anchored after %lds: offset %+.2fs -> %+.2fs, %d thumbnails after it redone\n", bomAte / 1000,
+                     antigo / 1000, nb / 1000, tirados);
+              fflush(stdout);
+              falhasR = 0;
+              bomAte = pA;
+              f1.acabou = f2.acabou = 0;
+              roda1 = f1.h && pthread_create(&t1, NULL, faixa, &f1) == 0;
+              roda2 = f2.h && pthread_create(&t2, NULL, faixa, &f2) == 0;
+              juntou = 0;
+              j->resumido = 0;           // a new SUMMARY when the redo finishes
+              proxR = SDL_GetTicks() + RECHECK_MS;
+              continue;
+            }
+            j->caiuEm = pA;
+            printf("[miniatura] the copy stopped matching after %lds and no new offset was found: %d thumbnails after it dropped\n",
+                   bomAte / 1000, tirados);
             fflush(stdout);
             salvar(j, 0);
             break;

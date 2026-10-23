@@ -479,7 +479,10 @@ object MiniaturaMotor {
     // For the per-title summary: [requests sent, decoders created] since the app started (the C side takes deltas).
     @JvmStatic
     // [requests, decoders created, bytes, network ms, frame ms, batches, batch bytes, batch keyframes, keyframe bytes, keyframes]
-    fun contadores(): LongArray = longArrayOf(requisicoes, criados, lidosTotal, msRede, msQuadros, nLotes, bytesLotes, kfLotes, somaKf, nKf)
+    fun contadores(): LongArray = longArrayOf(requisicoes, criados, lidosTotal, msRede, msQuadros, nLotes, bytesLotes, kfLotes, somaKf, nKf,
+        msDecod, msMontar)
+    @Volatile private var msDecod = 0L      // keyframe thumbnails only: until the decoder hands the frame out
+    @Volatile private var msMontar = 0L     // keyframe thumbnails only: resize + JPEG
     @Volatile private var lidosTotal = 0L
     @Volatile private var msRede = 0L
     @Volatile private var msQuadros = 0L
@@ -675,7 +678,12 @@ object MiniaturaMotor {
                 val ob = dec.dequeueOutputBuffer(info, 2000)
                 if (ob >= 0) {
                     var res: ByteArray? = null
-                    if (info.size > 0) dec.getOutputImage(ob)?.use { img -> res = montar(s, img, info.presentationTimeUs / 1000, jpeg) }
+                    if (info.size > 0) {
+                        val t1 = System.currentTimeMillis()
+                        msDecod += t1 - ini                     // seek + sample read (cached) + the decoder's own work
+                        dec.getOutputImage(ob)?.use { img -> res = montar(s, img, info.presentationTimeUs / 1000, jpeg) }
+                        msMontar += System.currentTimeMillis() - t1   // planes copy + resize + JPEG
+                    }
                     dec.releaseOutputBuffer(ob, false)
                     if (res != null) { s.ultimoPts = st; s.ultimoRes = if (jpeg) null else res; return res }
                     if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return motivo(s, tMs, "decoder ended without a frame (fed $fed)")
