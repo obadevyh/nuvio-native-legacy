@@ -616,15 +616,16 @@ static int conferirTela(Job *j, long long hB, long durB, Mapa *mapa) {
     double t, r = -2;
     int achou;
     if (nm == 0) {
-      // first anchor: the copy's KEYFRAMES +-8 s around the same time AND around the length difference (an intro
-      // or logo of another length shifts the whole film by it) find the region, then the exact frames
+      // first anchor: the copy's KEYFRAMES +-30 s around the same time (an intro, logo or title sequence of another
+      // length shifts what follows; 22/10 a Bond copy 12 s shorter was -4.8 s at the opening and further off later,
+      // so a check started mid-film missed it at +-8 s), fetched in ONE multi-range batch, then the exact frames
       double melhor = -2, pMelhor = pA;
-      long ultimoKf = -1, dif = durB - j->dur;
-      int centros = labs(dif) > 4000 ? 2 : 1;
-      for (int ci = 0; ci < centros; ci++)
-      for (long d = -8000; d <= 8000 && !parou(j); d += 2000) {
-        long alvo = pA + (ci ? dif : 0) + d, p; int okB;
-        if (alvo < 0 || alvo >= durB) continue;
+      long ultimoKf = -1, ts[31];
+      int nt = 0;
+      for (long d = -30000; d <= 30000; d += 2000) if (pA + d >= 0 && pA + d < durB) ts[nt++] = pA + d;
+      if (nt > 1) mPreparar(hB, ts, nt);
+      for (int i = 0; i < nt && !parou(j); i++) {
+        long alvo = ts[i], p; int okB;
         esperarPlayer(j);
         int lido = mQuadro(hB, alvo, 1, 0, &p, sb, &okB, NULL, NULL);
         if (falhou(j, lido, hB)) return 0;
@@ -885,7 +886,7 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, An
 }
 
 // ---- the set on this device's storage: a rewatch or a resume shows it at once and reads nothing ----
-// <data>/miniaturas/<fnv64 of the file identity>.nvm : "NVM2" (NVM1 = 320x180 squeezed sets from before 22/10, ignored), n, dur, complete, then (k, pts, len, jpeg)...
+// <data>/miniaturas/<fnv64 of the file identity>.nvm : "NVM3" (older NVM1/NVM2 sets are ignored: squeezed 320x180, or saved before the re-check existed), n, dur, complete, then (k, pts, len, jpeg)...
 // Identity: the file name + exact size the add-on declared (the same file through any link), else the link.
 // Kept 2 hours after the last use (long enough to come back to the film the same evening), then deleted; never
 // more than 200 MB in total, least recently used first.
@@ -921,7 +922,7 @@ static int carregar(Job *j) {
   if (!f) return 0;
   char mag[4]; long n, dur, completo, k, pts, len;
   int lidos = 0;
-  if (fread(mag, 1, 4, f) != 4 || memcmp(mag, "NVM2", 4) || !lerI32(f, &n) || !lerI32(f, &dur) || !lerI32(f, &completo) ||
+  if (fread(mag, 1, 4, f) != 4 || memcmp(mag, "NVM3", 4) || !lerI32(f, &n) || !lerI32(f, &dur) || !lerI32(f, &completo) ||
       n != j->n) { fclose(f); return 0; }
   while (lerI32(f, &k) && lerI32(f, &pts) && lerI32(f, &len)) {
     if (k < 0 || k >= j->n || len <= 0 || len > (1 << 20)) break;
@@ -976,7 +977,8 @@ static void limparCache(const char *dirArq) {
 }
 
 static void salvar(Job *j, int completo) {
-  if (!j->arq[0] || !j->feitos) return;
+  if (!j->arq[0]) return;
+  if (!j->feitos) { unlink(j->arq); return; }   // nothing left (a dropped copy): no stale set may survive (22/10, Bond)
   char dir[512], tmp[620];
   snprintf(dir, sizeof dir, "%s", j->arq);
   char *barra = strrchr(dir, '/');
@@ -984,7 +986,7 @@ static void salvar(Job *j, int completo) {
   snprintf(tmp, sizeof tmp, "%s.tmp", j->arq);
   FILE *f = fopen(tmp, "wb");
   if (!f) return;
-  fwrite("NVM2", 1, 4, f);
+  fwrite("NVM3", 1, 4, f);
   escreverI32(f, j->n); escreverI32(f, j->dur); escreverI32(f, completo);
   for (int k = 0; k < j->n; k++) {
     pthread_mutex_lock(&mu);
