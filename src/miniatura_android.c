@@ -5,6 +5,7 @@
 #ifndef NV_ANDROID
 const SeekrProvedor *miniatura_provedor(void) { return NULL; }
 int miniatura_prontas_agora(void) { return 0; }
+void miniatura_preaquecer(const char *url, const char *cabecalhos) { (void)url; (void)cabecalhos; }
 #else
 #include "dados.h"
 #include "streams.h"
@@ -23,6 +24,11 @@ int miniatura_prontas_agora(void) { return 0; }
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/system_properties.h>
+#include "miniplat.h"
+#ifdef NV_MINI_FFMPEG
+#include "miniatura_motor.h"   // CPU route: Namer03's FFmpeg engine (packet mode)
+#endif
 
 #define GRADE_MS 10000L
 #define TOL_MS 5000L
@@ -99,6 +105,15 @@ typedef struct {
   long ultimoBom;                          // last play time the copy was CONFIRMED to match (check anchors, re-checks)
   int reancoras;                           // times a new offset was found after the copy stopped matching
   long long cont0[12];
+  long long perdidos0;                     // player's dropped frames when the title started
+  long long audio0;                        // player's audio underruns when the title started
+  long memMin;                             // lowest MemAvailable seen (kB)
+  long heapMin;                            // lowest free Java heap seen (MB)
+  int esperasHeap;                         // times thumbnail work waited for heap room
+  char arqDireto[640];                     // the direct-mode set (its own identity: never mixed with a copy's)
+  Uint32 t0, primeiro, cob60, cob30;       // start; first thumbnail; whole film at 60 s / 30 s spacing (ticks)
+  int direto, contencoes;                  // thumbnails from the playing file; playback-contention back-offs
+  int cpuFeitos; long cpuMs, cpuDecMs;     // CPU route: thumbnails made, average total / decode ms
   volatile int parar;
   int vivo;
 } Job;
@@ -119,7 +134,8 @@ static int motivoSem;            // M_FALHOU because: 0 the video would not open
 
 // ---- JNI (MiniaturaMotor.kt) ----
 static jclass cls;
-static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo, jLote;
+static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo, jLote,
+                 jDiag, jConfig, jPerdidos, jAbrirDireto, jQuadroDireto, jKeyframe, jDiagDireto, jHeap, jAudio, jCodecCpu, jPacoteCpu, jPrepDec;
 
 static int jniPreparar(void) {
   if (cls) return 1;
@@ -149,7 +165,20 @@ static int jniPreparar(void) {
     jCont = (*env)->GetStaticMethodID(env, c, "contadores", "()[J");
     jAlvo = (*env)->GetStaticMethodID(env, c, "alvo", "(J)Ljava/lang/String;");
     jLote = (*env)->GetStaticMethodID(env, c, "lote", "(J)I");
-    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jCont || !jAlvo || !jLote) {
+    jDiag = (*env)->GetStaticMethodID(env, c, "diag", "(Z)Ljava/lang/String;");
+    jConfig = (*env)->GetStaticMethodID(env, c, "configurar", "(I)V");
+    jPerdidos = (*env)->GetStaticMethodID(env, c, "perdidos", "()J");
+    jAbrirDireto = (*env)->GetStaticMethodID(env, c, "abrirDireto", "(Ljava/lang/String;Ljava/lang/String;)J");
+    jQuadroDireto = (*env)->GetStaticMethodID(env, c, "quadroDireto", "(JJ)[B");
+    jKeyframe = (*env)->GetStaticMethodID(env, c, "keyframeMs", "(JJ)J");
+    jDiagDireto = (*env)->GetStaticMethodID(env, c, "diagDireto", "()Ljava/lang/String;");
+    jHeap = (*env)->GetStaticMethodID(env, c, "heapLivreMb", "()J");
+    jAudio = (*env)->GetStaticMethodID(env, c, "audioFalhas", "()J");
+    jCodecCpu = (*env)->GetStaticMethodID(env, c, "codecCpu", "(J)I");
+    jPacoteCpu = (*env)->GetStaticMethodID(env, c, "pacoteCpu", "(JJ)[B");
+    jPrepDec = (*env)->GetStaticMethodID(env, c, "prepararDecoder", "(J)I");
+    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jCont || !jAlvo || !jLote ||
+        !jDiag || !jConfig || !jPerdidos || !jAbrirDireto || !jQuadroDireto || !jKeyframe || !jDiagDireto || !jHeap || !jAudio || !jCodecCpu || !jPacoteCpu || !jPrepDec) {
       (*env)->ExceptionClear(env);
     } else {
       cls = (jclass)(*env)->NewGlobalRef(env, c);
@@ -268,7 +297,7 @@ static int mLote(long long h) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jint r = (*env)->CallStaticIntMethod(env, cls, jLote, (jlong)h);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 8; }
-  return r < 4 ? 4 : r > LOTE ? LOTE : r;
+  return r < 2 ? 2 : r > LOTE ? LOTE : r;
 }
 static void mContadores(long long out[NCONT]) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
@@ -290,6 +319,120 @@ static void mAlvo(long long h, const char *reserva, char *out, size_t n) {
     (*env)->DeleteLocalRef(env, sj);
   }
 }
+// The engine's read diagnostics since the last reset (zerar = reset after reading), into out.
+static void mDiag(int zerar, char *out, size_t n) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  if (out && n) out[0] = 0;
+  jstring sj = (jstring)(*env)->CallStaticObjectMethod(env, cls, jDiag, zerar ? JNI_TRUE : JNI_FALSE);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return; }
+  if (!sj) return;
+  const char *c = (*env)->GetStringUTFChars(env, sj, NULL);
+  if (c && out) snprintf(out, n, "%s", c);
+  if (c) (*env)->ReleaseStringUTFChars(env, sj, c);
+  (*env)->DeleteLocalRef(env, sj);
+}
+static void mDiagDireto(char *out, size_t n) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  out[0] = 0;
+  jstring sj = (jstring)(*env)->CallStaticObjectMethod(env, cls, jDiagDireto);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return; }
+  if (!sj) return;
+  const char *c = (*env)->GetStringUTFChars(env, sj, NULL);
+  if (c) { snprintf(out, n, "%s", c); (*env)->ReleaseStringUTFChars(env, sj, c); }
+  (*env)->DeleteLocalRef(env, sj);
+}
+// Direct mode (MiniaturaMotor.abrirDireto/quadroDireto): the playing file itself, hardware decoder + GPU resize.
+static long long mAbrirDireto(const char *url, const char *cab) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jstring u = (*env)->NewStringUTF(env, url), c = (*env)->NewStringUTF(env, cab ? cab : "");
+  jlong h = (*env)->CallStaticLongMethod(env, cls, jAbrirDireto, u, c);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); h = 0; }
+  (*env)->DeleteLocalRef(env, u); (*env)->DeleteLocalRef(env, c);
+  return h;
+}
+static long mKeyframe(long long h, long tMs) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jlong r = (*env)->CallStaticLongMethod(env, cls, jKeyframe, (jlong)h, (jlong)tMs);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = -1; }
+  return (long)r;
+}
+static int desempacotar(JNIEnv *env, jbyteArray a, long *pts, float sig[SIG_N], int *temSig, unsigned char **jpg, int *nJpg);
+static int mQuadroDireto(long long h, long tMs, long *pts, unsigned char **jpg, int *nJpg) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  float sig[SIG_N]; int ok;
+  jbyteArray a = (jbyteArray)(*env)->CallStaticObjectMethod(env, cls, jQuadroDireto, (jlong)h, (jlong)tMs);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); a = NULL; }
+  return desempacotar(env, a, pts, sig, &ok, jpg, nJpg);
+}
+// Free Java heap of the app (MB); the player's samples share it. Below HEAP_MIN_MB thumbnail work waits.
+#define HEAP_MIN_MB 64
+static long mHeapLivre(void) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jlong r = (*env)->CallStaticLongMethod(env, cls, jHeap);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 1000; }
+  return (long)r;
+}
+#ifdef NV_MINI_FFMPEG
+// CPU route: 1 HEVC, 2 H.264, 0 not possible for this source (MiniaturaMotor.codecCpu).
+static int mCodecCpu(long long h) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jint r = (*env)->CallStaticIntMethod(env, cls, jCodecCpu, (jlong)h);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 0; }
+  return r;
+}
+// The keyframe for tMs as an Annex B access unit with its parameter sets (malloc'd in *pk), *pts its time.
+static int mPacoteCpu(long long h, long tMs, long *pts, unsigned char **pk, int *n) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  *pk = NULL; *n = 0;
+  jbyteArray a = (jbyteArray)(*env)->CallStaticObjectMethod(env, cls, jPacoteCpu, (jlong)h, (jlong)tMs);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); a = NULL; }
+  if (!a) return 0;
+  jsize t = (*env)->GetArrayLength(env, a);
+  unsigned char cab[8];
+  if (t > 8) {
+    (*env)->GetByteArrayRegion(env, a, 0, 8, (jbyte *)cab);
+    *pk = malloc((size_t)(t - 8));
+    if (*pk) { (*env)->GetByteArrayRegion(env, a, 8, t - 8, (jbyte *)*pk); *n = t - 8; }
+  }
+  (*env)->DeleteLocalRef(env, a);
+  if (!*pk) return 0;
+  long long v = 0;
+  for (int i = 0; i < 8; i++) v = (v << 8) | cab[i];
+  *pts = (long)v;
+  return 1;
+}
+#endif
+// The direct mode's hardware decoder (+ GPU step), created now (MiniaturaMotor.prepararDecoder): 1 = ready.
+static int mPrepararDecoder(long long h) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jint r = (*env)->CallStaticIntMethod(env, cls, jPrepDec, (jlong)h);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 0; }
+  return r;
+}
+static long long mAudioFalhas(void) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jlong r = (*env)->CallStaticLongMethod(env, cls, jAudio);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 0; }
+  return r;
+}
+static long long mPerdidos(void) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jlong r = (*env)->CallStaticLongMethod(env, cls, jPerdidos);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 0; }
+  return r;
+}
+// debug.nuvio.miniatura (adb shell setprop): bit 1 = force the direct playing-file path, bit 2 = old closest-cue
+// prefetch (A/B of the read fix). Read when a title starts and handed to the engine.
+static int bitsDebug(void) {
+  char v[PROP_VALUE_MAX] = "";
+  if (__system_property_get("debug.nuvio.miniatura", v) <= 0) return 0;
+  return atoi(v);
+}
+static void mConfigurar(int bits) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  (*env)->CallStaticVoidMethod(env, cls, jConfig, (jint)bits);
+  if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+}
 static long long mRitmo(void) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jlong r = (*env)->CallStaticLongMethod(env, cls, jRitmo);
@@ -307,16 +450,47 @@ static long memDisponivelKB(void) {
 }
 
 static int parou(const Job *j) { return j->parar || j->pararFaixas; }
+static long mHeapLivre(void);
+// The app's Java heap is tight: wait (the player's sample buffer must never trigger a blocking GC because of us).
+static int heapApertado(Job *j) {
+  long h = mHeapLivre();
+  if (h < j->heapMin) j->heapMin = h;
+  if (h >= HEAP_MIN_MB) return 0;
+  if (j->esperasHeap++ % 20 == 0) { printf("[miniatura] waiting: app heap has %ld MB free (< %d)\n", h, HEAP_MIN_MB); fflush(stdout); }
+  return 1;
+}
 static void dormir(const Job *j, int ms) { for (int t = 0; t < ms && !parou(j); t += 50) usleep(50000); }
 
 // The player first: nothing is read while it rebuffers, reconnects or has failed. Measured 22/10 (Dune 2, 4K
 // through a StremThru proxy): a burst of thumbnail reads on the playing link and the player's reconnects were
 // refused together (ConnectException) until it gave up.
+// Seconds the player has buffered ahead, < 0 when it does not say. On Android VOD video_buffer_fim() is live-only
+// (always 0), so this gate never fired there before 23/10; the player's own stats carry the real figure. A 4K remux
+// sits at ~10 s (the player's 80 MB sample cap, measured 23/10), so the floor is absolute and low, not 20 s.
+// The thresholds are RELATIVE to what the player holds for this file: its buffer is capped in bytes (80 MB), so a
+// 102 Mbit/s remux is FULL at ~6 s (measured 23/10: a fixed 8 s wait stalled direct mode while the player sat idle
+// with a full buffer). folgaTopo = the highest buffer seen in the last minute (the player's ceiling for this file).
+#define FOLGA_MIN_S 4.0
+static double folgaTopo = -1;
+static Uint32 folgaTopoEm;
+static double folgaSeg(void) {
+  VideoStats st;
+  double f;
+  video_estatisticas(&st);
+  if (st.bufferSeg >= 0) f = st.bufferSeg;
+  else { double bf = video_buffer_fim(); f = bf > 0.5 ? bf - video_pos() : -1.0; }
+  if (f >= 0 && (f >= folgaTopo || SDL_GetTicks() - folgaTopoEm > 60000u)) { folgaTopo = f; folgaTopoEm = SDL_GetTicks(); }
+  return f;
+}
+// "Comfortable": at least `alvo` seconds, or 70 % of the ceiling when the ceiling itself is lower.
+static double folgaQuer(double alvo, double frac) {
+  return folgaTopo > 0 && folgaTopo * frac < alvo ? folgaTopo * frac : alvo;
+}
 static int folgaBaixa(void) {
-  double bf = video_buffer_fim(), pos = video_pos(), dur = video_duracao();
-  double quer = 20.0;
+  double f = folgaSeg(), pos = video_pos(), dur = video_duracao();
+  double quer = folgaQuer(FOLGA_MIN_S, 0.5);
   if (dur > 0 && dur - pos - 1.0 < quer) quer = dur - pos - 1.0;
-  return bf > 0.5 && quer > 0 && bf - pos < quer;
+  return f >= 0 && quer > 0 && f < quer;
 }
 static void esperarPlayer(const Job *j) {
   int avisou = 0;
@@ -474,8 +648,9 @@ static int hipotese(const Par *m, int n, double razao, double *a, double *b) {
 // Room for the player before each 4K read: at least 8 s buffered ahead (when the player reports it).
 static void esperarFolga(const Job *j) {
   for (int t = 0; t < 30 && !parou(j); t++) {
-    double bf = video_buffer_fim(), pos = video_pos();
-    if (bf <= 0.5 || bf - pos >= 8.0) return;
+    double f = folgaSeg();
+    // at least 6 s, or half the player's ceiling (0.7 of it held a 4K remux at its 7-9 s for 15 s per batch, 23/10)
+    if (f < 0 || f >= folgaQuer(6.0, 0.5)) return;
     dormir(j, 500);
   }
 }
@@ -893,7 +1068,7 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, An
 #define CACHE_MAX_BYTES (200LL << 20)
 #define CACHE_TTL_S (2 * 3600)
 
-static void chaveArquivo(const SeekrFonte *f, char *out, size_t n) {
+static void chaveArquivo(const SeekrFonte *f, char *out, size_t n, const char *modo) {
   char id[700];
   const char *nome = f->arquivo && f->arquivo[0] ? f->arquivo : "";
   const char *barra = strrchr(nome, '/');
@@ -903,6 +1078,7 @@ static void chaveArquivo(const SeekrFonte *f, char *out, size_t n) {
   if (f->tamanho || nome[0])
     snprintf(id, sizeof id, "t|%s:%d:%d|%llu|%s", f->imdb ? f->imdb : "", f->t, f->e, (unsigned long long)f->tamanho, nome);
   else snprintf(id, sizeof id, "d|%s:%d:%d|%ld", f->imdb ? f->imdb : "", f->t, f->e, f->durMs / 1000);
+  if (modo[0]) snprintf(id + strlen(id), sizeof id - strlen(id), "|%s", modo);
   unsigned long long h = 1469598103934665603ULL;
   for (const char *p = id; *p; p++) { h ^= (unsigned char)tolower((unsigned char)*p); h *= 1099511628211ULL; }
   char dir[512];
@@ -1053,7 +1229,9 @@ static void *faixa(void *u) {
   while (!parou(j)) {
     if (bufferando || video_reconectando() || video_falhou() || folgaBaixa()) { mSoltar(f->h); esperarPlayer(j); continue; }
     long disp = memDisponivelKB();
+    if (disp >= 0 && (j->memMin < 0 || disp < j->memMin)) j->memMin = disp;
     if (disp >= 0 && disp < PISO_KB) { mSoltar(f->h); dormir(j, 1500); continue; }
+    if (heapApertado(j)) { dormir(j, 1500); continue; }
     int k = -1, exato = 0;
     if (ifila < nfila) k = fila[ifila++];
     else {
@@ -1099,6 +1277,7 @@ static void *faixa(void *u) {
       if (!j->tiles[dest].jpg) {
         j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; j->tiles[dest].prov = (unsigned char)j->otimista;
         jpg = NULL; j->feitos++;
+        if (!j->primeiro) j->primeiro = SDL_GetTicks();
       }
       j->tentado[dest] = 1;
       if (job == j) estado = M_PRONTO;
@@ -1126,16 +1305,25 @@ static void resumo(Job *j, Uint32 t0) {
   long long cont[NCONT];
   mContadores(cont);
   long long nl = cont[5] - j->cont0[5], nk = cont[9] - j->cont0[9];
+  char dg[700], dd[700] = "";
+  mDiag(0, dg, sizeof dg);
+  if (j->direto) mDiagDireto(dd, sizeof dd);
+  char marcos[240];
+  snprintf(marcos, sizeof marcos, "cpu route %d (%ld ms each, decode %ld ms), first thumbnail %.1f s, 60 s coverage %s%.0f s, 30 s coverage %s%.0f s",
+           j->cpuFeitos, j->cpuMs, j->cpuDecMs,
+           j->primeiro ? (j->primeiro - t0) / 1000.0 : -1.0, j->cob60 ? "" : "not reached ", j->cob60 ? (j->cob60 - t0) / 1000.0 : 0.0,
+           j->cob30 ? "" : "not reached ", j->cob30 ? (j->cob30 - t0) / 1000.0 : 0.0);
   printf("[miniatura] SUMMARY %s | play %dp %.1f min | candidates: %s | chosen: %s | offset %+.2fs, redo %s | "
          "decoders %lld, requests %lld, %.1f MB | time: network %.1f s, frames %.1f s | batches %lld (avg %.1f keyframes, %.2f MB), "
-         "keyframe avg %.0f KB | keyframe thumbnails: decode %.1f s, resize+JPEG %.1f s | tiles %d/%d in %.0f s | playback: %d rebuffers, %d player errors | re-checks %d (misses %d), re-anchored %d%s\n",
+         "keyframe avg %.0f KB | keyframe thumbnails: decode %.1f s, resize+JPEG %.1f s | tiles %d/%d in %.0f s | playback: %d rebuffers, %d player errors | re-checks %d (misses %d), re-anchored %d%s | dropped frames %lld, audio underruns %lld, min free %ld MB, min heap free %ld MB (waits %d) | %s | %s%s%s\n",
          j->titulo, j->alturaA, j->dur / 60000.0, j->motivos, j->escolhida[0] ? j->escolhida : "none", j->offset / 1000,
          j->refeito ? "yes" : "no", cont[1] - j->cont0[1], cont[0] - j->cont0[0], (cont[2] - j->cont0[2]) / 1048576.0,
          (cont[3] - j->cont0[3]) / 1000.0, (cont[4] - j->cont0[4]) / 1000.0, nl,
          nl ? (double)(cont[7] - j->cont0[7]) / nl : 0.0, nl ? (cont[6] - j->cont0[6]) / 1048576.0 / nl : 0.0,
          nk ? (cont[8] - j->cont0[8]) / 1024.0 / nk : 0.0, (cont[10] - j->cont0[10]) / 1000.0, (cont[11] - j->cont0[11]) / 1000.0,
          j->feitos, j->n, (SDL_GetTicks() - t0) / 1000.0, evRebuffer, evErro, j->nRecheck, j->falhasRecheck,
-         j->reancoras, j->caiuEm ? ", copy dropped mid-film" : "");
+         j->reancoras, j->caiuEm ? ", copy dropped mid-film" : "", mPerdidos() - j->perdidos0, mAudioFalhas() - j->audio0, j->memMin / 1024, j->heapMin, j->esperasHeap, marcos, dg,
+         dd[0] ? " | " : "", dd);
   fflush(stdout);
 }
 
@@ -1152,6 +1340,510 @@ static void fecharLote(Job *j, Uint32 t0, Faixa *f1, Faixa *f2, int faixas) {
   resumo(j, t0);
 }
 
+// ---- DIRECT MODE: thumbnails from the PLAYING file (4K, experimental) ----
+// For a 4K title with no usable smaller copy (or forced by debug.nuvio.miniatura bit 1): ONE lane, ONE hardware
+// decoder kept for the title, keyframes fetched in multi-range batches (the socket closed after each, one request in
+// flight for the whole engine), scaled on the GPU. Coverage that is useful early comes first:
+//   0 the scrub target (+-30 s), 1 around the playhead (+-1 min), 2 the whole film every 60 s, 3 every 30 s,
+//   4 the 10 s grid, only while playback shows headroom (no contention seen, 30+ s buffered, memory well above the floor).
+// Each target is reduced to the keyframe the extractor lands on (the cue at or before it); a keyframe already made is
+// not made again, and each thumbnail is stored under ITS OWN time (a keyframe at 58 s is not labelled 60 s).
+// Safety: the player gates of the copy lanes (buffering, reconnect, < 20 s buffered, memory floor); dropped frames
+// rising, or the buffer draining (3+ s lost in 10 s, under 8 s), while we decode = contention: the decoder is released
+// and work pauses 20 s; the 3rd time ends direct mode.
+#define DIR_CONTENCAO_QUADROS 8          // player frames dropped within one check window that count as contention
+#define DIR_CONTENCOES_MAX 3
+// The thumbnail decoder is created only while playback is PAUSED or the user scrubs/seeks (audio is interrupted
+// then anyway). Measured 23/10 on the Shield with TrueHD passthrough: creating a second 4K hardware decoder caused an
+// audible HDMI underrun (nvaudio_hw) at 4 of 5 starts, also 8 s into playback. Until then keyframes are only
+// downloaded (to disk, MiniaturaMotor) and queued; the first pause/scrub decodes the queue in a burst (~20 ms each).
+#define DIR_PENDENTES_MAX 1200           // keyframes queued before the decoder exists: the whole 10 s grid of a 3 h film
+static int livreDireto(const Job *j, int k) { return k >= 0 && k < j->n && !j->tentado[k] && !j->tiles[k].jpg; }
+static int proximoDireto(const Job *j, int etapaMax, int *etapa) {
+  int n = j->n, ph = (int)(playheadMs / GRADE_MS), sc = (int)((posMs + GRADE_MS / 2) / GRADE_MS);
+  if (scrubbing) {
+    static const int D0[] = { 0, -3, 3 };
+    for (int i = 0; i < 3; i++) if (livreDireto(j, sc + D0[i])) { *etapa = 0; return sc + D0[i]; }
+  }
+  static const int D1[] = { 0, 3, -3, 6, -6 };
+  for (int i = 0; i < 5; i++) if (livreDireto(j, ph + D1[i])) { *etapa = 1; return ph + D1[i]; }
+  static const int PASSO[] = { 6, 3, 1 };
+  for (int e = 2; e <= etapaMax && e <= 4; e++) {
+    int p = PASSO[e - 2];
+    for (int d = 0; d <= n; d++) {                 // outward from the playhead, on the stage's spacing
+      int a = (ph / p + d) * p, b = (ph / p - d) * p;
+      if (a >= n && b < 0) break;
+      if (livreDireto(j, a)) { *etapa = e; return a; }
+      if (d && livreDireto(j, b)) { *etapa = e; return b; }
+    }
+  }
+  return -1;
+}
+// Slots of a stage still open (for the coverage milestones).
+// A slot of the stage counts as covered when a thumbnail lies within half the stage's spacing of it (the keyframe
+// that stands for it carries its own time).
+static int restamNaEtapa(const Job *j, int passo) {
+  for (int k = 0; k < j->n; k += passo) {
+    int achou = 0;
+    for (int d = -(passo / 2); d <= passo / 2 && !achou; d++) achou = k + d >= 0 && k + d < j->n && j->tiles[k + d].jpg != NULL;
+    if (!achou) return 1;
+  }
+  return 0;
+}
+
+#ifdef NV_MINI_FFMPEG
+// ---- SMART PER DEVICE: the CPU route's measured cost on THIS device ----
+// <data>/miniaturas/perfil-cpu.txt: average ms per CPU thumbnail and samples, for pictures up to 1080p and above.
+// While the film plays, downloaded keyframes are decoded on the CPU (Namer03's engine: no hardware decoder, so no
+// HDMI underrun) at most ~half of one core; the hardware burst still runs at the first pause/scrub. A class whose
+// average exceeds its limit (too slow to be worth the CPU next to playback) is skipped on this device until the
+// measurement says otherwise (a title that ran it updates the average). debug.nuvio.miniatura bit 32: CPU route off.
+#define CPU_MAX_MS_HD 1200
+#define CPU_MAX_MS_4K 2500
+#define CPU_AMOSTRAS 3                   // thumbnails before a title's own measurement decides
+typedef struct { double ms[2]; int n[2]; } PerfilCpu;
+static void perfilCaminho(char *out, size_t n) {
+  char dir[512];
+  if (!dados_caminho(dir, sizeof dir, "miniaturas")) { out[0] = 0; return; }
+  snprintf(out, n, "%s/perfil-cpu.txt", dir);
+}
+static void perfilLer(PerfilCpu *pf) {
+  char c[600];
+  memset(pf, 0, sizeof *pf);
+  perfilCaminho(c, sizeof c);
+  FILE *f = c[0] ? fopen(c, "r") : NULL;
+  if (!f) return;
+  if (fscanf(f, "%lf %d %lf %d", &pf->ms[0], &pf->n[0], &pf->ms[1], &pf->n[1]) != 4) memset(pf, 0, sizeof *pf);
+  fclose(f);
+}
+static void perfilGravar(const PerfilCpu *pf) {
+  char c[600], dir[512];
+  perfilCaminho(c, sizeof c);
+  if (!c[0]) return;
+  snprintf(dir, sizeof dir, "%s", c);
+  char *b = strrchr(dir, '/');
+  if (b) { *b = 0; mkdir(dir, 0700); }
+  FILE *f = fopen(c, "w");
+  if (!f) return;
+  fprintf(f, "%.0f %d %.0f %d\n", pf->ms[0], pf->n[0], pf->ms[1], pf->n[1]);
+  fclose(f);
+}
+// A finished direct-mode thumbnail into the set (freed when the slot is taken already).
+static void guardarTileDireto(Job *j, long p, unsigned char *jpg, int nj, int *feitosAqui) {
+  int dest = (int)((p + GRADE_MS / 2) / GRADE_MS);
+  pthread_mutex_lock(&mu);
+  if (dest >= 0 && dest < j->n && !j->tiles[dest].jpg) {
+    j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; jpg = NULL;
+    j->tentado[dest] = 1; j->feitos++; (*feitosAqui)++;
+    if (!j->primeiro) j->primeiro = SDL_GetTicks();
+    if (job == j) estado = M_PRONTO;
+  }
+  if (!j->cob60 && !restamNaEtapa(j, 6)) j->cob60 = SDL_GetTicks();
+  if (!j->cob30 && !restamNaEtapa(j, 3)) j->cob30 = SDL_GetTicks();
+  pthread_mutex_unlock(&mu);
+  free(jpg);
+}
+
+// THE CPU THREAD: decodes queued keyframes while the download loop goes on (measured 23/10: run in turns, the queue
+// was empty at the first scrub and downloads waited behind the CPU). Oldest first (the queue follows the coverage
+// stages); paused while the hardware decoder exists or the player is paused/scrubbing/buffering; full speed, slower
+// for a minute after contention. Fonte's entry points are synchronised on the Kotlin side.
+typedef struct {
+  Job *j; long long h; MiniMotor *cpu; long *pend; int *nPend; pthread_mutex_t *mp;
+  volatile int pausa, fim, desligar, recusou, cuidado;
+  long soma, decSoma, limite; int falhas, feitosAqui, semBloco, threads;
+} CpuFaixa;
+static void *cpuTrabalho(void *u) {
+  CpuFaixa *cf = u;
+  Job *j = cf->j;
+  while (!cf->fim && !parou(j)) {
+    if (cf->pausa || cf->desligar) { usleep(200000); continue; }
+    long disp = memDisponivelKB(), precisaKB = (long)(mini_motor_memoria(cf->cpu, cf->threads) / 1024);
+    if (disp >= 0 && disp - precisaKB < PISO_KB) { usleep(1000000); continue; }
+    pthread_mutex_lock(cf->mp);
+    if (*cf->nPend <= 0) { pthread_mutex_unlock(cf->mp); usleep(200000); continue; }
+    long kf = cf->pend[0], p = 0;
+    memmove(cf->pend, cf->pend + 1, sizeof *cf->pend * (size_t)(--*cf->nPend));
+    pthread_mutex_unlock(cf->mp);
+    unsigned char *pk = NULL, *jpg = NULL; int npk = 0, nj = 0; MiniQuadro q; char e[96] = "";
+    int r = -1;
+    if (!mPacoteCpu(cf->h, kf, &p, &pk, &npk)) {
+      // no block to hand over (a layout the block reader does not take, measured 23/10 on a 1080p episode): the
+      // hardware path reads it through the extractor at the first pause/scrub. Not a CPU failure.
+      if (mFalhaRede(cf->h) == 2) cf->recusou = 1;
+      pthread_mutex_lock(cf->mp);
+      cf->pend[(*cf->nPend)++] = kf;
+      int soEsses = ++cf->semBloco >= *cf->nPend;
+      pthread_mutex_unlock(cf->mp);
+      usleep(soEsses ? 2000000 : 20000);
+      continue;
+    }
+    cf->semBloco = 0;
+    r = mini_motor_pacote(cf->cpu, pk, npk, cf->threads, &jpg, &nj, &q, e, sizeof e);
+    free(pk);
+    if (r < 0) {
+      pthread_mutex_lock(cf->mp);
+      cf->pend[(*cf->nPend)++] = kf;              // the hardware burst takes it later
+      pthread_mutex_unlock(cf->mp);
+      if (++cf->falhas >= 5 && !cf->desligar) { cf->desligar = 1; printf("[miniatura] cpu route: 5 failures (%s), off for this title\n", e); fflush(stdout); }
+      usleep(200000);
+      continue;
+    }
+    j->cpuFeitos++; cf->soma += q.totalMs; cf->decSoma += q.decodMs;
+    j->cpuMs = cf->soma / j->cpuFeitos; j->cpuDecMs = cf->decSoma / j->cpuFeitos;
+    if (j->cpuFeitos <= 3 || j->cpuFeitos % 50 == 0) {
+      printf("[miniatura] cpu route: %ld s in %u ms (decode %u ms, keyframe %ld KB), %d made\n", p / 1000, q.totalMs,
+             q.decodMs, q.bytesPacote / 1024, j->cpuFeitos);
+      fflush(stdout);
+    }
+    guardarTileDireto(j, p, jpg, nj, &cf->feitosAqui);
+    if (j->cpuFeitos == CPU_AMOSTRAS && j->cpuMs > cf->limite) {
+      cf->desligar = 1;
+      printf("[miniatura] cpu route: %ld ms per thumbnail on this device (> %ld): off, hardware burst at the first pause/scrub\n",
+             j->cpuMs, cf->limite);
+      fflush(stdout);
+    }
+    // Full speed (30 ms between tiles, as Namer03's engine runs on TVs): no measured strain ever came from CPU
+    // decoding (23/10 runs: 0 underruns, 0 dropped frames; the hitches were hardware-decoder creation and GC). Half
+    // the frame's time as a rest only for a minute after real contention (dropped frames / audio underrun).
+    usleep(cf->cuidado ? (useconds_t)q.totalMs * 500 : 30000);
+  }
+  return NULL;
+}
+#endif
+
+// ---- PRE-WARM: the direct session and its hardware decoder while the title OPENS ----
+// The thumbnail job can only start once the player knows the duration, i.e. once playback runs (measured 23/10:
+// opened 13:53:37.7, playing 13:53:40.7, job 13:53:41.7): too late to create the decoder in silence. So the player
+// calls miniatura_preaquecer() while it opens; this thread opens the file and creates the decoder before the audio
+// starts, and trabalharDireto adopts the handle for the same link.
+static pthread_mutex_t muPre = PTHREAD_MUTEX_INITIALIZER;
+static char preUrl[4096];
+static long long preH;
+static int preDec, preRodando;
+typedef struct { char url[4096], cab[512]; } PreArgs;
+static void *preTrabalho(void *u) {
+  PreArgs *a = u;
+  Uint32 t0 = SDL_GetTicks();
+  long long h = mAbrirDireto(a->url, a->cab);
+  int dec = 0;
+  if (h && !video_tocando() && !video_falhou()) dec = mPrepararDecoder(h);
+  printf("[miniatura] pre-warm: file %s, hardware decoder %s (%u ms, playback %s)\n", h ? "open" : "not usable",
+         dec ? "created" : "not created", SDL_GetTicks() - t0, video_tocando() ? "running" : "not started yet");
+  fflush(stdout);
+  pthread_mutex_lock(&muPre);
+  if (!strcmp(preUrl, a->url) && !preH) { preH = h; preDec = dec; h = 0; }
+  preRodando = 0;
+  pthread_mutex_unlock(&muPre);
+  if (h) mFechar(h);
+  free(a);
+  return NULL;
+}
+void miniatura_preaquecer(const char *url, const char *cabecalhos) {
+  if (!url || strncmp(url, "http", 4)) return;
+  pthread_mutex_lock(&muPre);
+  if (preRodando || !strcmp(preUrl, url)) { pthread_mutex_unlock(&muPre); return; }
+  long long velho = preH;
+  preH = 0; preDec = 0;
+  snprintf(preUrl, sizeof preUrl, "%s", url);
+  pthread_mutex_unlock(&muPre);
+  if (velho) mFechar(velho);                    // a title that never started its job
+  if (bitsDebug() & 8 || !jniPreparar()) return;
+  PreArgs *a = calloc(1, sizeof *a);
+  if (!a) return;
+  snprintf(a->url, sizeof a->url, "%s", url);
+  snprintf(a->cab, sizeof a->cab, "%s", cabecalhos ? cabecalhos : "");
+  pthread_mutex_lock(&muPre); preRodando = 1; pthread_mutex_unlock(&muPre);
+  pthread_t t; pthread_attr_t at;
+  pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+  if (pthread_create(&t, &at, preTrabalho, a)) { free(a); pthread_mutex_lock(&muPre); preRodando = 0; pthread_mutex_unlock(&muPre); }
+  pthread_attr_destroy(&at);
+}
+// The pre-warmed session for this link (waits up to 5 s for one still being made); *dec = its decoder exists.
+static long long adotarPre(Job *j, int *dec) {
+  long long h = 0;
+  for (int i = 0; i < 50; i++) {
+    pthread_mutex_lock(&muPre);
+    int mesmo = !strcmp(preUrl, j->urlA), rodando = preRodando;
+    if (mesmo && !rodando && preH) { h = preH; *dec = preDec; preH = 0; }
+    pthread_mutex_unlock(&muPre);
+    if (!mesmo || !rodando || parou(j)) break;
+    dormir(j, 100);
+  }
+  return h;
+}
+
+// 1 = direct mode ran (whatever it made), 0 = the playing file cannot be used directly (the copy route then tries).
+static int trabalharDireto(Job *j, long long *hA) {
+  char motivo[96] = "";
+  int decPre = 0;
+  if (!*hA) *hA = adotarPre(j, &decPre);
+  if (*hA) { printf("[miniatura] direct: using the pre-warmed session (decoder %s)\n", decPre ? "ready" : "not created"); fflush(stdout); }
+  if (!*hA) *hA = mAbrirDireto(j->urlA, j->cabA);
+  if (!*hA) { printf("[miniatura] direct: the playing file cannot be used (see the engine log): trying the copies\n"); fflush(stdout); return 0; }
+  snprintf(origem, sizeof origem, "playing %dp (direct)", j->alturaA);
+  j->direto = 1;
+  snprintf(j->escolhida, sizeof j->escolhida, "playing file %dp (direct, GPU)", j->alturaA);
+  snprintf(j->arq, sizeof j->arq, "%s", j->arqDireto);
+  carregar(j);
+  falhasSeguidas = 0; decodSeguidas = 0;
+  long long perdAntes = mPerdidos();
+  Uint32 janela = SDL_GetTicks();
+  double folgaAntes = folgaSeg();
+  long long audioAntes = mAudioFalhas();
+  int decodificou = 0, vistoTocando = 0, nPend = 0, avisouEspera = 0, avisouGrade = 0;
+  // THE HARDWARE DECODER AS EARLY AS POSSIBLE: during the player's opening load, before its audio starts, the
+  // HDMI underrun that creating it causes (measured 23/10) falls into silence. Then every thumbnail goes through the
+  // hardware + GPU (~30/s) from the start, no scrub needed. Once playback runs, creation waits for a pause/scrub.
+  if (decPre) decodificou = 1;
+  else if (!video_tocando() && !video_falhou()) {
+    Uint32 c0 = SDL_GetTicks();
+    decodificou = mPrepararDecoder(*hA);
+    printf("[miniatura] direct: hardware decoder %s during the opening load (%u ms, playback %s)\n",
+           decodificou ? "created" : "NOT created", SDL_GetTicks() - c0, video_tocando() ? "had started" : "not started yet");
+  } else printf("[miniatura] direct: playback already running: hardware decoder at the first pause/scrub\n");
+  fflush(stdout);
+  Uint32 ultimaContencao = 0;
+  pthread_mutex_t mp = PTHREAD_MUTEX_INITIALIZER;   // the queue (pend/nPend), shared with the CPU thread
+#ifdef NV_MINI_FFMPEG
+  PerfilCpu pf;
+  perfilLer(&pf);
+  int classe = j->alturaA > 1080, cpuCod = -1, cpuRodando = 0;
+  pthread_t cpuT;
+  CpuFaixa cf;
+  memset(&cf, 0, sizeof cf);
+  long cpuLimite = classe ? CPU_MAX_MS_4K : CPU_MAX_MS_HD;
+  int cpuUsar = !(bitsDebug() & 32) && (pf.n[classe] < CPU_AMOSTRAS || pf.ms[classe] <= cpuLimite);
+  printf("[miniatura] cpu route: %s (device profile: %s %.0f ms over %d thumbnails)\n",
+         cpuUsar ? "on while playing" : "off on this device", classe ? ">1080p" : "<=1080p", pf.ms[classe], pf.n[classe]);
+  fflush(stdout);
+#endif
+  long *pend = malloc(sizeof(long) * (size_t)j->n);
+  if (!pend) { printf("[miniatura] direct: out of memory\n"); fflush(stdout); return 1; }
+  int etapaMax = 3, lotes = 0, feitosAqui = 0, erros0 = evErro;
+  j->tentado[0] = 1;                               // t = 0 is a black/logo frame that will not decode alone (measured 23/10)
+  long fila[LOTE];
+  printf("[miniatura] direct: thumbnails from the playing file, stages scrub > playhead > 60 s > 30 s > 10 s\n"); fflush(stdout);
+  while (!parou(j)) {
+    if (evErro != erros0) {                       // the player failed while we were decoding: never risk it again
+      snprintf(motivo, sizeof motivo, "player error during direct mode");
+      break;
+    }
+    // The decoder is KEPT through ordinary waits: creating a second 4K hardware decoder is what disturbed playback.
+    // Measured 23/10 on the Shield (TrueHD passthrough): HDMI audio underruns (nvaudio_hw) 0.35 s and 0.9 s after the
+    // thumbnail decoder was created, none while it decoded for minutes. Released only when the player is in trouble
+    // (reconnecting/failed), memory is at the floor, on contention, or at the end.
+    if (video_reconectando() || video_falhou()) { mSoltar(*hA); esperarPlayer(j); continue; }
+    if (bufferando || folgaBaixa()) { esperarPlayer(j); continue; }
+    long disp = memDisponivelKB();
+    if (disp >= 0 && (j->memMin < 0 || disp < j->memMin)) j->memMin = disp;
+    if (disp >= 0 && disp < PISO_KB) { mSoltar(*hA); dormir(j, 1500); continue; }
+    if (heapApertado(j)) { dormir(j, 1500); continue; }
+    // an audible gap while we work: back off at once, as for dropped frames
+    if (mAudioFalhas() != audioAntes) {
+      audioAntes = mAudioFalhas();
+      j->contencoes++; ultimaContencao = SDL_GetTicks();
+      printf("[miniatura] direct: player audio underrun while decoding: releasing the decoder, pause 20 s (%d/%d)\n",
+             j->contencoes, DIR_CONTENCOES_MAX);
+      fflush(stdout);
+      mSoltar(*hA);
+      if (j->contencoes >= DIR_CONTENCOES_MAX) { snprintf(motivo, sizeof motivo, "playback contention (audio)"); break; }
+      etapaMax = 3;
+#ifdef NV_MINI_FFMPEG
+      cf.pausa = 1;
+#endif
+      dormir(j, 20000);
+      audioAntes = mAudioFalhas(); perdAntes = mPerdidos(); janela = SDL_GetTicks(); folgaAntes = folgaSeg();
+      continue;
+    }
+    // contention: the player dropping frames while we decode
+    if (SDL_GetTicks() - janela >= 10000u) {
+      long long agora = mPerdidos(), d = agora - perdAntes;
+      double f = folgaSeg();
+      int caindo = f >= 0 && folgaAntes >= 0 && folgaAntes - f >= 3.0 && f < folgaQuer(8.0, 0.6);   // draining while we read
+      perdAntes = agora; janela = SDL_GetTicks(); folgaAntes = f;
+      // a buffer dip alone is logged, not counted: on a 4K remux the seconds swing with the bitrate under the player's
+      // 80 MB cap (measured 23/10: "draining" at 6-8 s with 0 dropped frames stopped the 10 s grid for the film)
+      if (caindo && d < DIR_CONTENCAO_QUADROS && !scrubbing) printf("[miniatura] direct: player buffer dipped to %.1f s (not counted)\n", f);
+      if (d >= DIR_CONTENCAO_QUADROS && !scrubbing) {
+        j->contencoes++; ultimaContencao = SDL_GetTicks();
+        printf("[miniatura] direct: %s while decoding: releasing the decoder, pause 20 s (%d/%d)\n",
+               caindo ? "player buffer draining" : "player dropping frames", j->contencoes, DIR_CONTENCOES_MAX);
+        printf("[miniatura] direct: dropped %lld frames in 10 s, buffer %.1f s\n", d, f);
+        fflush(stdout);
+        mSoltar(*hA);
+        if (j->contencoes >= DIR_CONTENCOES_MAX) { snprintf(motivo, sizeof motivo, "playback contention"); break; }
+        etapaMax = 3;
+  #ifdef NV_MINI_FFMPEG
+      cf.pausa = 1;
+#endif
+      dormir(j, 20000);
+        perdAntes = mPerdidos(); janela = SDL_GetTicks(); folgaAntes = folgaSeg();
+        continue;
+      }
+    }
+    // may the decoder exist now? once created it stays; before that only while paused or scrubbing/seeking (after
+    // playback was seen running, so never during the player's own start-up)
+    if (video_tocando() && !scrubbing && !bufferando) vistoTocando = 1;
+    int liberado = decodificou || (vistoTocando && (!video_tocando() || scrubbing || bufferando));
+    if (liberado && nPend > 0) {
+      // the queued keyframe nearest to where the user is (scrub target, else the playhead) first
+      long onde = scrubbing ? posMs : playheadMs, melhor = -1;
+      int iM = 0;
+      pthread_mutex_lock(&mp);
+      if (nPend <= 0) { pthread_mutex_unlock(&mp); continue; }
+      for (int i = 0; i < nPend; i++) { long d = labs(pend[i] - onde); if (melhor < 0 || d < melhor) { melhor = d; iM = i; } }
+      long kf = pend[iM];
+      pend[iM] = pend[--nPend];
+      pthread_mutex_unlock(&mp);
+      if (!decodificou) { printf("[miniatura] direct: %s: creating the decoder, %d keyframes queued\n", scrubbing ? "scrubbing" : !video_tocando() ? "paused" : "seeking", nPend + 1); fflush(stdout); }
+      long p; unsigned char *jpg = NULL; int nj = 0;
+      int ok = mQuadroDireto(*hA, kf, &p, &jpg, &nj);
+      decodificou = 1;
+      if (falhou(j, ok, *hA)) { free(jpg); snprintf(motivo, sizeof motivo, "reads/decodes failing"); break; }
+      if (ok && jpg) {
+        int dest = (int)((p + GRADE_MS / 2) / GRADE_MS);
+        pthread_mutex_lock(&mu);
+        if (dest >= 0 && dest < j->n && !j->tiles[dest].jpg) {
+          j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; jpg = NULL;
+          j->tentado[dest] = 1; j->feitos++; feitosAqui++;
+          if (!j->primeiro) j->primeiro = SDL_GetTicks();
+          if (job == j) estado = M_PRONTO;
+        }
+        if (!j->cob60 && !restamNaEtapa(j, 6)) j->cob60 = SDL_GetTicks();
+        if (!j->cob30 && !restamNaEtapa(j, 3)) j->cob30 = SDL_GetTicks();
+        pthread_mutex_unlock(&mu);
+      }
+      free(jpg);
+      if (feitosAqui && feitosAqui % 10 == 0) {
+        printf("[miniatura] direct: %d/%d tiles, %d queued, %d batches, buffered %.1f s, dropped +%lld, heap free %ld MB, pace %lld/s\n",
+               j->feitos, j->n, nPend, lotes, folgaSeg(), mPerdidos() - j->perdidos0, mHeapLivre(), mRitmo());
+        fflush(stdout);
+      }
+      if (feitosAqui && feitosAqui % 50 == 0) salvar(j, 0);
+      if (j->cob30 && !j->resumido) resumo(j, j->t0);
+      continue;
+    }
+#ifdef NV_MINI_FFMPEG
+    // the CPU thread works only while the film plays and the hardware decoder does not exist
+    cf.pausa = liberado || scrubbing || bufferando || !video_tocando();
+    cf.cuidado = j->contencoes && SDL_GetTicks() - ultimaContencao < 60000u;
+    if (cf.recusou) { snprintf(motivo, sizeof motivo, "source refused a connection"); break; }
+    if (!cpuRodando && cpuUsar && nPend > 0) {
+      if (cpuCod < 0) cpuCod = mCodecCpu(*hA);
+      if (cpuCod > 0) {
+        long long inf[6]; char e[96] = "";
+        mInfo(*hA, inf);
+        cf.cpu = mini_motor_abrir_pacotes(cpuCod == 1, (int)inf[1], (int)inf[2], inf[3] != 0, e, sizeof e);
+        if (cf.cpu) {
+          cf.j = j; cf.h = *hA; cf.pend = pend; cf.nPend = &nPend; cf.mp = &mp; cf.limite = cpuLimite;
+          // 2 slice/WPP threads for pictures above 1080p (Shield: one A57 core took ~400 ms per 4K keyframe; x265
+          // streams are WPP-coded, so rows decode in parallel), 1 below (~95 ms already)
+          cf.threads = classe ? 2 : 1;
+          cpuRodando = pthread_create(&cpuT, NULL, cpuTrabalho, &cf) == 0;
+        }
+        printf("[miniatura] cpu route: %s%s\n", cpuRodando ? "thread started" : "not available ", cpuRodando ? "" : e); fflush(stdout);
+      } else printf("[miniatura] cpu route: this file's blocks cannot be taken directly (hardware burst only)\n");
+      fflush(stdout);
+      if (!cpuRodando) cpuUsar = 0;
+    }
+    if (j->cob30 && !j->resumido) resumo(j, j->t0);
+#endif
+    if (!liberado && nPend >= DIR_PENDENTES_MAX) {   // enough downloaded: wait for a pause/scrub
+      if (!avisouEspera) { printf("[miniatura] direct: %d keyframes downloaded, decoding at the first pause/scrub\n", nPend); fflush(stdout); avisouEspera = 1; }
+      dormir(j, 500);
+      continue;
+    }
+    // claim a batch of distinct keyframes
+    int nf = 0, etapa = 9;
+    int quer = scrubbing ? 2 : mLote(*hA);
+    pthread_mutex_lock(&mu);
+    while (nf < quer) {
+      int e, k = proximoDireto(j, etapaMax, &e);
+      if (k < 0) break;
+      j->tentado[k] = 1;
+      pthread_mutex_unlock(&mu);
+      long kf = mKeyframe(*hA, k * GRADE_MS);      // first call loads the index (one read of the Cues)
+      pthread_mutex_lock(&mu);
+      if (kf < 0) kf = k * GRADE_MS;
+      int dest = (int)((kf + GRADE_MS / 2) / GRADE_MS), repetido = dest >= 0 && dest < j->n && j->tiles[dest].jpg != NULL;
+      for (int i = 0; i < nf && !repetido; i++) repetido = fila[i] == kf;
+      pthread_mutex_lock(&mp);
+      for (int i = 0; i < nPend && !repetido; i++) repetido = pend[i] == kf;
+      pthread_mutex_unlock(&mp);
+      if (repetido) continue;                     // same random-access frame as one made or queued
+      if (e < etapa) etapa = e;
+      fila[nf] = kf; nf++;
+      if (e <= 1 && nf >= 2) break;               // near targets: small batches, quick answers
+    }
+    pthread_mutex_unlock(&mu);
+    if (!nf) {
+      if (nPend > 0 && etapaMax >= 4) {             // everything downloaded: the queue waits for the decoder (or the CPU)
+        if (!liberado && !avisouEspera && nPend > 0) {
+          printf("[miniatura] direct: %d keyframes downloaded, decoding at the first pause/scrub\n", nPend); fflush(stdout); avisouEspera = 1;
+        }
+        dormir(j, 500);
+        continue;
+      }
+      // nothing open up to this stage: the 10 s grid only with headroom, else wait for scrubbing/headroom
+      double folga = folgaSeg();
+      // the 10 s grid is DOWNLOADED while playing too (no decoder needed for that); decoded at the first pause/scrub
+      // (memory: 100 MB above the floor; 2x the floor never held on the Shield during 4K playback, 23/10: ~400-500 MB free)
+      int memOk = disp < 0 || disp > PISO_KB + 100L * 1024, folgaOk = folga < 0 || folga >= folgaQuer(8.0, 0.7);
+      int quieto = !j->contencoes || SDL_GetTicks() - ultimaContencao > 60000u;   // 60 s without contention
+      if (etapaMax < 4 && quieto && folgaOk && memOk) {
+        etapaMax = 4;
+        printf("[miniatura] direct: headroom (%.0f s buffered, %ld MB free): refining to the 10 s grid\n", folga, disp / 1024); fflush(stdout);
+        continue;
+      }
+      if (etapaMax >= 4) break;                   // everything made
+      if (!avisouGrade) {                         // never a silent stall
+        printf("[miniatura] direct: 10 s grid waiting (%s%s%s)\n", !quieto ? "playback contention in the last minute " : "",
+               folgaOk ? "" : "player buffer low ", memOk ? "" : "memory low");
+        fflush(stdout);
+        avisouGrade = 1;
+      }
+      dormir(j, 3000);                            // the decoder stays: waiting for a scrub or for headroom
+      continue;
+    }
+    esperarFolga(j);
+    if (nf > 1) {
+      int r = mPreparar(*hA, fila, nf);
+      if (r == -2) { snprintf(motivo, sizeof motivo, "source refused a connection"); break; }
+      if (r >= 0) lotes++;
+    }
+    pthread_mutex_lock(&mp);
+    for (int i = 0; i < nf; i++) pend[nPend++] = fila[i];
+    pthread_mutex_unlock(&mp);
+    if (j->cob30 && !j->resumido) resumo(j, j->t0);   // a SUMMARY once the film has 30 s coverage (another at the end)
+  }
+#ifdef NV_MINI_FFMPEG
+  if (cpuRodando) { cf.fim = 1; pthread_join(cpuT, NULL); }
+  if (cf.cpu) mini_motor_fechar(cf.cpu);
+#endif
+  free(pend);
+#ifdef NV_MINI_FFMPEG
+  if (j->cpuFeitos >= CPU_AMOSTRAS) {
+    int n = pf.n[classe] > 200 ? 200 : pf.n[classe];
+    pf.ms[classe] = (pf.ms[classe] * n + (double)j->cpuMs * j->cpuFeitos) / (n + j->cpuFeitos);
+    pf.n[classe] = n + j->cpuFeitos;
+    perfilGravar(&pf);
+    printf("[miniatura] cpu route: %d thumbnails, %ld ms each (decode %ld ms); device profile now %.0f ms over %d\n",
+           j->cpuFeitos, j->cpuMs, j->cpuDecMs, pf.ms[classe], pf.n[classe]);
+    fflush(stdout);
+  }
+#endif
+  mSoltar(*hA);
+  pthread_mutex_lock(&mu);
+  int e, completo = etapaMax >= 4 && proximoDireto(j, 4, &e) < 0 && !parou(j);
+  pthread_mutex_unlock(&mu);
+  salvar(j, completo);                             // sparse coverage is saved as NOT complete
+  if (completo) avisoPronto = j->g;
+  printf("[miniatura] direct: done, %d/%d tiles%s%s\n", j->feitos, j->n, motivo[0] ? ", stopped: " : "", motivo); fflush(stdout);
+  j->resumido = 0;
+  return 1;
+}
+
 static void *trabalhar(void *u) {
   Job *j = u;
   long long hA = 0, hB = 0, info[6];
@@ -1160,9 +1852,36 @@ static void *trabalhar(void *u) {
   Uint32 t0 = SDL_GetTicks();
   falhasSeguidas = 0; decodSeguidas = 0;
   mContadores(j->cont0);
+  mDiag(1, NULL, 0);
+  int bits = bitsDebug();
+  mConfigurar(bits);
+  j->t0 = t0;
+  evRebuffer = evErro = 0;
+  j->perdidos0 = mPerdidos();                   // (before any branch: the forced-direct one returned before these)
+  j->audio0 = mAudioFalhas();
+  j->memMin = memDisponivelKB();
+  j->heapMin = 100000;
+  // DIRECT MODE FIRST, at any resolution (bit 8 of debug.nuvio.miniatura turns it off). Decided 23/10 with the user
+  // after the Shield runs: no copy check (30 s-2 min, wrong versions), frames of the very file playing, no audio
+  // underruns (decoder only from the first pause/scrub), ~4-6 thumbnails/s on 4K; the copy route created hardware
+  // decoders for HEVC copies (HDMI underruns, ~1.5/s). The copies remain the fallback when the playing file cannot be
+  // used directly (Dolby Vision profile 5, a codec other than H.264/HEVC). The 22/10 failure next to a 1080p remux
+  // (player decoder 4003) came from a burst of short-lived decoders; direct mode keeps ONE, created at a pause/scrub.
+  int diretoOk = !(bits & 8), diretoTentado = 0;
+  if (diretoOk) {
+    diretoTentado = 1;                           // no esperarPlayer: the decoder goes in during the opening load
+    if (trabalharDireto(j, &hA)) goto fim;
+    if (hA) { mFechar(hA); hA = 0; }
+  }
   evRebuffer = evErro = 0;
   if (j->arq[0]) limparCache(j->arq);           // other titles' sets older than 2 h go now
   if (carregar(j)) goto fim;                    // a complete saved set: no network at all
+  if (j->nCopias == 0 && diretoOk && !diretoTentado) {
+    printf("[miniatura] no smaller copy in the list: direct mode\n"); fflush(stdout);
+    esperarPlayer(j);
+    trabalharDireto(j, &hA);
+    goto fim;
+  }
   if (j->nCopias == 0) {                        // nothing smaller to make them from: the playing file is not opened
     printf("[miniatura] no smaller copy in the list: no thumbnails for this title\n"); fflush(stdout);
     pthread_mutex_lock(&mu); if (job == j) { estado = M_FALHOU; motivoSem = 1; } pthread_mutex_unlock(&mu);
@@ -1282,6 +2001,12 @@ static void *trabalhar(void *u) {
   }
   // Never thumbnails from the PLAYING file, at any resolution: decoding the very video the player decodes is what
   // preceded the player's own decoder failing (4003) and the source switches (22/10, a 1080p remux episode).
+  if (!usaB && diretoOk && !diretoTentado && !parou(j)) {
+    printf("[miniatura] no copy passed the check: direct mode\n"); fflush(stdout);
+    if (hA) { mFechar(hA); hA = 0; }             // the check's session (no batches, CPU decoder): a fresh direct one
+    trabalharDireto(j, &hA);
+    goto fim;
+  }
   if (!usaB) {
     printf("[miniatura] no copy passed the check: stopping (thumbnails are never made from the playing file)\n");
     fflush(stdout);
@@ -1509,7 +2234,8 @@ static void pPedir(const SeekrFonte *f) {
   j->tentado = calloc((size_t)j->n, 1);
   if (!j->tiles || !j->tentado) { free(j->tiles); free(j->tentado); free(j); return; }
   snprintf(j->urlA, sizeof j->urlA, "%s", f->url);
-  chaveArquivo(f, j->arq, sizeof j->arq);
+  chaveArquivo(f, j->arq, sizeof j->arq, "");
+  chaveArquivo(f, j->arqDireto, sizeof j->arqDireto, "direct-gpu-kf1");
   snprintf(j->cabA, sizeof j->cabA, "%s", f->cabecalhos ? f->cabecalhos : "");
   const Stream *st = stream_item(stream_atual());
   j->alturaA = st ? st->altura : 0;

@@ -30,4 +30,7 @@
 const SeekrProvedor *miniatura_provedor(void);
 // 1 for 4 s after the playing title's set completed: the player shows "Miniaturas geradas" in its pill.
 int miniatura_prontas_agora(void);
+// The player is OPENING a title (link known, not ready yet): open the file and create the thumbnail hardware decoder
+// now, before the audio starts (creating it later causes an audible HDMI underrun). Cheap to call every frame.
+void miniatura_preaquecer(const char *url, const char *cabecalhos);
 #endif

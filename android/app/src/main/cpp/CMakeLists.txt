@@ -10,6 +10,7 @@ set(NUVIO_RAIZ "" CACHE PATH "raiz do repositorio")
 set(NUVIO_SDL_SRC "$ENV{HOME}/.cache/nuvio-android/src" CACHE PATH "fontes do SDL")
 set(NUVIO_ENV_CMAKE "" CACHE FILEPATH "chaves -D geradas por tools/android.sh (fora do git)")
 set(NUVIO_P2P_MOTOR "" CACHE PATH "motor P2P de tools/p2p-motor/build-android.sh (vazio = sem motor)")
+set(NUVIO_MINI_FFMPEG "" CACHE PATH "pasta <abi>/{include,lib} de tools/android/ffmpeg-miniaturas.sh (vazio = sem a rota de CPU das miniaturas)")
 set(NUVIO_RUST_MKVCORE "" CACHE PATH "pasta <abi>/libmkvcore.a de tools/rust-mkvcore.sh --android (vazio = nucleo C)")
 
 set(SDL_DIR   "${NUVIO_SDL_SRC}/SDL2-2.30.9")
@@ -152,6 +153,16 @@ target_link_options(main PRIVATE "-Wl,--wrap=pthread_create" "-Wl,--wrap=fclose"
 
 # Nucleo EBML/NAL do mkv.c em Rust (piloto, docs/plans/rust-mapa.md): so com a
 # pasta informada; vazio = o caminho C de sempre.
+# Rota de CPU das miniaturas feitas no aparelho (src/miniatura_motor.c, motor do Namer03 com FFmpeg so de miniaturas).
+if(NUVIO_MINI_FFMPEG AND EXISTS "${NUVIO_MINI_FFMPEG}/${ANDROID_ABI}/lib/libavcodec.a")
+  set(MINI_FF "${NUVIO_MINI_FFMPEG}/${ANDROID_ABI}")
+  target_include_directories(main PRIVATE "${MINI_FF}/include")
+  target_compile_definitions(main PRIVATE NV_MINI_FFMPEG)
+  target_link_libraries(main PRIVATE "${MINI_FF}/lib/libavformat.a" "${MINI_FF}/lib/libavcodec.a" "${MINI_FF}/lib/libavutil.a" z m)
+elseif(NUVIO_MINI_FFMPEG)
+  message(WARNING "NUVIO_MINI_FFMPEG sem ${ANDROID_ABI}: miniaturas sem a rota de CPU")
+endif()
+
 if(NUVIO_RUST_MKVCORE)
   set(RUST_MKV_LIB "${NUVIO_RUST_MKVCORE}/${ANDROID_ABI}/libmkvcore.a")
   if(NOT EXISTS "${RUST_MKV_LIB}")

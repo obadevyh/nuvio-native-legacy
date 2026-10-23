@@ -635,6 +635,7 @@ void seekr_usar_provedor(const SeekrProvedor *p) {
   __atomic_store_n(&alt, p, __ATOMIC_RELEASE);
 }
 int seekr_provedor_alternativo(void) { return ALT() != NULL; }
+int seekr_provedor_e(const SeekrProvedor *p) { return p && ALT() == p; }
 void seekr_pedir_fonte(const SeekrFonte *f) {
   const SeekrProvedor *a = ALT();
   if (!f) return;

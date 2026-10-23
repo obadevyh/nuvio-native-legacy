@@ -123,5 +123,6 @@ typedef struct {
 // NULL volta ao Seekr. Trocar de provedor desliga o anterior.
 void seekr_usar_provedor(const SeekrProvedor *p);
 int  seekr_provedor_alternativo(void);
+int  seekr_provedor_e(const SeekrProvedor *p);   // 1 when p is the active alternative provider
 void seekr_pedir_fonte(const SeekrFonte *f);
 #endif

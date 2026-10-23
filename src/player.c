@@ -4651,6 +4651,9 @@ void player_atualizar(float dt, Uint32 agora) {
       durFonteAtualizar(d, agora);
     }
     durFonteContagem(agora);
+    // MINIATURAS NO APARELHO: enquanto o titulo ABRE (antes do audio), o decoder das miniaturas ja nasce.
+    if (!video_pronto() && !ehCanal() && ajustes_seekr_ligado() && seekr_provedor_e(miniatura_provedor()))
+      miniatura_preaquecer(video_url_atual(), video_cabecalhos());
     // MINIATURAS DO SEEKR: so com a duracao REAL (o servico escolhe a versao
     // da folha por ela) e uma vez por titulo — seekr_pedir ignora o repetido.
     if (d > 60.0 && video_pronto() && !ehCanal() && ajustes_seekr_ligado()) {

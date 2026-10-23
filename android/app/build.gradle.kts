@@ -44,6 +44,9 @@ android {
                     "-DNV_VERSAO_APP=$versao",   // a versao COMPILADA vem sempre do appinfo.json (o arquivo de chaves pode estar velho)
                     "-DNUVIO_P2P_MOTOR=${(findProperty("nuvio.p2pMotor") as String?) ?: ""}",
                     "-DNUVIO_RUST_MKVCORE=${(findProperty("nuvio.rustMkvcore") as String?) ?: ""}",
+                    // FFmpeg so das miniaturas (tools/android/ffmpeg-miniaturas.sh); sem a pasta, a rota de CPU fica de fora
+                    "-DNUVIO_MINI_FFMPEG=${(findProperty("nuvio.miniFfmpeg") as String?)
+                        ?: File(System.getProperty("user.home"), ".cache/nuvio-android/mini-ffmpeg").takeIf { it.isDirectory }?.path?.replace('\\', '/') ?: ""}",
                 )
                 arguments += "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
             }

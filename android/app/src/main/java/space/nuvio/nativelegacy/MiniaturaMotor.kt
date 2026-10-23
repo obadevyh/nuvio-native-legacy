@@ -3,12 +3,14 @@ package space.nuvio.nativelegacy
 import android.graphics.Bitmap
 import android.media.Image
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaDataSource
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.util.Log
 import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
@@ -67,20 +69,125 @@ object MiniaturaMotor {
         // 22/10, an H.264 copy read ~0.5 MB per thumbnail for ~0.2 MB keyframes. A bigger keyframe costs one more
         // small request, never a wrong frame. +64 KB of margin for the block headers around it.
         private var media = 0
+        var direto = false    // the PLAYING file read for direct thumbnails: batches allowed, socket closed after each
+            private set
+        fun modoDireto() { direto = true; janela = 1 shl 20; limite = 16L shl 20 }   // a ~4 MB batch must fit whole
+        // a small read just past a cached range in direct mode (a block header, the rest of a keyframe): 256 KB, not a
+        // whole keyframe window
+        var fimAtual = -1L                              // block end of the keyframe being decoded (direct mode), -1 unknown
+        private fun janelaFalta(p: Long, len: Int): Int {
+            if (direto && fase != F_EXATO && fimAtual > p) return (fimAtual + margem - p).coerceIn(16L * 1024, 8L shl 20).toInt()
+            return if (direto && fase != F_EXATO && len <= 64 * 1024 && segs.any { it.first + it.second.size == p || p - (it.first + it.second.size) in 0..65536 }) 256 * 1024 else janela
+        }   // batches of ~8 MB must fit whole
         fun ajustarJanela(amostra: Int) {
             somaKf += amostra; nKf++
+            if (direto) {
+                // The window must hold the keyframe AND the next block's header: Android's Matroska parser reads it
+                // right after the keyframe (measured 23/10, 4K remux: a 2 KB read just past a 512 KB window on most
+                // thumbnails, one extra request each). The typical keyframe x 1.4 + 256 KB, 768 KB-4 MB.
+                media = if (media == 0) amostra else (media * 7 + amostra) / 8
+                janela = (media * 14 / 10 + 256 * 1024).coerceIn(768 * 1024, 4 shl 20)
+                return
+            }
             if (!manter || tamanho > (8L shl 30)) return
             media = if (media == 0) amostra else (media * 7 + amostra) / 8
             janela = (media * 13 / 10 + 64 * 1024).coerceIn(128 * 1024, 384 * 1024)
         }
         // keyframes per multi-range request: as many as ~4 MB of windows (4-32)
-        fun loteIdeal(): Int = ((4 shl 20) / janela).coerceIn(4, 32)
+        // direct mode with exact block ranges: ~6 MB of keyframes per request (round trips were the limit once only the
+        // keyframes were fetched: 2.8 keyframes per request, measured 23/10)
+        fun loteIdeal(): Int = if (direto && nalTam > 0 && media > 0) ((8 shl 20) / media).coerceIn(4, 16)
+            else if (direto) ((4 shl 20) / janela).coerceIn(2, 5) else ((4 shl 20) / janela).coerceIn(4, 32)
 
+        // METADATA IS NEVER EVICTED: the header read when the file opens and the Cues (the keyframe index, usually at
+        // the END of the file). Android's Matroska parser loads cue points lazily, a little further on each seek;
+        // measured 23/10 (Bond copy): with the index evicted by the LRU, every seek re-read it, one extra request each.
+        // Pinned: what the extractor reads while opening, anything inside the Cues element once it is known, and what
+        // continues a pinned range in the last 10 % of the file (the index read on). At most 8 MB.
+        private val fixos = ArrayList<Pair<Long, ByteArray>>()
+        private var fixosBytes = 0L
+        private var cuesIni = -1L; private var cuesFim = -1L
+        private fun fixar(a: Long, n: Int): Boolean {
+            if (fixosBytes + n > (8L shl 20)) return false
+            if (fase == F_META) return true
+            if (cuesIni >= 0 && a >= cuesIni && a < cuesFim) return true
+            return tamanho > 0 && a >= tamanho / 10 * 9 && fixos.any { it.first + it.second.size == a }
+        }
         private fun guardar(a: Long, d: ByteArray) {
+            if (fixar(a, d.size)) { fixos.add(a to d); fixosBytes += d.size; diagCache(this); return }
             segs.add(a to d); guardados += d.size
             while (guardados > limite && segs.size > 1) guardados -= segs.removeAt(0).second.size
+            diagCache(this)
         }
-        private fun temByte(p: Long) = segs.any { p >= it.first && p < it.first + it.second.size }
+        private fun temByte(p: Long) = segs.any { p >= it.first && p < it.first + it.second.size } ||
+            fixos.any { p >= it.first && p < it.first + it.second.size }
+
+        // ---- READ DIAGNOSTICS (counters in D, bounded detail lines): what each network fetch was for ----
+        @Volatile var fase = F_META           // set by quadro/quadroExato around the extractor's calls
+        @Volatile var alvoMs = -1L            // the time the current seek asked for
+        var cacheBytes = 0L                   // what this source holds (the engine's peak is summed over sources)
+        private val baixados = ArrayList<LongArray>()   // every byte range fetched, merged [a, b): unique vs repeated
+        fun registrarBaixa(a: Long, n: Int) {
+            var b = a + n; var novo = n.toLong(); var i = 0
+            var ini = a
+            while (i < baixados.size) {
+                val r = baixados[i]
+                if (r[1] < ini) { i++; continue }
+                if (r[0] > b) break
+                novo -= maxOf(0L, minOf(r[1], a + n) - maxOf(r[0], a))
+                ini = minOf(ini, r[0]); b = maxOf(b, r[1])
+                baixados.removeAt(i)
+            }
+            baixados.add(i, longArrayOf(ini, b))
+            D.addAndGet(D_UNICOS, novo); D.addAndGet(D_REPETIDOS, n - novo)
+        }
+        private fun jaBaixado(p: Long) = baixados.any { p >= it[0] && p < it[1] }
+        // Index of the cue whose cluster holds byte p (largest cluster start <= p); -1 without an index.
+        private fun cueDe(p: Long): Int {
+            val c = cues ?: return -1
+            var k = -1
+            for (i in 0 until c.size / 3) if (c[i * 3 + 1] <= p && (k < 0 || c[i * 3 + 1] >= c[k * 3 + 1])) k = i
+            return k
+        }
+        // Cue picked for time tMs: at-or-before (what Android's MatroskaExtractor seeks to, whatever the mode) or closest.
+        fun cueParaTempo(tMs: Long, maisPerto: Boolean): Int {
+            val c = cues ?: return -1
+            val n = c.size / 3
+            val tNs = tMs * 1_000_000L
+            var lo = 0; var hi = n - 1
+            while (lo < hi) { val mid = (lo + hi + 1) / 2; if (c[mid * 3] <= tNs) lo = mid else hi = mid - 1 }
+            if (!maisPerto) return lo
+            if (c[lo * 3] > tNs) return lo
+            return if (lo + 1 < n && c[(lo + 1) * 3] - tNs < tNs - c[lo * 3]) lo + 1 else lo
+        }
+        // A network fetch for an extractor read (not a batch): counted by purpose, the first few per title in detail.
+        private fun diagFalta(p: Long, pos: Long, len: Int) {
+            val parcial = p != pos
+            D.incrementAndGet(D_FASE0 + fase)
+            if (jaBaixado(p)) D.incrementAndGet(D_EVICTED)
+            val k = cueDe(p)
+            val c = cues
+            var cueTxt = "no-index"
+            if (c != null && k >= 0) {
+                val antes = if (alvoMs >= 0) cueParaTempo(alvoMs, false) else -1
+                val perto = if (alvoMs >= 0) cueParaTempo(alvoMs, true) else -1
+                if ((fase == F_SEEK || fase == F_AMOSTRA) && !parcial && k == antes && antes != perto) D.incrementAndGet(D_CUE_ANTES)
+                cueTxt = "cue#$k t=${c[k * 3] / 1_000_000}ms cluster=${c[k * 3 + 1]} rel=${c[k * 3 + 2]} at+${p - c[k * 3 + 1]}" +
+                    " | wanted ${alvoMs}ms: previous cue#$antes closest cue#$perto"
+            }
+            if (D.incrementAndGet(D_DETALHES) > 40) return
+            var dist = Long.MAX_VALUE; var perto = "none"
+            for (s in segs + fixos) {
+                val a = s.first; val b = a + s.second.size
+                val d = if (p < a) a - p else if (p >= b) p - b + 1 else 0
+                if (d < dist) { dist = d; perto = "$a-$b" }
+            }
+            Log.i(TAG, "fetch[${D.get(D_DETALHES)}] ${FASES[fase]} ${if (parcial) "partial" else "miss"} read $pos+$len, missing from $p" +
+                " | nearest cached $perto (${if (dist == Long.MAX_VALUE) "-" else "${dist / 1024} KB away"})" +
+                " | fetched before: ${jaBaixado(p)} | window ${janela / 1024} KB | $cueTxt")
+        }
+        fun soltarCache() { segs.clear(); guardados = 0; fixos.clear(); fixosBytes = 0; diagCache(this); fecharDisco() }
+        fun guardadosAgora() = guardados + fixosBytes
 
         // ---- MULTI-RANGE BATCHES (measured 22/10 on TorBox's Nexus servers: one GET with 8 ranges came back as a
         // 206 multipart/byteranges with all 8 parts in 373 ms, vs ~190 ms for EACH single range) ----
@@ -112,6 +219,33 @@ object MiniaturaMotor {
 
         // Segment -> SeekHead -> Cues (+ Info's TimestampScale, Tracks' video track number). Null when not Matroska
         // or anything is unexpected: the batches are then simply not used.
+        // Time (ms) of the keyframe the extractor lands on for tMs (the cue at or before it); -1 without an index.
+        fun keyframeMs(tMs: Long): Long {
+            val c = carregarCues() ?: return -1
+            return c[cueParaTempo(tMs, false) * 3] / 1_000_000L
+        }
+
+        // Dolby Vision configuration in the Matroska track header (BlockAdditionMapping dvcC/dvvC): profile x 16 +
+        // base-layer compatibility id, or -1 when there is none. Android 11's extractor does not report it (the track is
+        // plain video/hevc), so a profile 5 file (IPT, no HDR10 base) would decode to green/purple pictures unnoticed.
+        fun perfilDv(): Int {
+            val h = ler(0, 256 * 1024) ?: return -1
+            for (i in 0 until h.size - 12) {
+                if (h[i] != 'd'.code.toByte() || h[i + 1] != 'v'.code.toByte() || (h[i + 2] != 'c'.code.toByte() && h[i + 2] != 'v'.code.toByte()) ||
+                    h[i + 3] != 'C'.code.toByte()) continue
+                for (k in i + 4 until minOf(h.size - 8, i + 48)) {
+                    if (h[k] != 0x41.toByte() || h[k + 1] != 0xED.toByte()) continue
+                    val (n, l) = vint(h, k + 2, false) ?: break
+                    val d = k + 2 + l
+                    if (n < 5 || d + 5 > h.size) break
+                    val perfil = (h[d + 2].toInt() and 0xff) shr 1
+                    val compat = (h[d + 4].toInt() and 0xff) shr 4
+                    return perfil * 16 + compat
+                }
+            }
+            return -1
+        }
+
         private fun carregarCues(): LongArray? {
             if (cuesTentado) return cues
             cuesTentado = true
@@ -150,7 +284,7 @@ object MiniaturaMotor {
                     j = kfim
                 }
                 if (cuesPos < 0) return null
-                var escala = 1_000_000L
+                var escala = 1_000_000L   // ns per Matroska tick
                 if (infoPos >= 0) ler(infoPos, 4096)?.let { b ->
                     val (_, i0) = vint(b, 0, true) ?: return@let
                     val (isz, i1) = vint(b, i0, false) ?: return@let
@@ -172,14 +306,30 @@ object MiniaturaMotor {
                         val (esz, e1) = vint(b, k + e0, false) ?: break
                         if (eid == 0xAEL) {
                             var m = k + e0 + e1; var num = -1L; var tipo = -1L
+                            var codec = ""; var priv: ByteArray? = null; var cod = false
                             while (m < k + e0 + e1 + esz.toInt() && m < b.size) {
                                 val (fid, f0) = vint(b, m, true) ?: break
                                 val (fsz, f1) = vint(b, m + f0, false) ?: break
-                                if (fid == 0xD7L) num = uint(b, m + f0 + f1, fsz.toInt())
-                                if (fid == 0x83L) tipo = uint(b, m + f0 + f1, fsz.toInt())
-                                m += f0 + f1 + fsz.toInt()
+                                val d0 = m + f0 + f1
+                                if (fid == 0xD7L) num = uint(b, d0, fsz.toInt())
+                                if (fid == 0x83L) tipo = uint(b, d0, fsz.toInt())
+                                if (fid == 0x86L && d0 + fsz <= b.size) codec = String(b, d0, fsz.toInt(), Charsets.ISO_8859_1)
+                                if (fid == 0x63A2L && d0 + fsz <= b.size) priv = b.copyOfRange(d0, d0 + fsz.toInt())
+                                if (fid == 0x6D80L) cod = true          // ContentEncodings: header stripping/compression
+                                m += d0 - m + fsz.toInt()
                             }
-                            if (tipo == 1L) trilhaVideo = num
+                            if (tipo == 1L) {
+                                trilhaVideo = num
+                                trilhaV = num
+                                val pv = priv
+                                nalTam = when {
+                                    cod || pv == null -> 0
+                                    codec.startsWith("V_MPEGH/ISO/HEVC") && pv.size > 22 -> (pv[21].toInt() and 3) + 1
+                                    codec.startsWith("V_MPEG4/ISO/AVC") && pv.size > 5 -> (pv[4].toInt() and 3) + 1
+                                    else -> 0
+                                }
+                                Log.i(TAG, "video track $num: $codec, ${if (nalTam > 0) "NAL length $nalTam: keyframes decoded straight from their blocks" else "blocks not usable directly${if (cod) " (content encoding)" else ""}"}")
+                            }
                         }
                         k += e0 + e1 + esz.toInt()
                     }
@@ -188,6 +338,7 @@ object MiniaturaMotor {
                 val (cid, c0) = vint(ch, 0, true) ?: return null
                 val (csz, c1) = vint(ch, c0, false) ?: return null
                 if (cid != 0x1C53BB6BL || csz <= 0 || csz > (16L shl 20)) return null
+                cuesIni = cuesPos; cuesFim = cuesPos + c0 + c1 + csz
                 val b = ler(cuesPos + c0 + c1, csz.toInt()) ?: return null
                 val out = ArrayList<Long>()
                 var k = 0
@@ -214,7 +365,7 @@ object MiniaturaMotor {
                                     q += g0 + g1 + gsz.toInt()
                                 }
                                 if (t >= 0 && cl >= 0 && (trilhaVideo < 0 || trilha == trilhaVideo)) {
-                                    out += t * escala / 1_000_000L; out += segIni + cl; out += rel
+                                    out += t * escala; out += segIni + cl; out += rel   // time in ns, as the extractor compares it
                                 }
                             }
                             m += e0 + e1 + esz.toInt()
@@ -224,24 +375,33 @@ object MiniaturaMotor {
                 }
                 if (out.size < 30) return null
                 cues = out.toLongArray()
-                Log.i(TAG, "keyframe index: ${out.size / 3} entries (Matroska Cues), multi-range batches on")
+                var comRel = 0
+                for (q in 2 until out.size step 3) if (out[q] > 0) comRel++
+                Log.i(TAG, "keyframe index: ${out.size / 3} entries (Matroska Cues), $comRel with CueRelativePosition > 0, multi-range batches on")
                 return cues
             } catch (e: Exception) {
                 return null
             }
         }
 
-        // Prefetch the keyframes nearest these times (the extractor's SEEK_TO_CLOSEST_SYNC picks the same ones) in ONE
-        // multi-range request. Returns how many were fetched, 0 nothing to do, -1 batches not possible for this file.
-        fun prefetch(tempos: LongArray): Int {
-            if (!multiOk || !manter) return -1
+        // Prefetch the keyframes the extractor will land on for these times in ONE multi-range request. Returns how many
+        // were fetched, 0 nothing to do, -1 batches not possible for this file.
+        // The cue AT OR BEFORE each time, never the closest: Android's MatroskaExtractor (BlockIterator::seek, AOSP
+        // frameworks/av) ignores the seek mode and always starts from the last cue <= the time. Picking the closest
+        // fetched the NEXT keyframe about half the time, and the extractor then missed and made its own request.
+        // Fonte is used by two threads in direct mode (the download loop and the CPU thumbnail thread): its entry
+        // points take the Fonte's lock (order: Fonte, then VOO, everywhere).
+        fun prefetch(tempos: LongArray): Int = synchronized(this) { prefetch0(tempos) }
+        private fun prefetch0(tempos: LongArray): Int {
+            if (!multiOk || (!manter && !direto)) return -1
             val c = carregarCues() ?: return -1
-            val n = c.size / 3
+            if (direto) return prefetchExato(c, tempos)
             val faixas = ArrayList<LongArray>()
             for (t in tempos) {
-                var lo = 0; var hi = n - 1
-                while (lo < hi) { val mid = (lo + hi) / 2; if (c[mid * 3] < t) lo = mid + 1 else hi = mid }
-                val k = if (lo > 0 && t - c[(lo - 1) * 3] < c[lo * 3] - t) lo - 1 else lo
+                val antes = cueParaTempo(t, false)
+                val k = if (cueMaisPerto) cueParaTempo(t, true) else antes
+                if (antes != cueParaTempo(t, true)) D.incrementAndGet(D_PERTO_DIFERE)
+                D.incrementAndGet(D_PEDIDOS_LOTE)
                 val ini = c[k * 3 + 1]
                 if (temByte(ini)) continue
                 val fim = minOf(tamanho - 1, ini + c[k * 3 + 2] + janela - 1)
@@ -254,9 +414,232 @@ object MiniaturaMotor {
             return partes.size
         }
 
-        private fun pedirVarios(faixas: List<LongArray>): List<Pair<Long, ByteArray>>? {
+        // ---- DIRECT MODE: EXACT KEYFRAME RANGES ----
+        // A window sized from the typical keyframe wasted ~half the bytes on a 4K remux (measured 23/10: 343 MB for 297
+        // thumbnails of 606 KB keyframes) and still missed the big ones (86 extra requests). Instead: a tiny multi-range
+        // probe reads each keyframe's block header (16 bytes at cluster + CueRelativePosition: element ID + size), then
+        // ONE batch fetches exactly [cluster start, block end + margin]. The margin covers what Android's parser reads
+        // after the keyframe (it walks on to the next video block); it is learnt from the reads actually seen
+        // (largest overshoot of the last 16 frames + 16 KB, 16-512 KB).
+        private val fimBloco = HashMap<Int, Long>()     // cue index -> end of its keyframe's block (absolute)
+        private val iniBloco = HashMap<Int, Long>()     // cue index -> start of its keyframe's block (absolute)
+        var trilhaV = -1L; var nalTam = 0               // video track number; NAL length size (0 = blocks not usable)
+        // KEYFRAME BLOCKS ON DISK (direct mode): fetched while the film plays, decoded later in a burst once the
+        // decoder may exist (pause/scrub, see trabalharDireto). One file per source in the app's cache, at most 900 MB
+        // and never below 1 GB free; deleted when the source closes.
+        private var disco: java.io.RandomAccessFile? = null
+        private var discoArq: java.io.File? = null
+        private val noDisco = HashMap<Int, LongArray>()   // cue index -> [file offset, length]
+        private var discoFim = 0L
+        private var discoFalhou = false
+        private fun guardarNoDisco(k: Int, d: ByteArray, de: Int, n: Int) {
+            if (discoFalhou || k in noDisco || discoFim + n > (900L shl 20)) return
+            try {
+                if (disco == null) {
+                    val dir = NvPlayer.contexto()?.cacheDir ?: run { discoFalhou = true; return }
+                    if (dir.usableSpace < (1L shl 30)) { discoFalhou = true; return }
+                    dir.listFiles { f -> f.name.startsWith("miniatura-blocos-") }?.forEach { it.delete() }   // leftovers
+                    val f = java.io.File(dir, "miniatura-blocos-${System.nanoTime()}.bin")
+                    discoArq = f; disco = java.io.RandomAccessFile(f, "rw")
+                }
+                val r = disco ?: return
+                r.seek(discoFim); r.write(d, de, n)
+                noDisco[k] = longArrayOf(discoFim, n.toLong()); discoFim += n
+            } catch (e: Exception) { discoFalhou = true }
+        }
+        private fun lerDoDisco(k: Int): ByteArray? {
+            val e = noDisco[k] ?: return null
+            return try { val b = ByteArray(e[1].toInt()); disco?.let { it.seek(e[0]); it.readFully(b) } ?: return null; b } catch (x: Exception) { null }
+        }
+        fun fecharDisco() {
+            try { disco?.close() } catch (_: Exception) {}
+            disco = null; discoArq?.delete(); discoArq = null; noDisco.clear(); discoFim = 0
+        }
+        private val excessos = ArrayDeque<Long>()
+        var margem = 192L * 1024; private set
+        var maxLido = 0L                                // furthest byte the extractor read during the current frame
+        var nSondas = 0L; var nExatos = 0L; var nChutes = 0L
+        fun fimBlocoPara(tMs: Long): Long { if (cues == null) return -1; return fimBloco[cueParaTempo(tMs, false)] ?: -1L }
+        fun registrarExcesso(fim: Long) {
+            if (fim <= 0 || maxLido <= 0) return
+            excessos.addLast(maxOf(0L, maxLido - fim)); while (excessos.size > 16) excessos.removeFirst()
+            margem = ((excessos.maxOrNull() ?: 0L) + 16 * 1024).coerceIn(16L * 1024, 512L * 1024)
+        }
+        private fun prefetchExato(c: LongArray, tempos: LongArray): Int {
+            val ks = tempos.map { cueParaTempo(it, false) }.distinct()
+            D.addAndGet(D_PEDIDOS_LOTE, ks.size.toLong())
+            // Find each keyframe's block with small probes. Round 1 reads the cluster's header plus CueRelativePosition
+            // (counted from the cluster's DATA) + 64 bytes; when the index has no relative position (measured 23/10: a
+            // remux with rel = 0 everywhere) or other elements come first (Timecode, audio blocks), the walk goes on
+            // element by element, each further round reading 64 bytes where the previous one stopped (at most 6).
+            val pos = HashMap<Int, Long>()                     // cue -> next absolute position to look at (-1 = cluster start)
+            for (k in ks) if (k !in fimBloco) pos[k] = -1L
+            var ronda = 0
+            while (pos.isNotEmpty() && ronda < 6) {
+                ronda++
+                val alvos = pos.entries.map { (k, p) ->
+                    val a0 = if (p < 0) c[k * 3 + 1] else p
+                    // later rounds read 64 KB: enough to walk past the audio blocks before the keyframe in one round
+                    // (measured 23/10: 64-byte rounds, each a request >= 1 s apart, stalled a remux's batches)
+                    val n = if (p < 0) 12 + minOf(c[k * 3 + 2], 65536L) + 64 else 65536L
+                    longArrayOf(a0, minOf(tamanho - 1, a0 + n - 1), k.toLong(), if (p < 0) 1 else 0)
+                }
+                val pedido = alvos.map { longArrayOf(it[0], it[1]) }.sortedBy { it[0] }.distinctBy { it[0] }
+                val antes = multiOk
+                semPausa = true
+                val partes = try { synchronized(VOO) { pedirVarios(pedido) } } finally { semPausa = false; multiOk = antes }
+                nSondas++
+                if (partes == null) break
+                val prox = HashMap<Int, Long>()
+                for (f in alvos) {
+                    val k = f[2].toInt()
+                    val parte = partes.firstOrNull { f[0] >= it.first && f[0] < it.first + it.second.size } ?: continue
+                    val bb = parte.second; val base = parte.first
+                    var p = f[0]
+                    if (f[3] == 1L) {                              // the cluster's own header first
+                        val i0 = (p - base).toInt()
+                        val (cid, h0) = vint(bb, i0, true) ?: continue
+                        if (cid != 0x1F43B675L) continue
+                        val (_, h1) = vint(bb, i0 + h0, false) ?: continue
+                        p += h0 + h1 + c[k * 3 + 2]
+                    }
+                    var passos = 0
+                    while (passos++ < 64) {
+                        val i = (p - base).toInt()
+                        if (i < 0 || i + 12 > bb.size) { prox[k] = p; break }   // continue in the next round
+                        val (id, l0) = vint(bb, i, true) ?: break
+                        val (tam, l1) = vint(bb, i + l0, false) ?: break
+                        if (tam < 0 || tam > (64L shl 20) || id == 0x1F43B675L) break   // unknown size / next cluster
+                        if (id == 0xA3L || id == 0xA0L) {
+                            var t = i + l0 + l1
+                            if (id == 0xA0L) {                     // BlockGroup: the track number is inside its Block
+                                val (bid, b0) = vint(bb, t, true) ?: break
+                                val (_, b1) = vint(bb, t + b0, false) ?: break
+                                if (bid != 0xA1L) break
+                                t += b0 + b1
+                            }
+                            if (t + 4 > bb.size) { prox[k] = p; break }
+                            val trk = vint(bb, t, false)?.first ?: break
+                            if (trilhaV < 0 || trk == trilhaV) {
+                                iniBloco[k] = p; fimBloco[k] = p + l0 + l1 + tam
+                                // the typical keyframe for the batch size (loteIdeal): the CPU route never passes through
+                                // ajustarJanela, so without this the batches stayed at 4 (measured 23/10)
+                                val t = (l0 + l1 + tam).toInt()
+                                media = if (media == 0) t else (media * 7 + t) / 8
+                                break
+                            }
+                        }
+                        p += l0 + l1 + tam                         // Timecode, CRC, an audio block...: skip it
+                    }
+                }
+                pos.clear(); pos.putAll(prox)
+            }
+            val faixas = ArrayList<LongArray>()
+            for (k in ks) {
+                val ini = c[k * 3 + 1]
+                val fb = fimBloco[k]
+                if (fb != null) nExatos++ else nChutes++
+                val ib = iniBloco[k]
+                val a0 = if (fb != null && ib != null && nalTam > 0) ib else ini
+                val fim = minOf(tamanho - 1, when {
+                    fb != null && nalTam > 0 -> fb - 1                 // the block alone: decoded without the extractor
+                    fb != null -> fb + margem - 1
+                    else -> ini + c[k * 3 + 2] + janela - 1
+                })
+                if (temByte(a0) && temByte(fim)) continue
+                faixas += longArrayOf(a0, fim)
+            }
+            if (faixas.isEmpty()) return 0
+            faixas.sortBy { it[0] }
+            val partes = synchronized(VOO) { pedirVarios(faixas) } ?: return -1
+            for ((a, d) in partes) guardar(a, d)
+            if (nalTam > 0) for (k in ks) {
+                val ib = iniBloco[k] ?: continue; val fb = fimBloco[k] ?: continue
+                val pt = partes.firstOrNull { ib >= it.first && fb <= it.first + it.second.size } ?: continue
+                guardarNoDisco(k, pt.second, (ib - pt.first).toInt(), (fb - ib).toInt())
+            }
+            return partes.size
+        }
+        @Volatile private var semPausa = false
+        // DIRECT MODE PACE: >= 0.25 s between requests, <= 5 MB/s averaged, and (comVaga) never more connections to the
+        // link than the player's own 4. Measured 23/10 (TorBox): a 5th connection next to the player's 4 got the CDN to
+        // refuse connections twice (08:59 with a new socket per request, 12:27 with one kept-alive socket).
+        private var proximaDireta = 0L
+        private fun esperarTaxa() {
+            val espera = proximaDireta - android.os.SystemClock.elapsedRealtime()
+            if (espera > 0) Thread.sleep(espera)
+        }
+        // counted from the request's START (from its end, measured 23/10, it halved the rate to ~2.5 MB/s)
+        private fun marcarTaxa(bytes: Long, inicio: Long) {
+            // >= 1 s between requests (probes included) and ~2.5 MB/s: TorBox's CDN refused connections ~50 s into
+            // 2-3 thumbnail requests/s next to the player's own chunk requests (08:59, 12:27, 12:58 on 23/10); the run
+            // at ~2/s survived. Fewer, bigger batches (loteIdeal) keep the bytes per second.
+            proximaDireta = inicio + maxOf(1000L, bytes / 5000L)   // ~5 MB/s: the refusals tracked the request rate, not bytes (12:27 at ~2.3 MB/s)
+        }
+
+        // The keyframe for tMs straight from its Matroska block, as Annex B into `out` (start codes, as the decoder
+        // takes it): (pts us, bytes) or null when the block is unknown, laced, of another track or malformed (the
+        // caller then uses the extractor). Its bytes come from the cache (the batch fetched exactly the block).
+        fun blocoChave(tMs: Long, out: ByteBuffer): Pair<Long, Int>? = synchronized(this) { blocoChave0(tMs, out) }
+        private fun blocoChave0(tMs: Long, out: ByteBuffer): Pair<Long, Int>? {
+            val c = cues ?: return null
+            if (nalTam <= 0) return null
+            val kk = cueParaTempo(tMs, false)
+            val a = iniBloco[kk] ?: return null; val fim = fimBloco[kk] ?: return null
+            if (fim - a > out.capacity()) return null
+            val b = lerDoDisco(kk) ?: ler(a, (fim - a).toInt()) ?: return null
+            val (id, l0) = vint(b, 0, true) ?: return null
+            val (_, l1) = vint(b, l0, false) ?: return null
+            var i = l0 + l1; var fimB = b.size
+            if (id == 0xA0L) {                                     // BlockGroup: its Block (0xA1)
+                var achou = false
+                while (i < b.size) {
+                    val (eid, e0) = vint(b, i, true) ?: break
+                    val (esz, e1) = vint(b, i + e0, false) ?: break
+                    if (eid == 0xA1L) { i += e0 + e1; fimB = minOf(b.size.toLong(), i + esz).toInt(); achou = true; break }
+                    i += e0 + e1 + esz.toInt()
+                }
+                if (!achou) return null
+            } else if (id != 0xA3L) return null
+            val (trk, t0) = vint(b, i, false) ?: return null
+            if (trilhaV >= 0 && trk != trilhaV) return null
+            i += t0 + 2                                            // track number, 16-bit relative timecode
+            if (i >= fimB) return null
+            if ((b[i].toInt() and 0x06) != 0) return null          // laced: not a single frame
+            i++
+            out.clear()
+            var p = i
+            while (p + nalTam <= fimB) {
+                var len = 0L
+                for (q in 0 until nalTam) len = (len shl 8) or (b[p + q].toLong() and 0xff)
+                p += nalTam
+                if (len <= 0 || p + len > fimB || out.remaining() < len + 4) return null
+                out.put(0); out.put(0); out.put(0); out.put(1)
+                out.put(b, p, len.toInt())
+                p += len.toInt()
+            }
+            if (p != fimB || out.position() == 0) return null
+            out.flip()
+            nBlocos++
+            return c[kk * 3] / 1000 to out.limit()
+        }
+        var nBlocos = 0L
+        // Direct mode reads the PLAYING file's link: each request takes one of the player's connection permits
+        // (ParaleloDataSource.vagas) after the pace wait, and closes its socket (an idle kept-alive socket would
+        // still be a 5th connection). The copy route reads another file: no permit.
+        private fun <T> comVaga(f: () -> T): T {
+            if (!direto) return f()
+            esperarTaxa()
+            while (!ParaleloDataSource.vagas.tryAcquire(500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                if (recusado) throw IOException("refused earlier")
+            }
+            try { return f() } finally { ParaleloDataSource.vagas.release() }
+        }
+        private fun pedirVarios(faixas: List<LongArray>): List<Pair<Long, ByteArray>>? = comVaga { pedirVarios0(faixas) }
+        private fun pedirVarios0(faixas: List<LongArray>): List<Pair<Long, ByteArray>>? {
             if (recusado) throw IOException("refused earlier")
-            pausar()
+            if (direto) esperarTaxa()
+            if (!semPausa) pausar()   // a 16-byte probe does not wait for the pace gap (the batch after it does)
             val c = URL(alvo).openConnection() as HttpURLConnection
             val ini = android.os.SystemClock.elapsedRealtime()
             try {
@@ -265,37 +648,94 @@ object MiniaturaMotor {
                 c.readTimeout = 6000
                 for ((k, v) in cab) c.setRequestProperty(k, v)
                 c.setRequestProperty("Accept-Encoding", "identity")
+                if (!manter) c.setRequestProperty("Connection", "close")
                 c.setRequestProperty("Range", "bytes=" + faixas.joinToString(",") { "${it[0]}-${it[1]}" })
                 val code = c.responseCode
                 val tipo = c.contentType ?: ""
-                if (code != 206 || !tipo.lowercase().startsWith("multipart/byteranges")) {
-                    multiOk = false   // single range or whole file: never again for this file (and read nothing more)
+                if (code == 206 && !tipo.lowercase().startsWith("multipart/byteranges")) {
+                    // ONE range back for several asked: a server may merge close/overlapping ranges into one (RFC 9110
+                    // 14.2). When its Content-Range covers every range asked at a modest extra cost, that IS the batch.
+                    // Measured 23/10 (Bond copy): this answer turned batches off for the whole title.
+                    val m = Regex("bytes\\s+(\\d+)-(\\d+)/", RegexOption.IGNORE_CASE).find(c.getHeaderField("Content-Range") ?: "")
+                    val a = m?.groupValues?.get(1)?.toLongOrNull() ?: -1L
+                    val b = m?.groupValues?.get(2)?.toLongOrNull() ?: -1L
+                    val pedido = faixas.sumOf { it[1] - it[0] + 1 }
+                    val cobre = m != null && a <= faixas[0][0] && b >= faixas.last()[1] && b < tamanho
+                    val n = b - a + 1
+                    val usa = cobre && n <= pedido * 3 / 2 + (1 shl 20)
+                    if (faixas.size > 1 || !usa) Log.i(TAG, "batch of ${faixas.size} ranges answered as ONE range $a-$b (${n / 1024} KB for ${pedido / 1024} KB asked)" +
+                        if (usa) ": used as the batch" else ": single ranges from now on")
+                    if (!usa) { multiOk = false; c.disconnect(); return null }
+                    val d = ByteArray(n.toInt())
+                    var got = 0
+                    c.inputStream.use { s -> while (got < d.size) { val r = s.read(d, got, d.size - got); if (r < 0) break; got += r } }
+                    if (got != d.size) throw IOException("short read")
+                    if (!manter) c.disconnect()
+                    lidos += got; lidosTotal += got; requisicoes++
+                    if (direto) marcarTaxa(got.toLong(), ini)
+                    msRede += android.os.SystemClock.elapsedRealtime() - ini
+                    nLotes++; bytesLotes += got; kfLotes += faixas.size
+                    resultado(android.os.SystemClock.elapsedRealtime() - ini, true, got)
+                    registrarBaixa(a, got)
+                    return listOf(a to d)
+                }
+                if (code != 206) {
+                    multiOk = false   // whole file: never again for this file (and read nothing more)
                     Log.w(TAG, "multi-range not served here (http $code, $tipo): single ranges from now on")
                     c.disconnect()
                     return null
                 }
                 val fronteira = Regex("boundary=\"?([^\";]+)").find(tipo)?.groupValues?.get(1) ?: run { multiOk = false; c.disconnect(); return null }
-                val corpo = c.inputStream.use { it.readBytes() }
-                lidos += corpo.size
-                lidosTotal += corpo.size
+                // Parsed AS IT ARRIVES, each part read straight into an array of its exact size: no whole-body buffer
+                // (readBytes grows by doubling) and no copy per part. Measured 23/10 next to a 4K remux (the player holds
+                // ~84 MB of samples on the same heap): those transient 10-20 MB per batch drove the heap to 0 % free,
+                // GC stalls of up to 0.8 s, and audio hitches of ~0.5 s.
+                val partes = ArrayList<Pair<Long, ByteArray>>()
+                var total = 0
+                val marca = "--$fronteira"
+                c.inputStream.buffered(16 * 1024).use { ins ->
+                    fun linha(): String? {
+                        val sb = StringBuilder()
+                        while (true) {
+                            val x = ins.read()
+                            if (x < 0) return if (sb.isEmpty()) null else sb.toString()
+                            if (x == '\n'.code) return sb.toString().trimEnd('\r')
+                            sb.append(x.toChar())
+                            if (sb.length > 4096) return null
+                        }
+                    }
+                    var l = linha()
+                    while (l != null && !l.startsWith(marca)) l = linha()
+                    while (l != null && l.startsWith(marca) && !l.startsWith("$marca--")) {
+                        var a = -1L; var b = -1L
+                        while (true) {
+                            val h = linha() ?: break
+                            if (h.isEmpty()) break
+                            Regex("^Content-Range:\\s*bytes\\s+(\\d+)-(\\d+)/", RegexOption.IGNORE_CASE).find(h)?.let {
+                                a = it.groupValues[1].toLong(); b = it.groupValues[2].toLong()
+                            }
+                        }
+                        if (a < 0 || b < a || b >= tamanho || b - a + 1 > (16L shl 20)) break
+                        // a server may merge or reorder ranges (RFC 9110): each part is stored where ITS Content-Range says
+                        val d = ByteArray((b - a + 1).toInt())
+                        var got = 0
+                        while (got < d.size) { val r = ins.read(d, got, d.size - got); if (r < 0) break; got += r }
+                        if (got != d.size) break
+                        partes += a to d
+                        total += d.size
+                        registrarBaixa(a, d.size)
+                        l = linha()                                     // the CRLF ending the part
+                        while (l != null && !l.startsWith(marca)) l = linha()
+                    }
+                }
+                lidos += total
+                lidosTotal += total
+                if (direto) marcarTaxa(total.toLong(), ini)
                 requisicoes++
                 msRede += android.os.SystemClock.elapsedRealtime() - ini
-                nLotes++; bytesLotes += corpo.size; kfLotes += faixas.size
-                resultado(android.os.SystemClock.elapsedRealtime() - ini, true, corpo.size)
-                val partes = ArrayList<Pair<Long, ByteArray>>()
-                val marca = ("--$fronteira").toByteArray()
-                var p = indice(corpo, marca, 0)
-                while (p >= 0) {
-                    val cabFim = indice(corpo, "\r\n\r\n".toByteArray(), p)
-                    if (cabFim < 0) break
-                    val cabTxt = String(corpo, p, cabFim - p, Charsets.ISO_8859_1)
-                    val m = Regex("Content-Range:\\s*bytes (\\d+)-(\\d+)/", RegexOption.IGNORE_CASE).find(cabTxt) ?: break
-                    val a = m.groupValues[1].toLong(); val b = m.groupValues[2].toLong()
-                    val dIni = cabFim + 4; val dLen = (b - a + 1).toInt()
-                    if (dIni + dLen > corpo.size) break
-                    partes += a to corpo.copyOfRange(dIni, dIni + dLen)
-                    p = indice(corpo, marca, dIni + dLen)
-                }
+                nLotes++; bytesLotes += total; kfLotes += faixas.size
+                resultado(android.os.SystemClock.elapsedRealtime() - ini, true, total)
+                if (!manter) c.disconnect()
                 if (partes.isEmpty()) { multiOk = false; return null }
                 return partes
             } catch (e: IOException) {
@@ -321,16 +761,20 @@ object MiniaturaMotor {
         }
 
         private fun segmento(p: Long): Pair<Long, ByteArray> {
+            for (f in fixos) if (p >= f.first && p < f.first + f.second.size) return f
             for (i in segs.indices.reversed()) {
                 val s = segs[i]
                 if (p >= s.first && p < s.first + s.second.size) { if (i != segs.size - 1) { segs.removeAt(i); segs.add(s) }; return s }
             }
-            // A read that continues right where a cached segment ends is a FORWARD decode (an exact frame: the
+            // A read that continues right where a cached segment ends during a FORWARD decode (an exact frame: the
             // check's fine pass, the gap fills): 1 MB at a time then, not a keyframe-sized window. Measured 23/10:
             // with ~190 KB windows, exact frames needed ~25 requests each, queued behind the batches, and timed out.
-            val seguido = segs.any { it.first + it.second.size == p }
-            val n = if (seguido && manter) maxOf(janela, 1 shl 20) else janela
+            // A keyframe that overflows its prefetched window only needs the rest of itself: one window, not 1 MB.
+            val seguido = fase == F_EXATO && segs.any { it.first + it.second.size == p }
+            val n = if (seguido && manter) maxOf(janela, 1 shl 20) else janelaFalta(p, lendoLen)
+            diagFalta(p, lendoPos, lendoLen)
             val d = pedir(p, minOf(tamanho - 1, p + n - 1))
+            buscou = true
             guardar(p, d)
             return p to d
         }
@@ -342,8 +786,10 @@ object MiniaturaMotor {
         // so the lanes share one pooled socket per host and one lane decodes while the other's request is on the wire.
         private fun pedir(a: Long, b: Long): ByteArray = synchronized(VOO) { pedirUm(a, b) }
 
-        private fun pedirUm(a: Long, b: Long): ByteArray {
+        private fun pedirUm(a: Long, b: Long): ByteArray = comVaga { pedirUm0(a, b) }
+        private fun pedirUm0(a: Long, b: Long): ByteArray {
             if (recusado) throw IOException("refused earlier")
+            if (direto) esperarTaxa()
             pausar()
             var ultimo: IOException? = null
             for (tentativa in 0 until 2) {
@@ -366,8 +812,15 @@ object MiniaturaMotor {
                     var got = 0
                     c.inputStream.use { s -> while (got < n) { val r = s.read(d, got, n - got); if (r < 0) break; got += r } }
                     if (got != n) throw IOException("short read")
+                    if (b > a) {   // not the 0-0 size probe
+                        val cr = c.getHeaderField("Content-Range") ?: ""
+                        if (!cr.startsWith("bytes $a-")) throw IOException("range not honoured")
+                        registrarBaixa(a, got)
+                        D.incrementAndGet(D_UNITARIAS)
+                    }
                     lidos += got
                     lidosTotal += got
+                    if (direto) marcarTaxa(got.toLong(), ini)
                     requisicoes++
                     msRede += android.os.SystemClock.elapsedRealtime() - ini
                     resultado(android.os.SystemClock.elapsedRealtime() - ini, true, got)
@@ -387,8 +840,14 @@ object MiniaturaMotor {
             throw ultimo ?: IOException("read failed")
         }
 
-        override fun readAt(pos: Long, buf: ByteArray, off: Int, len: Int): Int {
+        private var lendoPos = 0L; private var lendoLen = 0; private var buscou = false
+        override fun readAt(pos: Long, buf: ByteArray, off: Int, len: Int): Int = synchronized(this) { readAt0(pos, buf, off, len) }
+        private fun readAt0(pos: Long, buf: ByteArray, off: Int, len: Int): Int {
             if (pos >= tamanho) return -1
+            lendoPos = pos; lendoLen = len; buscou = false
+            if (pos + len > maxLido) maxLido = minOf(tamanho, pos + len)
+            val dentro = temByte(pos)
+            D.incrementAndGet(D_LEITURAS)
             return try {
                 var feito = 0
                 while (feito < len && pos + feito < tamanho) {
@@ -400,6 +859,7 @@ object MiniaturaMotor {
                     System.arraycopy(d, ini, buf, off + feito, k)
                     feito += k
                 }
+                D.incrementAndGet(if (!buscou) D_HITS else if (dentro) D_PARCIAIS else D_FALTAS)
                 feito
             } catch (e: Exception) {
                 erroRede = true   // the extractor only sees "end of data": tell the C side it was the network
@@ -426,11 +886,70 @@ object MiniaturaMotor {
         var yArr = ByteArray(0); var uArr = ByteArray(0); var vArr = ByteArray(0)
         var ultimoPts = Long.MIN_VALUE
         var ultimoRes: ByteArray? = null
+        // direct mode (quadroDireto): hardware decoder -> SurfaceTexture -> 480x270 on the GPU
+        var gpu: GpuMiniatura? = null
+        var visW = 0; var visH = 0           // visible picture after crop (rotation applied)
+        var amostra: ByteBuffer? = null      // the keyframe, kept to queue it twice
+        var pedido = 0L                      // generation of the current request: outputs of earlier ones never count
+        var saida: ByteArrayOutputStream? = null   // reused for each direct reply
+        var csdAnexoB: ByteArray? = null           // parameter sets (Annex B) for the CPU route
+        var amostraCpu: ByteBuffer? = null         // the CPU thread's keyframe buffer
     }
 
     private val sessoes = ConcurrentHashMap<Long, Sessao>()
     private var proximo = 1L
     private val VOO = Any()
+
+    // ---- read diagnostics for the per-title SUMMARY (diag()); reset when a title starts ----
+    const val F_META = 0; const val F_SEEK = 1; const val F_AMOSTRA = 2; const val F_AVANCO = 3; const val F_EXATO = 4
+    private val FASES = arrayOf("meta", "seek", "sample", "advance", "exact")
+    private const val D_LEITURAS = 0; private const val D_HITS = 1; private const val D_PARCIAIS = 2; private const val D_FALTAS = 3
+    private const val D_FASE0 = 4   // 4..8: single fetches by purpose
+    private const val D_EVICTED = 9; private const val D_UNICOS = 10; private const val D_REPETIDOS = 11
+    private const val D_PICO = 12; private const val D_CUE_ANTES = 13; private const val D_PERTO_DIFERE = 14
+    private const val D_PEDIDOS_LOTE = 15; private const val D_DETALHES = 16; private const val D_UNITARIAS = 17
+    private const val D_CACHE = 18
+    private val D = java.util.concurrent.atomic.AtomicLongArray(19)
+    private fun diagCache(f: Fonte) {
+        val antes = f.cacheBytes
+        f.cacheBytes = f.guardadosAgora()
+        val total = D.addAndGet(D_CACHE, f.cacheBytes - antes)
+        while (true) { val p = D.get(D_PICO); if (total <= p || D.compareAndSet(D_PICO, p, total)) break }
+    }
+    // debug.nuvio.miniatura bits (read by the C side when a title starts): 2 = old closest-cue prefetch (A/B)
+    @Volatile private var cueMaisPerto = false
+    @JvmStatic
+    fun configurar(bits: Int) {
+        cueMaisPerto = bits and 2 != 0
+        dumpar = if (bits and 16 != 0) 12 else 0
+        if (bits == 0) return
+        if (pastaTeste == null) pastaTeste = try { NvPlayer.contexto()?.getExternalFilesDir("miniaturas-teste") } catch (e: Exception) { null }
+    }
+
+    @JvmStatic
+    fun perdidos(): Long = NvPlayer.quadrosPerdidosAgora()
+    @JvmStatic
+    fun audioFalhas(): Long = NvPlayer.audioFalhasAgora()
+
+    // Free room on this app's Java heap (MB): the player's sample buffer lives there too. The C side pauses thumbnail
+    // work below 64 MB so a thumbnail never forces a blocking GC on the player's threads.
+    @JvmStatic
+    fun heapLivreMb(): Long { val r = Runtime.getRuntime(); return (r.maxMemory() - (r.totalMemory() - r.freeMemory())) shr 20 }
+
+    @JvmStatic
+    fun diag(zerar: Boolean): String {
+        val mb = 1048576.0
+        val s = "reads ${D.get(D_LEITURAS)} (hit ${D.get(D_HITS)}, partial ${D.get(D_PARCIAIS)}, miss ${D.get(D_FALTAS)}) | " +
+            "single fetches ${D.get(D_UNITARIAS)}: meta ${D.get(D_FASE0)} seek ${D.get(D_FASE0 + 1)} sample ${D.get(D_FASE0 + 2)} " +
+            "advance ${D.get(D_FASE0 + 3)} exact ${D.get(D_FASE0 + 4)}, refetched-after-evict ${D.get(D_EVICTED)}, " +
+            "on the previous cue (prefetch took the next) ${D.get(D_CUE_ANTES)} | batch keyframes asked ${D.get(D_PEDIDOS_LOTE)}, " +
+            "closest!=previous ${D.get(D_PERTO_DIFERE)}${if (cueMaisPerto) " (closest-cue mode)" else ""} | " +
+            "unique %.1f MB, repeated %.1f MB, peak cache %.1f MB".format(D.get(D_UNICOS) / mb, D.get(D_REPETIDOS) / mb, D.get(D_PICO) / mb)
+        if (zerar) { nDireto = 0; nDiretoCache = 0; msDiretoCache = 0; nDup = 0; nAvanco = 0; nDiretoFalhas = 0; msGpu = 0; msJpeg = 0; msSeek = 0; msEsperaQuadro = 0 }
+        if (zerar) for (i in 0 until D_CACHE) if (i != D_PICO) D.set(i, 0)
+        if (zerar) D.set(D_PICO, D.get(D_CACHE))
+        return s
+    }
 
     // Request pacing for ALL sessions together, adaptive. At most ~4/s (250 ms apart; one request takes ~0.29 s, so
     // in practice the single in-flight request is the limit, ~3.4/s). Two parallel connections next to the player
@@ -614,7 +1133,7 @@ object MiniaturaMotor {
     @JvmStatic
     fun fechar(h: Long) {
         soltarDecoder(h)
-        sessoes.remove(h)?.ex?.release()
+        sessoes.remove(h)?.let { it.ex.release(); it.fonte.soltarCache(); it.gpu?.soltar(); it.gpu = null }
     }
 
     // The keyframe nearest `tMs` (closest=true) or the one at/before it.
@@ -644,6 +1163,7 @@ object MiniaturaMotor {
         val s = sessoes[h] ?: return null
         s.fonte.erroRede = false
         try {
+            s.fonte.fase = F_SEEK; s.fonte.alvoMs = tMs
             s.ex.seekTo(tMs * 1000, if (closest) MediaExtractor.SEEK_TO_CLOSEST_SYNC else MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
             val st = s.ex.sampleTime
             if (st < 0) return motivo(s, tMs, "seek found no sample")
@@ -662,6 +1182,7 @@ object MiniaturaMotor {
                         // HEVC gets ONE more sample first: Android's software HEVC decoder sometimes ended without a
                         // frame on the keyframe alone (4 of 612, 22/10); the first frame out is still the keyframe.
                         val antesDoFim = if (s.mime == "video/hevc" || s.mime == "video/dolby-vision") 2 else 1
+                        s.fonte.fase = F_AMOSTRA
                         val n = if (s.soft && fed >= antesDoFim) -1 else s.ex.readSampleData(dec.getInputBuffer(ib)!!, 0)
                         if (n < 0) { dec.queueInputBuffer(ib, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); eos = true }
                         else {
@@ -671,6 +1192,7 @@ object MiniaturaMotor {
                             // No advance() after the LAST sample fed (software path): on Matroska it reads on through
                             // the audio blocks to the next video frame, past the prefetched window. Measured 23/10:
                             // ~1 extra request per thumbnail (847 requests for 25 batches on a 2 h film).
+                            s.fonte.fase = F_AVANCO
                             if (!s.soft || fed < antesDoFim) s.ex.advance()
                         }
                     }
@@ -699,6 +1221,296 @@ object MiniaturaMotor {
         }
     }
 
+    // ---- DIRECT THUMBNAILS FROM THE PLAYING FILE (4K, no usable smaller copy; experimental) ----
+    // The playing file is read in multi-range batches with the socket closed after each request (debrid connection
+    // limits, see Fonte), decoded by ONE persistent hardware decoder per source onto a SurfaceTexture and scaled on the
+    // GPU (GpuMiniatura). The player's own decoder and extractor are never touched.
+    @Volatile private var msGpu = 0L
+    @Volatile private var msJpeg = 0L
+    @Volatile private var nDireto = 0L         // direct thumbnails made
+    @Volatile private var nDiretoCache = 0L    // ...of which with no network read during the call (prefetched)
+    @Volatile private var msDiretoCache = 0L   // decode + GPU + JPEG time of those
+    @Volatile private var nDup = 0L            // outputs obtained by the repeated keyframe (no extra bytes)
+    @Volatile private var nAvanco = 0L         // ...that needed the following samples instead
+    @Volatile private var nDiretoFalhas = 0L
+    @Volatile private var msSeek = 0L            // extractor seek (incl. reading the keyframe from the cache)
+    @Volatile private var msEsperaQuadro = 0L    // decoder output -> frame available on the SurfaceTexture
+
+    // Opens the playing file for direct thumbnails. 0 = not possible; the reason is logged. Profiles declined: Dolby
+    // Vision without an HDR10/SDR base layer (profile 5), codecs other than H.264/HEVC.
+    @JvmStatic
+    fun abrirDireto(url: String, cabecalhos: String): Long {
+        val h = abrir(url, cabecalhos, false)
+        val s = sessoes[h] ?: return 0L
+        s.fonte.modoDireto()
+        if (s.mime != "video/avc" && s.mime != "video/hevc" && s.mime != "video/dolby-vision") {
+            Log.w(TAG, "direct: codec ${s.mime} not supported"); fechar(h); return 0L
+        }
+        val dv = s.fonte.perfilDv()
+        if (dv >= 0) {
+            val perfil = dv / 16; val compat = dv % 16
+            // compat 1 = HDR10 base (8.1), 2 = SDR (8.2), 4 = HLG (8.4), 6 = profile 7's HDR10 base layer
+            val ok = (perfil == 7 || perfil == 8) && compat in intArrayOf(1, 2, 4, 6)
+            Log.i(TAG, "direct: Dolby Vision profile $perfil (base-layer compat $compat) ${if (ok) "-> decoding the base layer" else "-> declined"}")
+            if (!ok) { fechar(h); return 0L }
+            if (compat == 1 || compat == 6) s.hdr = true
+        }
+        if (s.mime == "video/dolby-vision" && dv < 0) { Log.w(TAG, "direct: Dolby Vision track without its profile: declined"); fechar(h); return 0L }
+        return h
+    }
+
+    // ---- CPU ROUTE (src/miniatura_motor.c, Namer03's FFmpeg engine in packet mode) ----
+    // 1 = HEVC (also Dolby Vision's base layer), 2 = H.264, 0 = the CPU route cannot take this source (keyframes are
+    // taken straight from Matroska blocks: needs the index and plain, unlaced blocks).
+    @JvmStatic
+    fun codecCpu(h: Long): Int {
+        val s = sessoes[h] ?: return 0
+        if (s.fonte.nalTam <= 0) return 0
+        return when (s.mime) { "video/hevc", "video/dolby-vision" -> 1; "video/avc" -> 2; else -> 0 }
+    }
+
+    // The keyframe for tMs as one Annex B access unit with the stream's parameter sets in front (the decoder gets no
+    // extradata): 8 bytes pts ms (big endian) + the bytes. null when the block is not usable (or a read failed).
+    @JvmStatic
+    fun pacoteCpu(h: Long, tMs: Long): ByteArray? {
+        val s = sessoes[h] ?: return null
+        s.fonte.erroRede = false
+        val am = s.amostraCpu ?: ByteBuffer.allocateDirect(8 shl 20).also { s.amostraCpu = it }
+        val r = try { s.fonte.blocoChave(tMs, am) } catch (e: Exception) { null } ?: return null
+        val csd = s.csdAnexoB ?: run {
+            val o = ByteArrayOutputStream()
+            for (k in arrayOf("csd-0", "csd-1")) if (s.fmt.containsKey(k)) s.fmt.getByteBuffer(k)?.let { b ->
+                val d = b.duplicate(); d.position(0); val a = ByteArray(d.remaining()); d.get(a); o.write(a)
+            }
+            o.toByteArray().also { s.csdAnexoB = it }
+        }
+        val out = ByteArray(8 + csd.size + r.second)
+        val pts = r.first / 1000
+        for (k in 0 until 8) out[k] = ((pts shr (8 * (7 - k))) and 0xff).toByte()
+        System.arraycopy(csd, 0, out, 8, csd.size)
+        val d = am.duplicate(); d.position(0); d.get(out, 8 + csd.size, r.second)
+        return out
+    }
+
+    @JvmStatic
+    fun prepararDecoder(h: Long): Int = try { val s = sessoes[h]; if (s != null && decoderDireto(s) != null) 1 else 0 } catch (e: Exception) { 0 }
+
+    @JvmStatic
+    fun keyframeMs(h: Long, tMs: Long): Long = try { sessoes[h]?.fonte?.keyframeMs(tMs) ?: -1L } catch (e: Exception) { -1L }
+
+    // The hardware decoder for this source rendering into the GPU step's Surface. Rate-limited like decoder().
+    private fun decoderDireto(s: Sessao): MediaCodec? {
+        s.dec?.let { return it }
+        if (s.errosCodec >= 2) return null
+        synchronized(this) {
+            val espera = ultimaCriacao + 2000 - android.os.SystemClock.elapsedRealtime()
+            if (espera > 0) Thread.sleep(espera)
+            ultimaCriacao = android.os.SystemClock.elapsedRealtime()
+        }
+        val g = s.gpu ?: GpuMiniatura().also { if (!it.iniciar()) { it.soltar(); Log.w(TAG, "direct: GPU step failed to start"); s.errosCodec = 2; return null }; s.gpu = it }
+        val mime = if (s.mime == "video/dolby-vision") "video/hevc" else s.mime
+        val f = MediaFormat(s.fmt)
+        f.setString(MediaFormat.KEY_MIME, mime)
+        if (s.mime == "video/dolby-vision") f.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10)
+        // the hardware decoder that takes THIS format (profile, bit depth, size), never a software one
+        val lista = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+        val nomes = lista.codecInfos.filter { ci ->
+            !ci.isEncoder && ci.supportedTypes.any { it.equals(mime, true) } &&
+                !ci.name.startsWith("OMX.google.") && !ci.name.startsWith("c2.android.") &&
+                (android.os.Build.VERSION.SDK_INT < 29 || ci.isHardwareAccelerated) &&
+                try { ci.getCapabilitiesForType(mime).videoCapabilities.isSizeSupported(s.fmt.getInteger(MediaFormat.KEY_WIDTH), s.fmt.getInteger(MediaFormat.KEY_HEIGHT)) } catch (e: Exception) { false }
+        }.map { it.name }
+        for (nome in nomes) {
+            var c: MediaCodec? = null
+            try {
+                c = MediaCodec.createByCodecName(nome)
+                if (s.travadas == 0) f.setInteger(MediaFormat.KEY_PRIORITY, 1) else f.removeKey(MediaFormat.KEY_PRIORITY)
+                c.configure(f, g.surface, null, 0)
+                c.start()
+                s.dec = c; s.soft = false
+                criados++
+                Log.i(TAG, "direct: decoder $nome (hardware, ${if (s.hdr) "HDR/PQ" else "SDR"}, ${s.fmt.getInteger(MediaFormat.KEY_WIDTH)}x${s.fmt.getInteger(MediaFormat.KEY_HEIGHT)})")
+                return c
+            } catch (e: Exception) {
+                Log.w(TAG, "direct: decoder $nome refused: ${e.javaClass.simpleName}")
+                try { c?.release() } catch (_: Exception) {}
+            }
+        }
+        s.errosCodec++
+        return null
+    }
+
+    private fun visivel(s: Sessao, of: MediaFormat) {
+        var w = of.getInteger(MediaFormat.KEY_WIDTH); var h = of.getInteger(MediaFormat.KEY_HEIGHT)
+        if (of.containsKey("crop-right") && of.containsKey("crop-left")) w = of.getInteger("crop-right") - of.getInteger("crop-left") + 1
+        if (of.containsKey("crop-bottom") && of.containsKey("crop-top")) h = of.getInteger("crop-bottom") - of.getInteger("crop-top") + 1
+        val rot = if (s.fmt.containsKey(MediaFormat.KEY_ROTATION)) s.fmt.getInteger(MediaFormat.KEY_ROTATION) else 0
+        if (rot == 90 || rot == 270) { val t = w; w = h; h = t }
+        s.visW = w; s.visH = h
+        if (of.containsKey(MediaFormat.KEY_COLOR_TRANSFER) && of.getInteger(MediaFormat.KEY_COLOR_TRANSFER) == MediaFormat.COLOR_TRANSFER_ST2084) s.hdr = true
+    }
+
+    // End of sequence after the keyframe, then the SAME keyframe again (1 us later): the second random-access picture
+    // makes the decoder output the first at once (HEVC C.5.2.2 / H.264 C.4.4 bumping), with no extra bytes read and no
+    // reliance on end-of-stream (Nvidia's decoder drops the last frame there). Only the first picture is kept, by its
+    // exact timestamp. Samples from the extractor are Annex B (start codes) for both codecs.
+    private val EOS_HEVC = byteArrayOf(0, 0, 0, 1, 0x48, 0x01)
+    private val EOS_AVC = byteArrayOf(0, 0, 0, 1, 0x0A)
+
+    // The keyframe the extractor lands on for tMs, as a 480x270 JPEG made on the GPU. Same reply format as quadro().
+    @JvmStatic
+    fun quadroDireto(h: Long, tMs: Long): ByteArray? {
+        val s = sessoes[h] ?: return null
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        val req0 = s.fonte.lidos
+        s.fonte.erroRede = false
+        val pedido = ++s.pedido
+        try {
+            s.fonte.fase = F_SEEK; s.fonte.alvoMs = tMs
+            s.fonte.maxLido = 0
+            s.fonte.fimAtual = s.fonte.fimBlocoPara(tMs)
+            val cap = maxOf(8 shl 20, s.amostra?.capacity() ?: 0)
+            val am = s.amostra?.takeIf { it.capacity() >= cap } ?: ByteBuffer.allocateDirect(cap).also { s.amostra = it }
+            val ts0 = android.os.SystemClock.elapsedRealtime()
+            // the keyframe straight from its block (only its own bytes were fetched); the extractor when that fails
+            val bloco = try { s.fonte.blocoChave(tMs, am) } catch (e: Exception) { null }
+            val st: Long
+            var n: Int
+            if (bloco != null) {
+                st = bloco.first; n = bloco.second
+            } else {
+                s.ex.seekTo(tMs * 1000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                st = s.ex.sampleTime
+                if (st < 0) return motivo(s, tMs, "direct: seek found no sample")
+                if (s.ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC == 0) return motivo(s, tMs, "direct: landed on a non-keyframe")
+                s.fonte.fase = F_AMOSTRA
+                am.clear()
+                n = s.ex.readSampleData(am, 0)
+                if (n <= 0) return motivo(s, tMs, "direct: keyframe read failed")
+                s.fonte.registrarExcesso(s.fonte.fimAtual)   // how far past the keyframe's block the parser read
+            }
+            msSeek += android.os.SystemClock.elapsedRealtime() - ts0
+            s.fonte.ajustarJanela(n)
+            val dec = decoderDireto(s) ?: return motivo(s, tMs, "direct: no decoder")
+            val g = s.gpu ?: return null
+            dec.flush()
+            g.descartarPendentes()
+            val eos = if (s.mime == "video/avc") EOS_AVC else EOS_HEVC
+            val info = MediaCodec.BufferInfo()
+            var enviados = 0          // 0 keyframe, 1 its repeat, then following samples (fallback)
+            var seguintes = 0
+            var tDecod = 0L
+            val ini = android.os.SystemClock.elapsedRealtime()
+            var ultimaSaida = ini
+            while (android.os.SystemClock.elapsedRealtime() - ini < 3000) {
+                if (pedido != s.pedido) return null
+                val parado = android.os.SystemClock.elapsedRealtime() - ultimaSaida
+                if (enviados < 2 || (parado > 400 && seguintes < 8)) {
+                    val ib = dec.dequeueInputBuffer(5000)
+                    if (ib >= 0) {
+                        val buf = dec.getInputBuffer(ib)!!
+                        buf.clear()
+                        if (enviados < 2) {
+                            val dup = am.duplicate(); dup.position(0); dup.limit(n)
+                            if (buf.remaining() < n + eos.size) { dec.queueInputBuffer(ib, 0, 0, 0, 0); return motivo(s, tMs, "direct: keyframe bigger than the input buffer") }
+                            buf.put(dup); buf.put(eos)
+                            dec.queueInputBuffer(ib, 0, n + eos.size, st + enviados, 0)
+                        } else {
+                            // the repeat gave nothing: feed what follows the keyframe, as the copy path does (the
+                            // advance past the keyframe happens only now: it reads the next blocks)
+                            if (seguintes == 0) {
+                                if (bloco != null) s.ex.seekTo(st, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                                s.fonte.fase = F_AVANCO; s.ex.advance()
+                            }
+                            s.fonte.fase = F_AMOSTRA
+                            val r = s.ex.readSampleData(buf, 0)
+                            if (r < 0) { dec.queueInputBuffer(ib, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); seguintes = 99 }
+                            else { dec.queueInputBuffer(ib, 0, r, s.ex.sampleTime + 2, 0); s.fonte.fase = F_AVANCO; s.ex.advance(); seguintes++ }
+                            ultimaSaida = android.os.SystemClock.elapsedRealtime()
+                        }
+                        enviados++
+                    }
+                }
+                val ob = dec.dequeueOutputBuffer(info, 10000)
+                if (ob == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) { visivel(s, dec.outputFormat); continue }
+                if (ob < 0) continue
+                ultimaSaida = android.os.SystemClock.elapsedRealtime()
+                if (info.presentationTimeUs != st || info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                    dec.releaseOutputBuffer(ob, false)
+                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
+                    continue
+                }
+                if (s.visW <= 0) visivel(s, dec.outputFormat)
+                tDecod = android.os.SystemClock.elapsedRealtime() - ini
+                dec.releaseOutputBuffer(ob, true)
+                val g0 = g.msGpu
+                val tw0 = android.os.SystemClock.elapsedRealtime()
+                if (!g.capturar(st, s.visW, s.visH, s.hdr, 1500)) return motivo(s, tMs, "direct: the GPU step got no frame")
+                msEsperaQuadro += android.os.SystemClock.elapsedRealtime() - tw0 - (g.msGpu - g0)
+                if (pedido != s.pedido) return null
+                msGpu += g.msGpu - g0
+                if (seguintes == 0) nDup++ else nAvanco++
+                val j0 = android.os.SystemClock.elapsedRealtime()
+                // header + EMPTY signature (direct thumbnails are not matched against anything; assinaturaDe would
+                // allocate a 0.5 MB pixel array per thumbnail on the heap the player shares)
+                val out = s.saida ?: ByteArrayOutputStream(48 * 1024).also { s.saida = it }
+                out.reset()
+                for (k in 7 downTo 0) out.write((((st / 1000) shr (8 * k)) and 0xff).toInt())
+                out.write(0)
+                out.write(ByteArray(SW * SH))
+                g.bmp.compress(Bitmap.CompressFormat.JPEG, 80, out)
+                val tj = android.os.SystemClock.elapsedRealtime() - j0
+                msJpeg += tj
+                msDecod += tDecod
+                nDireto++
+                val total = android.os.SystemClock.elapsedRealtime() - t0
+                if (s.fonte.lidos == req0) { nDiretoCache++; msDiretoCache += total }
+                if (nDireto <= 5 || nDireto % 25 == 0L)
+                    Log.i(TAG, "direct frame ${st / 1000} ms for ${tMs} ms: keyframe ${n / 1024} KB, decode $tDecod ms (${if (seguintes == 0) "repeat" else "+$seguintes samples"}), " +
+                        "gpu ${g.msGpu - g0} ms, jpeg $tj ms, total $total ms, network ${if (s.fonte.lidos == req0) "none" else "${(s.fonte.lidos - req0) / 1024} KB"}" +
+                        ", ${s.visW}x${s.visH}${if (s.hdr) " PQ" else ""}")
+                if (dumpar > 0) dumparJpeg(st / 1000, out.toByteArray())
+                return out.toByteArray()
+            }
+            nDiretoFalhas++
+            soltarDecoder(h)
+            if (!s.fonte.erroRede) s.travadas++
+            if (s.travadas >= 2) s.errosCodec = 2      // stuck twice (also at normal priority): no more decoders for this file
+            return motivo(s, tMs, "direct: decoder timed out (sent $enviados, following $seguintes)")
+        } catch (e: Exception) {
+            nDiretoFalhas++
+            soltarDecoder(h)
+            if (e is IllegalStateException || e is MediaCodec.CodecException) s.errosCodec++
+            return motivo(s, tMs, "direct: error ${e.javaClass.simpleName}${if (s.errosCodec >= 2) ": decoder given up for this file" else ""}")
+        } finally {
+            msQuadros += android.os.SystemClock.elapsedRealtime() - t0
+        }
+    }
+
+    // Debug (debug.nuvio.miniatura bit 16): the first direct thumbnails written to the app's external files folder, for
+    // checking colours against the screen (adb pull /sdcard/Android/data/<package>/files/miniaturas-teste).
+    @Volatile private var dumpar = 0
+    @Volatile var pastaTeste: java.io.File? = null
+    private fun dumparJpeg(ptsMs: Long, r: ByteArray) {
+        val d = pastaTeste ?: return
+        dumpar--
+        try {
+            d.mkdirs()
+            val jpg = r.copyOfRange(9 + SW * SH, r.size)
+            java.io.File(d, "direto_%07d.jpg".format(ptsMs)).writeBytes(jpg)
+        } catch (_: Exception) {}
+    }
+
+    @JvmStatic
+    fun diagDireto(): String {
+        val f = sessoes.values.firstOrNull { it.fonte.direto }?.fonte
+        return "direct: $nDireto thumbnails (repeat-keyframe $nDup, needed following samples $nAvanco, failures $nDiretoFalhas), " +
+            "seek %.1f s, gpu+readback %.1f s, frame wait %.1f s, jpeg %.1f s, prefetched-only %d in %.1f s (%.0f ms each)".format(
+                msSeek / 1000.0, msGpu / 1000.0, msEsperaQuadro / 1000.0, msJpeg / 1000.0, nDiretoCache, msDiretoCache / 1000.0,
+                if (nDiretoCache > 0) msDiretoCache.toDouble() / nDiretoCache else 0.0) +
+            (if (f != null) " | exact ranges ${f.nExatos}, guessed ${f.nChutes}, probes ${f.nSondas}, from blocks ${f.nBlocos}, margin ${f.margem / 1024} KB" else "")
+    }
+
     // The frame AT `tMs` (not the keyframe): decode forward from the keyframe before it and keep the first frame
     // whose time is >= tMs. Signature only. For the fine pass of the timeline check, on the small copy only
     // (a 720p GOP is cheap to run through; a 4K one is not).
@@ -707,8 +1519,10 @@ object MiniaturaMotor {
         val s = sessoes[h] ?: return null
         s.fonte.erroRede = false
         try {
+            s.fonte.fase = F_SEEK; s.fonte.alvoMs = tMs
             s.ex.seekTo(tMs * 1000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
             if (s.ex.sampleTime < 0) return motivo(s, tMs, "exact: seek found no sample")
+            s.fonte.fase = F_EXATO
             val dec = decoder(s) ?: return null
             dec.flush()
             s.ultimoPts = Long.MIN_VALUE

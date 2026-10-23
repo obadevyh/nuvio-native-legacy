@@ -122,6 +122,11 @@ class ParaleloDataSource(
     companion object {
         private const val TAG = "nuvio-paralelo"
         const val CONEXOES = 4
+        // CONNECTIONS TO THE DEBRID LINK, SHARED: the player's chunk downloads and the on-device thumbnails' reads of
+        // the same file (MiniaturaMotor, direct mode) take a permit each, so together they never pass CONEXOES.
+        // Measured 23/10 (TorBox): with thumbnails as a 5th connection next to these 4, the CDN refused connections
+        // twice, the player's too (third-party guidance: at most 4 per link). Fair: waiting chunks go first.
+        @JvmField val vagas = java.util.concurrent.Semaphore(CONEXOES, true)
         const val PEDACO = 4 shl 20           // 4 MB por pedido
         private const val ADIANTE = 3         // pedacos em voo por conexao
         private const val TENTATIVAS = 3
@@ -500,6 +505,7 @@ class ParaleloDataSource(
             // Uma conexao paralela ativa, do connect ao ultimo byte. As outras
             // somam no mesmo segundo do medidor; nada e contado duas vezes.
             medidor?.inicio(token)
+            try { vagas.acquire() } catch (e: InterruptedException) { Thread.currentThread().interrupt(); medidor?.fim(token); throw cancelado(e) }
             Estat.conexoes.incrementAndGet()
             var c: HttpURLConnection? = null
             try {
@@ -513,6 +519,7 @@ class ParaleloDataSource(
                 if (foiCancelado(e)) throw cancelado(e)
             } finally {
                 desconectar(c)
+                vagas.release()
                 Estat.conexoes.decrementAndGet()
                 medidor?.fim(token)
             }

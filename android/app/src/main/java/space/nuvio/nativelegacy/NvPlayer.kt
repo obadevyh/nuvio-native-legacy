@@ -155,6 +155,11 @@ object NvPlayer {
     private var ultAtmos = -1
     private var avisouSemAudio = false
     private var quadrosPerdidos = 0L
+    // On-device thumbnails (MiniaturaMotor): dropped frames of the open playback, for the per-title summary.
+    @JvmStatic fun quadrosPerdidosAgora(): Long = quadrosPerdidos
+    @Volatile private var audioFalhas = 0L
+    @JvmStatic fun audioFalhasAgora(): Long = audioFalhas
+    @JvmStatic fun contexto(): android.content.Context? = activity?.applicationContext
     private var statsTiques = 0
     private var bufferAlvoMs = androidx.media3.exoplayer.DefaultLoadControl.DEFAULT_MAX_BUFFER_MS
     private var bufferMinMs = 0
@@ -2245,6 +2250,13 @@ object NvPlayer {
 
         override fun onDroppedVideoFrames(eventTime: AnalyticsListener.EventTime, droppedFrames: Int, elapsedMs: Long) {
             if (atual(minha)) quadrosPerdidos += droppedFrames
+        }
+
+        // Audible gaps: logged with their time so on-device thumbnail work can be lined up against them.
+        override fun onAudioUnderrun(eventTime: AnalyticsListener.EventTime, bufferSize: Int, bufferSizeMs: Long, elapsedSinceLastFeedMs: Long) {
+            if (!atual(minha)) return
+            audioFalhas++
+            Log.w(TAG, "[player] audio underrun #$audioFalhas: buffer ${bufferSizeMs} ms, ${elapsedSinceLastFeedMs} ms since the last feed")
         }
 
         override fun onVideoDecoderInitialized(
