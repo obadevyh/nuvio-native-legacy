@@ -8,6 +8,7 @@ int miniatura_prontas_agora(void) { return 0; }
 void miniatura_preaquecer(const char *url, const char *cabecalhos) { (void)url; (void)cabecalhos; }
 #else
 #include "dados.h"
+#include "gfx.h"
 #include "streams.h"
 #include "video.h"
 #include <dirent.h>
@@ -2128,7 +2129,10 @@ static unsigned usoTex;
 static int velho;
 
 static void texLimpar(void) {
-  for (int i = 0; i < NTEX; i++) if (texs[i].tex) { glDeleteTextures(1, &texs[i].tex); texs[i].tex = 0; }
+  for (int i = 0; i < NTEX; i++) if (texs[i].tex) {
+    gfx_tex_esquecer(texs[i].tex);
+    glDeleteTextures(1, &texs[i].tex); texs[i].tex = 0;
+  }
 }
 static GLuint texDe(Job *j, int k) {
   int livreI = 0;
@@ -2142,7 +2146,10 @@ static GLuint texDe(Job *j, int k) {
   SDL_Surface *c = s ? SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ABGR8888, 0) : NULL;
   if (s) SDL_FreeSurface(s);
   if (!c) return 0;
-  if (texs[livreI].tex) glDeleteTextures(1, &texs[livreI].tex);
+  if (texs[livreI].tex) {
+    gfx_tex_esquecer(texs[livreI].tex);
+    glDeleteTextures(1, &texs[livreI].tex);
+  }
   GLuint t;
   glGenTextures(1, &t);
   glBindTexture(GL_TEXTURE_2D, t);
@@ -2152,6 +2159,7 @@ static GLuint texDe(Job *j, int k) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, c->w, c->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, c->pixels);
+  gfx_tex_esquecer(0);  // raw GL binding changed behind the renderer's cache
   SDL_FreeSurface(c);
   texs[livreI].tex = t; texs[livreI].g = j->g; texs[livreI].k = k; texs[livreI].uso = ++usoTex;
   return t;
@@ -2177,10 +2185,20 @@ static int pQuadros(double posSeg, int n, GLuint *out, double *cueSeg) {
       // a neighbour within 8 s IS this slot's thumbnail (no "still loading" ring); further away it stands in
       velho = atual >= 0 && labs(j->tiles[atual].pts - k * GRADE_MS) > TOL_COPIA_MS;
     }
-    int alvos[3] = { k - 1, atual, k + 1 }, base = n == 1 ? 1 : 0;
+    // Slots can be empty after cue deduplication or during the sparse pass.
+    // The strip follows actual picture times, not adjacent grid positions.
+    int alvos[3] = { -1, atual, -1 }, base = n == 1 ? 1 : 0;
+    if (n > 1 && atual >= 0) {
+      long pts = j->tiles[atual].pts;
+      for (int s = 0; s < j->n; s++) {
+        if (!j->tiles[s].jpg || labs(j->tiles[s].pts - pts) > VIZINHO_SLOTS * GRADE_MS) continue;
+        if (j->tiles[s].pts < pts && (alvos[0] < 0 || j->tiles[s].pts > j->tiles[alvos[0]].pts)) alvos[0] = s;
+        if (j->tiles[s].pts > pts && (alvos[2] < 0 || j->tiles[s].pts < j->tiles[alvos[2]].pts)) alvos[2] = s;
+      }
+    }
     for (int i = 0; i < n; i++) {
       int s = alvos[base + i];
-      if (s < 0 || s >= j->n || !j->tiles[s].jpg || (i != (n == 1 ? 0 : 1) && velho)) continue;
+      if (s < 0 || s >= j->n || !j->tiles[s].jpg) continue;
       out[i] = texDe(j, s);
       if (cueSeg && out[i]) cueSeg[i] = j->tiles[s].pts / 1000.0;
     }
