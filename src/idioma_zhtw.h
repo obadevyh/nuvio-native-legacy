@@ -2932,6 +2932,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "拖動時間軸時顯示縮圖。設定 › 播放 › Seekr。"),
   T("Miniaturas da barra de tempo no player.", "播放器時間軸上的縮圖。"),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas em cache", "Thumbnails cached"),
   T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas iniciadas", "Thumbnails started"),
   T("Miniaturas na barra de tempo", "時間軸縮圖"),

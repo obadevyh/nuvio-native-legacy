@@ -2932,6 +2932,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "シークバーを動かすとサムネイルを表示。設定 › 再生 › Seekr。"),
   T("Miniaturas da barra de tempo no player.", "プレーヤーのタイムバーにサムネイルを表示します。"),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas em cache", "Thumbnails cached"),
   T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas iniciadas", "Thumbnails started"),
   T("Miniaturas na barra de tempo", "タイムバーのサムネイル"),

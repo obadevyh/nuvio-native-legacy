@@ -6532,7 +6532,8 @@ void player_desenhar(Uint32 agora) {
     PlrIlhaPedido pd;
     memset(&pd, 0, sizeof pd);
     pd.icone = "aj_film";
-    pd.texto = thumbnailMilestone == 1 ? i18n("Miniaturas iniciadas")
+    pd.texto = thumbnailMilestone == 4 ? i18n("Miniaturas em cache")
+             : thumbnailMilestone == 1 ? i18n("Miniaturas iniciadas")
              : thumbnailMilestone == 2 ? i18n("Miniaturas 50%") : i18n("Miniaturas geradas");
     pd.semFim = 1; pd.aberta = 1;
     plrilha_pedir(&pd);

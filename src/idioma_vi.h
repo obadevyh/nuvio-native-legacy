@@ -2932,6 +2932,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Ảnh thu nhỏ khi tua trên thanh thời gian. Cài đặt › Phát lại › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Ảnh thu nhỏ trên thanh thời gian của trình phát."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas em cache", "Thumbnails cached"),
   T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas iniciadas", "Thumbnails started"),
   T("Miniaturas na barra de tempo", "Ảnh thu nhỏ trên thanh thời gian"),

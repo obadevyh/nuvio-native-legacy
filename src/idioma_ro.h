@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Miniaturi când derulezi bara de timp. Setări › Redare › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Miniaturi pe bara de timp din player."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas em cache", "Thumbnails cached"),
   T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas iniciadas", "Thumbnails started"),
   T("Miniaturas na barra de tempo", "Miniaturi pe bara de timp"),

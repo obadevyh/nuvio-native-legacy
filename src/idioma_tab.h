@@ -2931,6 +2931,7 @@
   { "Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Thumbnails as you scrub the seek bar. Settings › Playback › Seekr." },
   { "Miniaturas da barra de tempo no player.", "Seek bar thumbnails in the player." },
   { "Miniaturas disponíveis", "Thumbnails available" },
+  { "Miniaturas em cache", "Thumbnails cached" },
   { "Miniaturas geradas", "Thumbnails generated" },
   { "Miniaturas iniciadas", "Thumbnails started" },
   { "Miniaturas na barra de tempo", "Seek bar thumbnails" },

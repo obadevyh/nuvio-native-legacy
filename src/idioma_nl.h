@@ -2932,6 +2932,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Miniaturen bij het scrollen door de tijdbalk. Instellingen › Afspelen › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Miniaturen op de tijdbalk in de speler."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas em cache", "Thumbnails cached"),
   T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas iniciadas", "Thumbnails started"),
   T("Miniaturas na barra de tempo", "Miniaturen op de tijdbalk"),

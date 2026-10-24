@@ -92,7 +92,7 @@ typedef struct {
 typedef struct {
   unsigned g;
   char urlA[4096], cabA[512];
-  int alturaA, larguraSaida, avisoCompleto;
+  int alturaA, larguraSaida, avisoCompleto, cacheChecado, cacheTipo;
   long dur;
   Copia copias[TENTATIVAS];
   int nCopias;
@@ -1143,6 +1143,17 @@ static int carregar(Job *j) {
   return completo && lidos > 0;
 }
 
+// Publish the result before permitting any progress pill. A saved set is not
+// a fresh generation, even when its retained tile count already exceeds 50%.
+static int carregarInformado(Job *j) {
+  int complete = carregar(j);
+  pthread_mutex_lock(&mu);
+  j->cacheTipo = complete ? 2 : j->feitos > 0 ? 1 : 0;
+  j->cacheChecado = 1;
+  pthread_mutex_unlock(&mu);
+  return complete;
+}
+
 typedef struct { char nome[300]; long long tam; time_t quando; } ArqCache;
 static void limparCache(const char *dirArq) {
   char dir[512];
@@ -1645,7 +1656,7 @@ static int trabalharDireto(Job *j, long long *hA) {
   pthread_mutex_lock(&mu); j->direto = 1; pthread_mutex_unlock(&mu);
   snprintf(j->escolhida, sizeof j->escolhida, "playing file %dp (direct, GPU)", j->alturaA);
   snprintf(j->arq, sizeof j->arq, "%s", j->arqDireto);
-  carregar(j);
+  carregarInformado(j);
   falhasSeguidas = 0; decodSeguidas = 0;
   long long perdAntes = mPerdidos();
   Uint32 janela = SDL_GetTicks();
@@ -1975,7 +1986,7 @@ static void *trabalhar(void *u) {
   }
   evRebuffer = evErro = 0;
   if (j->arq[0]) limparCache(j->arq);           // other titles' sets older than 2 h go now
-  if (carregar(j)) { avisoPronto = j->g; goto fim; }                    // a complete saved set: no network at all
+  if (carregarInformado(j)) { avisoPronto = j->g; goto fim; }                    // a complete saved set: no network at all
   if (j->nCopias == 0 && diretoOk && !diretoTentado) {
     printf("[miniatura] no smaller copy in the list: direct mode\n"); fflush(stdout);
     esperarPlayer(j);
@@ -2438,8 +2449,8 @@ int miniatura_status_agora(void) {
   pthread_mutex_lock(&mu);
   Job *j = job;
   int half = j && j->n > 1 && j->feitos * 2 >= j->n - 1;
-  int result = mini_progress(&progresso, j ? j->g : 0, j != NULL, half,
-                             j && j->avisoCompleto, SDL_GetTicks());
+  int result = mini_progress(&progresso, j ? j->g : 0, j && j->cacheChecado, half,
+                             j && j->avisoCompleto, j ? j->cacheTipo : 0, SDL_GetTicks());
   pthread_mutex_unlock(&mu);
   return result;
 }

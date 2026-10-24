@@ -2931,6 +2931,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Мініатюри під час перемотування шкали часу. Налаштування › Відтворення › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Мініатюри на стрічці часу в плеєрі."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas em cache", "Thumbnails cached"),
   T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas iniciadas", "Thumbnails started"),
   T("Miniaturas na barra de tempo", "Мініатюри на стрічці часу"),

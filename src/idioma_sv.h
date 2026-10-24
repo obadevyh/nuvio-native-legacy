@@ -2932,6 +2932,7 @@
   T("Miniaturas ao percorrer a barra de tempo. Ajustes › Reprodução › Seekr.", "Miniatyrer när du spolar i tidslinjen. Inställningar › Uppspelning › Seekr."),
   T("Miniaturas da barra de tempo no player.", "Miniatyrer i tidsfältet i spelaren."),
   T("Miniaturas disponíveis", "Thumbnails available"),
+  T("Miniaturas em cache", "Thumbnails cached"),
   T("Miniaturas geradas", "Thumbnails generated"),
   T("Miniaturas iniciadas", "Thumbnails started"),
   T("Miniaturas na barra de tempo", "Miniatyrer i tidsfältet"),

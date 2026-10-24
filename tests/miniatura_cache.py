@@ -30,7 +30,7 @@ prefix = r'''
 #define CACHE_TTL_S 7200
 #define M_PRONTO 1
 typedef struct { unsigned char *jpg; int n; long pts; unsigned char prov, salvo; unsigned revision; } Tile;
-typedef struct { int n, feitos, direto, appendPronto; long dur; Tile *tiles; unsigned char *tentado; char arq[640]; } Job;
+typedef struct { int n, feitos, direto, appendPronto, cacheTipo, cacheChecado; long dur; Tile *tiles; unsigned char *tentado; char arq[640]; } Job;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static Job *job;
 static int estado;
@@ -51,20 +51,25 @@ int main(int argc, char **argv) {
   salvar(&j,0); assert(size(j.arq)==61);
   salvar(&j,1); assert(size(j.arq)==61); // no duplicate records on repeated checkpoint
   Job resumed=create(argv[1]); job=&resumed;
-  assert(carregar(&resumed)==1 && resumed.feitos==3);
+  assert(carregarInformado(&resumed)==1 && resumed.feitos==3);
+  assert(resumed.cacheChecado && resumed.cacheTipo==2);
   assert(resumed.tiles[2].pts==20000 && !memcmp(resumed.tiles[2].jpg,"def",3));
   release(&resumed);
   FILE *f=fopen(argv[1],"r+b"); assert(f); fseek(f,12,SEEK_SET); escreverI32(f,0); fseek(f,0,SEEK_END);
   escreverI32(f,2); escreverI32(f,20000); escreverI32(f,100); fputc(1,f); fclose(f);
   resumed=create(argv[1]); job=&resumed;
-  assert(!carregar(&resumed) && resumed.feitos==3); // torn tail preserves previous pictures
+  assert(!carregarInformado(&resumed) && resumed.feitos==3);
+  assert(resumed.cacheChecado && resumed.cacheTipo==1); // torn tail preserves previous pictures
   salvar(&resumed,0); assert(size(argv[1])==61); // first checkpoint repairs/truncates old tail
   release(&resumed); release(&j);
+  Job missing=create("/tmp/nuvio-no-such-thumbnail-set.nvm"); job=&missing;
+  assert(!carregarInformado(&missing) && missing.cacheChecado && missing.cacheTipo==0);
+  release(&missing);
   puts("PASS: incremental checkpoints, no duplicate records, resume and interrupted append recovery");
 }
 '''
 source = prefix + "\n".join(extract(sig) for sig in (
-    "static void escreverI32(", "static int lerI32(", "static int carregar(", "static void salvar(")) + checks
+    "static void escreverI32(", "static int lerI32(", "static int carregar(", "static int carregarInformado(", "static void salvar(")) + checks
 with tempfile.TemporaryDirectory(prefix="nuvio-cache-") as tmp:
     c = Path(tmp) / "cache.c"
     exe = Path(tmp) / "cache"
