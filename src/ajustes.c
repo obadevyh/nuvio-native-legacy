@@ -715,6 +715,7 @@ typedef enum {
   AJ_OPENSEEK_SERVIDOR, AJ_OPENSEEK_PAREAR, AJ_OPENSEEK_ESTADO,
   // Aparelho CONVIDADO de uma biblioteca compartilhada: a fonte em uso e os ajustes so deste aparelho.
   AJ_OPENSEEK_COMPART, AJ_OPENSEEK_AJ_M30, AJ_OPENSEEK_AJ_M5, AJ_OPENSEEK_AJ_M1, AJ_OPENSEEK_AJ_P1, AJ_OPENSEEK_AJ_P5, AJ_OPENSEEK_AJ_P30, AJ_OPENSEEK_DESFAZER, AJ_OPENSEEK_REJEITAR,
+  AJ_MINIATURA_RES,
   AJ_N
 } OpcaoId;
 #define AJ_OPENSEEK_ULT AJ_OPENSEEK_REJEITAR
@@ -1856,6 +1857,7 @@ static const Opcao OPCOES[AJ_N] = {
   ACAO("Miniaturas 30 s mais cedo"), ACAO("Miniaturas 5 s mais cedo"), ACAO("Miniaturas 1 s mais cedo"),
   ACAO("Miniaturas 1 s mais tarde"), ACAO("Miniaturas 5 s mais tarde"), ACAO("Miniaturas 30 s mais tarde"),
   ACAO("Desfazer o ajuste"), ACAO("Vídeo errado: rejeitar"),
+  NUM("Resolução das miniaturas", 0, 3, 1, NULL),
 };
 
 // Nome de cada opcao no arquivo. O formato era POSICIONAL — uma linha por
@@ -2186,6 +2188,7 @@ static const char *CHAVE[] = {
   "-openseekServidor", "-openseekParear", "-openseekEstado",
   "-openseekCompart", "-openseekAjM30", "-openseekAjM5", "-openseekAjM1", "-openseekAjP1", "-openseekAjP5", "-openseekAjP30",
   "-openseekDesfazer", "-openseekRejeitar",
+  "miniaturaResolutionLocal",
 };
 // QUATRO VETORES PARALELOS indexados pelo mesmo enum AJ_*: OPCOES, CHAVE,
 // valor e as secoes. OPCOES ja e declarado [AJ_N], e `valor` aceita inicializacao
@@ -4184,6 +4187,7 @@ static const char *seekrMascarada(void) {
 }
 int ajustes_seekr_habilitado(void) { return valor[AJ_SEEKR_LIGADO] == 0; }
 int ajustes_seekr_ligado(void) { return lig(AJ_SEEKR_LIGADO); }
+int ajustes_miniatura_largura(void) { static const int w[] = {0,320,480,640}; int i=valor[AJ_MINIATURA_RES]; return w[i >= 0 && i <= 3 ? i : 0]; }
 int ajustes_seekr_fita(void)   { return lig(AJ_SEEKR_FITA); }
 int ajustes_seekr_ajuste_s(void) { return previaOpenSeek() || previaLocal() ? 0 : valor[AJ_SEEKR_AJUSTE]; }
 
@@ -6100,6 +6104,7 @@ static int somenteDesteAparelho(int op) {
     case AJ_PULAR_ABERTURA: case AJ_PULAR_RESUMO: case AJ_PROXIMO_AUTO: case AJ_PULAR_CREDITOS: case AJ_PROXIMO_CONTAGEM: /* idem: local desta TV */
     case AJ_PLR_FORMATO: /* o web nao tem a fileira de formato */
     case AJ_SEEKR_LIGADO: case AJ_SEEKR_FITA: case AJ_SEEKR_AJUSTE: /* o web nao tem o Seekr */
+    case AJ_MINIATURA_RES:
     case AJ_PREVIA_PROVEDOR: /* idem: o servidor proprio e da casa desta TV */
     case AJ_MENU_EXPLORAR: case AJ_MENU_GUIA: case AJ_MENU_AGENDA: case AJ_MENU_PERFIL:
     // Linha do titulo: o web nao tem, e nenhuma conta pode desliga-las aqui.
@@ -6507,7 +6512,7 @@ static int foraDestaPlataforma(int op) {
   if (op == AJ_DV7) return 1;
 #endif
 #ifndef NV_ANDROID
-  if (op == AJ_FONTE_PRECARREGAR || op == AJ_LEG_SYNC_AUDIO || op == AJ_TUNNELING) return 1;
+  if (op == AJ_MINIATURA_RES || op == AJ_FONTE_PRECARREGAR || op == AJ_LEG_SYNC_AUDIO || op == AJ_TUNNELING) return 1;
 #endif
 #if defined(NV_ANDROID) && !defined(NV_P2P_MOTOR)
   if (op == AJ_P2P_LIMITE || op == AJ_P2P_DESTINO) return 1;
@@ -7308,6 +7313,7 @@ static int visivel(int i) {
     if (!ajOpcaoDisponivel(op) || !ajIptvLinhaVisivel(op)) return 0;
     // #205: o fundo so existe no layout Dinamica; a cor, so com o fundo "Cor".
     if ((op == AJ_FUNDO_DIN || op == AJ_FUNDO_DIN_COR) && ajustes_home_layout() != HOME_LAYOUT_DINAMICA) return 0;
+    if (op == AJ_MINIATURA_RES && !previaLocal()) return 0;
     // Miniaturas: so as opcoes do provedor escolhido. A sincronia manual existe
     // para a folha do Seekr tirada de OUTRA versao; a do OpenSeek e do proprio video.
     if ((op == AJ_SEEKR_CHAVE || op == AJ_SEEKR_TESTAR || op == AJ_SEEKR_AJUSTE) && (previaOpenSeek() || previaLocal())) return 0;
@@ -7886,6 +7892,7 @@ static const char *ajudaOpcaoBase(int op) {
     case AJ_MDB_LIGADO: return "O MDBList junta notas de várias fontes na página do título. Desligar esconde a fileira inteira.";
     case AJ_MDB_CHAVE: return "A chave vem da sua conta Nuvio ou do arquivo do pacote. Não dá para digitar nesta TV.";
     case AJ_SEEKR_LIGADO: case AJ_SEEKR_CHAVE: return seekrAjuda(op);
+    case AJ_MINIATURA_RES: return "Tamanho das miniaturas feitas neste aparelho. Automático mantém o perfil recomendado. Vale no próximo vídeo; resoluções maiores usam mais recursos.";
     case AJ_SEEKR_FITA: return "Mostra o quadro anterior e o seguinte ao lado da miniatura, com o tempo de cada um. Deixa claro que há um quadro a cada 10 segundos.";
     case AJ_SEEKR_AJUSTE: return "Use quando a miniatura mostra sempre a cena de alguns segundos antes ou depois. Acontece quando a sua versão do título é diferente da usada pelo Seekr (outro corte, abertura mais longa). Vale para todos os títulos; volte a 0 ao trocar de filme.";
     case AJ_SEEKR_TESTAR: return seekrAjuda(op);
@@ -10007,6 +10014,7 @@ static int nValores(int op) {
 // Texto do valor de uma linha. Buffer estatico porque so uma linha e desenhada
 // por vez dentro de desenhaLinha.
 static const char *textoValor(int op) {
+  if (op == AJ_MINIATURA_RES) { static const char *labels[] = {"Automático", "180p (320 x 180)", "270p (480 x 270)", "360p (640 x 360)"}; return i18n(labels[valor[op] >= 0 && valor[op] <= 3 ? valor[op] : 0]); }
   if (op == AJ_FONTE_AUTO && ajustes_fonte_prioridade() == 3) return i18n("Primeira da lista");
   if(op==AJ_GUIA_CATEGORIAS)return i18n("Abrir");
   // Fora de 1080p/720p a linha mostra o valor EFETIVO, nao o gravado.

@@ -1145,12 +1145,23 @@ object NvPlayer {
             liberar()
         }
     }
+    // Diagnostic only: bounded output-frame samples per user seek, no URL/media ID.
+    private class SeekAudit(val id: Int, val session: Int, val targetMs: Long, val sinceMs: Long) {
+        val frames = java.util.concurrent.atomic.AtomicInteger()
+    }
+    private var seekAuditId = 0
+    private val seekAudit = java.util.concurrent.atomic.AtomicReference<SeekAudit?>()
     @JvmStatic fun buscar(ms: Int) {
         val pedido = pedidos.get()
         principal.post {
             if (pedido == pedidos.get()) {
+                val p = player ?: return@post
+                val target = ms.coerceAtLeast(0).toLong()
+                val audit = SeekAudit(++seekAuditId, sessao, target, SystemClock.elapsedRealtime())
+                seekAudit.set(audit)
+                Log.i(TAG, "[seek-audit] request id=${audit.id} session=$sessao targetMs=$target beforeMs=${p.currentPosition} bufferedMs=${p.bufferedPosition} state=${p.playbackState} toleranceBeforeUs=${p.seekParameters.toleranceBeforeUs} toleranceAfterUs=${p.seekParameters.toleranceAfterUs}")
                 relatarAudio(sessao, "seek alvoMs=$ms")
-                player?.seekTo(ms.coerceAtLeast(0).toLong())
+                p.seekTo(target)
             }
         }
     }
@@ -1489,6 +1500,17 @@ object NvPlayer {
             ouvinteAtual = ouv; analiticoAtual = ana
             p.addListener(ouv)
             p.addAnalyticsListener(ana)
+            p.setVideoFrameMetadataListener { ptsUs, _, _, _ ->
+                val audit = seekAudit.get()
+                if (audit != null && audit.session == minha) {
+                    val elapsed = SystemClock.elapsedRealtime() - audit.sinceMs
+                    val frame = audit.frames.getAndIncrement()
+                    if (frame < 16 && elapsed <= 10000) {
+                        Log.i(TAG, "[seek-audit] output id=${audit.id} frame=$frame ptsMs=${ptsUs / 1000} targetMs=${audit.targetMs} deltaMs=${ptsUs / 1000 - audit.targetMs} elapsedMs=$elapsed")
+                    }
+                    if (frame >= 15 || elapsed > 10000) seekAudit.compareAndSet(audit, null)
+                }
+            }
 
             val sv = superficie
             if (sv != null) {
@@ -1564,6 +1586,7 @@ object NvPlayer {
         val p = player
         player = null
         pronto = false
+        seekAudit.set(null)
         miniaturaTocou = false; miniaturaTocando = false
         duracaoEnviada = -1
         videoW = 0; videoH = 0
@@ -1709,7 +1732,7 @@ object NvPlayer {
 
     // Retangulo em coordenadas de layout 1920x1080; aceita origem NEGATIVA e
     // tamanho maior que a tela (zoom): a camada recorta o excedente.
-    // `encaixa`: janela LISA do nucleo — o quadro encaixa no retangulo com
+    // `encaixa`: janela LISA do nucleo â€” o quadro encaixa no retangulo com
     // tarja, como o plano da LG e o LetterBox da Samsung. Sem isso o trailer
     // em "Original" (Apple 2,4:1) saia esticado em 16:9. Recorte (encaixa =
     // false) ja vem com a proporcao certa e e aplicado exato.
@@ -1819,7 +1842,7 @@ object NvPlayer {
         // plano da TCL fica preso na geometria de abertura e a troca Crop ->
         // Ajuste nao aparece (revisao 14/10). DV nativo dispensa a recriacao
         // da ABERTURA (ver recriarSuperficie); depois de estavel, a troca de
-        // modo e um pedido do dono e o veto nao se aplica — o plano da TCL so
+        // modo e um pedido do dono e o veto nao se aplica â€” o plano da TCL so
         // acompanha a geometria nova com a camada nascendo de novo.
         if (ultHdr.isEmpty() || ultHdr == "none") recriarSuperficie(RECRIA_ESPERA_MS)
         else if (estavelEmitido) recriarSuperficie(RECRIA_ESPERA_HDR_MS)
@@ -1871,7 +1894,7 @@ object NvPlayer {
         // virou DV nativo enquanto a recriacao esperava, desistir agora e mais
         // barato que desligar a saida do decoder e religar o DispLink da TCL
         // (15 s no log do dono). O evento de superficie estavel segue normal.
-        // Depois de estavel o pedido e do dono trocando o aspecto — recria
+        // Depois de estavel o pedido e do dono trocando o aspecto â€” recria
         // mesmo em DV, que e o unico gesto que muda a geometria do plano.
         if (decoderDv && !estavelEmitido) { avaliarEstavel(); return@Runnable }
         val p = player
@@ -1919,7 +1942,7 @@ object NvPlayer {
         Log.i(TAG, "[dvtrace] pedido sessao=$sessao holder=${System.identityHashCode(superficie?.holder)} atrasoMs=$atrasoMs hdr=$ultHdr quadro=$quadroVisto semRecriar=$semRecriar soltando=${soltando != null}")
         // DV nativo so dispensa a recriacao da ABERTURA (a que nasce antes de
         // a superficie estabilizar): depois de estavel, a troca de aspecto e o
-        // gesto que o dono fazia na mao para o Dolby ligar — vetar aqui deixava
+        // gesto que o dono fazia na mao para o Dolby ligar â€” vetar aqui deixava
         // o plano preso na geometria de abertura e nenhum modo mudava (TCL,
         // 14/10). O veto do HDR sozinho ja cobre a transicao (hdrNaSuperficie).
         if (semRecriar || (decoderDv && !estavelEmitido)) return
@@ -2084,7 +2107,10 @@ object NvPlayer {
                                              newPosition: Player.PositionInfo, reason: Int) {
             if (!atual(minha)) return
             val p = player ?: return
-            if (!p.isCurrentMediaItemLive) return
+            if (!p.isCurrentMediaItemLive) {
+                Log.i(TAG, "[seek-audit] discontinuity id=$seekAuditId session=$minha reason=$reason oldMs=${oldPosition.positionMs} newMs=${newPosition.positionMs} state=${p.playbackState}")
+                return
+            }
             // Numeric timing only: never log media IDs, manifest URLs or labels.
             val linha = "[live] discontinuity sessao=$minha reason=$reason oldMs=${oldPosition.positionMs} newMs=${newPosition.positionMs} offsetMs=${p.currentLiveOffset} state=${p.playbackState} bufferedMs=${p.totalBufferedDuration}"
             Log.i(TAG, linha)

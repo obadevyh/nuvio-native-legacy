@@ -940,8 +940,10 @@ object MiniaturaMotor {
     // debug.nuvio.miniatura bits (read by the C side when a title starts): 2 = old closest-cue prefetch (A/B)
     @Volatile private var cueMaisPerto = false
     @Volatile private var perfilBits = 0
+    @Volatile private var perfilLargura = 0
     @JvmStatic
-    fun configurar(bits: Int) {
+    fun configurar(bits: Int, largura: Int) {
+        perfilLargura = largura
         perfilBits = bits
         cueMaisPerto = bits and 2 != 0
         dumpar = if (bits and 16 != 0) 12 else 0
@@ -1358,7 +1360,7 @@ object MiniaturaMotor {
             val am = NvPlayer.contexto()?.getSystemService(android.content.Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
             val info = android.app.ActivityManager.MemoryInfo()
             am?.getMemoryInfo(info)
-            val w = miniaturaLargura(am?.isLowRamDevice == true, info.totalMem, perfilBits)
+            val w = miniaturaLargura(am?.isLowRamDevice == true, info.totalMem, perfilBits, perfilLargura)
             GpuMiniatura(w, w * 9 / 16).also {
                 if (!it.iniciar()) { it.soltar(); Log.w(TAG, "direct: GPU step failed to start"); s.errosCodec = 2; return null }
                 Log.i(TAG, "direct: thumbnail output ${it.largura}x${it.altura}")
@@ -1685,15 +1687,17 @@ object MiniaturaMotor {
         out.write(1)
         out.write(sig)
         if (jpeg) {
+            val outputW = when (val chosen = perfilLargura) { 320, 480, 640 -> chosen; else -> TW }
+            val outputH = outputW * 9 / 16
             s.uArr = copia(pu.buffer, s.uArr); s.vArr = copia(pv.buffer, s.vArr)
             val ua8 = s.uArr; val va8 = s.vArr
             // The picture keeps ITS shape inside the 16:9 thumbnail, with black bars, as it looks on the TV. Measured
             // 22/10: a 1280x536 (2.39:1) copy squeezed into 480x270 stretched everything vertically.
-            val px = IntArray(TW * TH) { 0xff000000.toInt() }
+            val px = IntArray(outputW * outputH) { 0xff000000.toInt() }
             val dw: Int; val dh: Int
-            if (w.toLong() * TH >= h.toLong() * TW) { dw = TW; dh = ((TW.toLong() * h / w).toInt() / 2 * 2).coerceIn(2, TH) }
-            else { dh = TH; dw = ((TH.toLong() * w / h).toInt() / 2 * 2).coerceIn(2, TW) }
-            val ox = (TW - dw) / 2; val oy = (TH - dh) / 2
+            if (w.toLong() * outputH >= h.toLong() * outputW) { dw = outputW; dh = ((outputW.toLong() * h / w).toInt() / 2 * 2).coerceIn(2, outputH) }
+            else { dh = outputH; dw = ((outputH.toLong() * w / h).toInt() / 2 * 2).coerceIn(2, outputW) }
+            val ox = (outputW - dw) / 2; val oy = (outputH - dh) / 2
             // 2x2 samples per output pixel (not one): far less aliasing on edges and text, for 3 more reads each
             val qx = maxOf(1, w / (dw * 4)); val qy = maxOf(1, h / (dh * 4))
             for (ty in 0 until dh) {
@@ -1711,10 +1715,10 @@ object MiniaturaMotor {
                     val r = ((c + 409 * v + 128) shr 8).coerceIn(0, 255)
                     val g = ((c - 100 * u - 208 * v + 128) shr 8).coerceIn(0, 255)
                     val b = ((c + 516 * u + 128) shr 8).coerceIn(0, 255)
-                    px[(oy + ty) * TW + ox + tx] = (0xff shl 24) or (r shl 16) or (g shl 8) or b
+                    px[(oy + ty) * outputW + ox + tx] = (0xff shl 24) or (r shl 16) or (g shl 8) or b
                 }
             }
-            val bmp = Bitmap.createBitmap(px, TW, TH, Bitmap.Config.ARGB_8888)
+            val bmp = Bitmap.createBitmap(px, outputW, outputH, Bitmap.Config.ARGB_8888)
             bmp.compress(Bitmap.CompressFormat.JPEG, 80, out)
             bmp.recycle()
         }

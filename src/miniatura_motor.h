@@ -56,6 +56,7 @@ typedef struct {
 
 // Read tuning. Defaults (mini_motor_config_padrao) are the TV-tested values.
 typedef struct {
+  int larguraSaida;    // 0=default 320; or 320/480/640, 16:9
   int lerBlocos;        // 256 KiB blocks per range request, 1..7 (default 4 = 1 MiB)
   int prefetch;         // 1 = fetch the next keyframe (mini_motor_proximo) during a decode
   int tsBlocos;         // MPEG-TS: blocks per request while reading forward (default 7)

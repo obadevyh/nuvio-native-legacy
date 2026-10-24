@@ -5,9 +5,12 @@
 #ifndef NV_ANDROID
 const SeekrProvedor *miniatura_provedor(void) { return NULL; }
 int miniatura_prontas_agora(void) { return 0; }
+int miniatura_status_agora(void) { return 0; }
+int miniatura_direto(void) { return 0; }
 void miniatura_preaquecer(const char *url, const char *cabecalhos) { (void)url; (void)cabecalhos; }
 #else
 #include "dados.h"
+#include "ajustes.h"
 #include "gfx.h"
 #include "streams.h"
 #include "video.h"
@@ -29,6 +32,7 @@ void miniatura_preaquecer(const char *url, const char *cabecalhos) { (void)url; 
 #include "miniplat.h"
 #include "miniatura_pixels.h"
 #include "miniatura_lifecycle.h"
+#include "miniatura_progress.h"
 #include <stdatomic.h>
 #ifdef NV_MINI_FFMPEG
 #include "miniatura_motor.h"   // CPU route: Namer03's FFmpeg engine (packet mode)
@@ -88,7 +92,7 @@ typedef struct {
 typedef struct {
   unsigned g;
   char urlA[4096], cabA[512];
-  int alturaA;
+  int alturaA, larguraSaida, avisoCompleto;
   long dur;
   Copia copias[TENTATIVAS];
   int nCopias;
@@ -126,6 +130,12 @@ typedef struct {
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static Job *job;
 static int estado = M_PARADO;
+int miniatura_direto(void) {
+  pthread_mutex_lock(&mu);
+  int direct = job && job->direto;
+  pthread_mutex_unlock(&mu);
+  return direct;
+}
 static unsigned geracao;
 static char urlAtual[4096];
 static volatile long posMs, playheadMs;
@@ -133,7 +143,7 @@ static volatile int scrubbing, bufferando;
 static char origem[48] = "";      // what the thumbnails came from (log + label)
 static volatile unsigned avisoPronto;
 static volatile int evRebuffer, evErro;   // playback events during the title (summary)
-static Uint32 prontoDesde;          // when the playing title's set completed (the player shows it 4 s)
+static MiniProgress progresso;
 static int motivoSem;            // M_FALHOU because: 0 the video would not open, 1 no smaller copy usable
    // generation whose set just completed (pPedir shows the notice)
 
@@ -173,7 +183,7 @@ static int jniPreparar(void) {
     jAlvo = (*env)->GetStaticMethodID(env, c, "alvo", "(J)Ljava/lang/String;");
     jLote = (*env)->GetStaticMethodID(env, c, "lote", "(J)I");
     jDiag = (*env)->GetStaticMethodID(env, c, "diag", "(Z)Ljava/lang/String;");
-    jConfig = (*env)->GetStaticMethodID(env, c, "configurar", "(I)V");
+    jConfig = (*env)->GetStaticMethodID(env, c, "configurar", "(II)V");
     jPerdidos = (*env)->GetStaticMethodID(env, c, "perdidos", "()J");
     jAbrirDireto = (*env)->GetStaticMethodID(env, c, "abrirDireto", "(Ljava/lang/String;Ljava/lang/String;)J");
     jQuadroDireto = (*env)->GetStaticMethodID(env, c, "quadroDireto", "(JJ)[B");
@@ -446,7 +456,7 @@ static int bitsDebug(void) {
 }
 static void mConfigurar(int bits) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
-  (*env)->CallStaticVoidMethod(env, cls, jConfig, (jint)bits);
+  (*env)->CallStaticVoidMethod(env, cls, jConfig, (jint)bits, (jint)ajustes_miniatura_largura());
   if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
 }
 static long long mRitmo(void) {
@@ -1598,6 +1608,7 @@ void miniatura_preaquecer(const char *url, const char *cabecalhos) {
   pthread_mutex_unlock(&muPre);
   if (velho) mFechar(velho);                    // a title that never started its job
   if (bitsDebug() & 8 || !jniPreparar()) return;
+  mConfigurar(bitsDebug());
   PreArgs *a = calloc(1, sizeof *a);
   if (!a) return;
   snprintf(a->url, sizeof a->url, "%s", url);
@@ -1631,7 +1642,7 @@ static int trabalharDireto(Job *j, long long *hA) {
   if (!*hA) *hA = mAbrirDireto(j->urlA, j->cabA);
   if (!*hA) { printf("[miniatura] direct: the playing file cannot be used (see the engine log): trying the copies\n"); fflush(stdout); return 0; }
   snprintf(origem, sizeof origem, "playing %dp (direct)", j->alturaA);
-  j->direto = 1;
+  pthread_mutex_lock(&mu); j->direto = 1; pthread_mutex_unlock(&mu);
   snprintf(j->escolhida, sizeof j->escolhida, "playing file %dp (direct, GPU)", j->alturaA);
   snprintf(j->arq, sizeof j->arq, "%s", j->arqDireto);
   carregar(j);
@@ -1822,6 +1833,9 @@ static int trabalharDireto(Job *j, long long *hA) {
         mInfo(*hA, inf);
         cf.cpu = mini_motor_abrir_pacotes(cpuCod == 1, (int)inf[1], (int)inf[2], inf[3] != 0, e, sizeof e);
         if (cf.cpu) {
+          MiniConfig config; mini_motor_config_padrao(&config);
+          config.larguraSaida = j->larguraSaida;
+          mini_motor_config(cf.cpu, &config);
           cf.j = j; cf.h = *hA; cf.pend = pend; cf.nPend = &nPend; cf.mp = &mp; cf.limite = cpuLimite;
           // 2 slice/WPP threads for pictures above 1080p (Shield: one A57 core took ~400 ms per 4K keyframe; x265
           // streams are WPP-coded, so rows decode in parallel), 1 below (~95 ms already)
@@ -1961,7 +1975,7 @@ static void *trabalhar(void *u) {
   }
   evRebuffer = evErro = 0;
   if (j->arq[0]) limparCache(j->arq);           // other titles' sets older than 2 h go now
-  if (carregar(j)) goto fim;                    // a complete saved set: no network at all
+  if (carregar(j)) { avisoPronto = j->g; goto fim; }                    // a complete saved set: no network at all
   if (j->nCopias == 0 && diretoOk && !diretoTentado) {
     printf("[miniatura] no smaller copy in the list: direct mode\n"); fflush(stdout);
     esperarPlayer(j);
@@ -2221,7 +2235,7 @@ static void prepararPixelsDireto(Job *j, long long h, int k, long pts) {
   unsigned char *rgba = buffer ? (*env)->GetDirectBufferAddress(env, buffer) : NULL;
   jlong size = buffer ? (*env)->GetDirectBufferCapacity(env, buffer) : 0;
   SDL_Surface *surface = NULL;
-  if (rgba && w > 0 && w <= 480 && hgt > 0 && hgt <= 270 && size >= (jlong)w * hgt * 4) {
+  if (rgba && w > 0 && w <= 640 && hgt > 0 && hgt <= 360 && size >= (jlong)w * hgt * 4) {
     surface = SDL_CreateRGBSurfaceWithFormat(0, w, hgt, 32, SDL_PIXELFORMAT_ABGR8888);
     if (surface) for (int y = 0; y < hgt; y++) memcpy((unsigned char *)surface->pixels + y * surface->pitch, rgba + y * w * 4, (size_t)w * 4);
   }
@@ -2350,7 +2364,7 @@ static void pPedir(const SeekrFonte *f) {
   posMs = f->posMs; playheadMs = f->playheadMs; scrubbing = f->scrubbing;
   if (avisoPronto && avisoPronto == geracao) {          // the playing title's set is complete
     avisoPronto = 0;
-    prontoDesde = SDL_GetTicks();
+    pthread_mutex_lock(&mu); if (job && job->g == geracao) job->avisoCompleto = 1; pthread_mutex_unlock(&mu);
   }
   bufferando = video_bufferando_ms() > 0;
   { static int bAntes, eAntes;
@@ -2371,8 +2385,12 @@ static void pPedir(const SeekrFonte *f) {
   j->tentado = calloc((size_t)j->n, 1);
   if (!j->tiles || !j->tentado) { free(j->tiles); free(j->tentado); free(j); return; }
   snprintf(j->urlA, sizeof j->urlA, "%s", f->url);
-  chaveArquivo(f, j->arq, sizeof j->arq, "");
-  chaveArquivo(f, j->arqDireto, sizeof j->arqDireto, "direct-gpu-kf1");
+  j->larguraSaida = ajustes_miniatura_largura();
+  char cacheMode[64];
+  snprintf(cacheMode, sizeof cacheMode, "thumb-w%d", j->larguraSaida);
+  chaveArquivo(f, j->arq, sizeof j->arq, cacheMode);
+  snprintf(cacheMode, sizeof cacheMode, "direct-gpu-kf1-w%d", j->larguraSaida);
+  chaveArquivo(f, j->arqDireto, sizeof j->arqDireto, cacheMode);
   snprintf(j->cabA, sizeof j->cabA, "%s", f->cabecalhos ? f->cabecalhos : "");
   const Stream *st = stream_item(stream_atual());
   j->alturaA = st ? st->altura : 0;
@@ -2416,10 +2434,14 @@ static const SeekrProvedor PROVEDOR = {
   pTemChave, pEstado, pRotulo, pUso, pTentar, pPedir, pDesligar, pQuadros, pVelho, pOcioso
 };
 const SeekrProvedor *miniatura_provedor(void) { return &PROVEDOR; }
-int miniatura_prontas_agora(void) {
-  if (!prontoDesde) return 0;
-  if (SDL_GetTicks() - prontoDesde < 4000u) return 1;
-  prontoDesde = 0;
-  return 0;
+int miniatura_status_agora(void) {
+  pthread_mutex_lock(&mu);
+  Job *j = job;
+  int half = j && j->n > 1 && j->feitos * 2 >= j->n - 1;
+  int result = mini_progress(&progresso, j ? j->g : 0, j != NULL, half,
+                             j && j->avisoCompleto, SDL_GetTicks());
+  pthread_mutex_unlock(&mu);
+  return result;
 }
+int miniatura_prontas_agora(void) { return miniatura_status_agora() == 3; }
 #endif

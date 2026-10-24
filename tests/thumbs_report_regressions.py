@@ -72,6 +72,10 @@ int main(void) {
   memset(&storage,0,sizeof storage); storage.n=100;
   assert(!pQuadros(60,3,out,cues));
   assert(!out[0] && !out[1] && !out[2]);
+  // Occupied nominal 60s slot displays a 62s keyframe without stale indication.
+  tile(6,62000);
+  assert(pQuadros(60,1,out,cues) && cues[0]==62 && !velho);
+  printf("PTS CHECK: cursor=60s, displayed keyframe=%.1fs, stale=%d\n", cues[0], velho);
   char target[64]; CatItem series={"series","tt123"}, movie={"movie","tt456"};
   sheet=1; folhaTocarT=1; folhaTocarE=4;
   idDoAlvo(&series,target,sizeof target);
