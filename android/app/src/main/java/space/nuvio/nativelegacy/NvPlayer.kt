@@ -1121,7 +1121,10 @@ object NvPlayer {
         val pedido = pedidos.incrementAndGet()
         principal.post { if (pedido == pedidos.get()) liberar() }
     }
-    private var pausaPedida = false
+    @Volatile private var pausaPedida = false
+    @Volatile private var miniaturaTocou = false
+    @Volatile private var miniaturaTocando = false
+    internal fun miniaturaPodeCriar(): Boolean = !miniaturaTocando && (!miniaturaTocou || pausaPedida)
     @JvmStatic fun pausar(p: Int) {
         principal.post { pausaPedida = p != 0; player?.playWhenReady = !pausaPedida }
     }
@@ -1561,6 +1564,7 @@ object NvPlayer {
         val p = player
         player = null
         pronto = false
+        miniaturaTocou = false; miniaturaTocando = false
         duracaoEnviada = -1
         videoW = 0; videoH = 0
         temJanela = false
@@ -2055,7 +2059,8 @@ object NvPlayer {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!atual(minha)) return
             val p = player ?: return
-            if (isPlaying) { if (pronto) ev(EV_TOCANDO) }
+            miniaturaTocando = isPlaying
+            if (isPlaying) { miniaturaTocou = true; if (pronto) ev(EV_TOCANDO) }
             // Parar de tocar por buffer nao e pausa (o evento 7 ja disse).
             else if (!p.playWhenReady && p.playbackState != Player.STATE_ENDED) ev(EV_PAUSADO)
         }

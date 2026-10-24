@@ -1148,9 +1148,11 @@ object MiniaturaMotor {
     @JvmStatic
     fun soltarDecoder(h: Long) {
         val s = sessoes[h] ?: return
-        try { s.dec?.stop() } catch (_: Exception) {}
-        try { s.dec?.release() } catch (_: Exception) {}
+        val dec = s.dec ?: return
         s.dec = null
+        try { dec.stop() } catch (_: Exception) {}
+        try { dec.release() } catch (_: Exception) {}
+        Log.i(TAG, "decoder released: session=$h")
     }
 
     @JvmStatic
@@ -1325,6 +1327,9 @@ object MiniaturaMotor {
     fun prepararDecoder(h: Long): Int = try { val s = sessoes[h]; if (s != null && decoderDireto(s) != null) 1 else 0 } catch (e: Exception) { 0 }
 
     @JvmStatic
+    fun decoderPronto(h: Long): Int = if (sessoes[h]?.dec != null) 1 else 0
+
+    @JvmStatic
     fun keyframeMs(h: Long, tMs: Long): Long = try { sessoes[h]?.fonte?.keyframeMs(tMs) ?: -1L } catch (e: Exception) { -1L }
 
     // The hardware decoder for this source rendering into the GPU step's Surface. Rate-limited like decoder().
@@ -1335,6 +1340,19 @@ object MiniaturaMotor {
             val espera = ultimaCriacao + 2000 - android.os.SystemClock.elapsedRealtime()
             if (espera > 0) Thread.sleep(espera)
             ultimaCriacao = android.os.SystemClock.elapsedRealtime()
+        }
+        // Recheck after the rate-limit wait: playback may have resumed meanwhile.
+        if (!NvPlayer.miniaturaPodeCriar()) {
+            Log.i(TAG, "direct: decoder admission denied: playback active")
+            return null
+        }
+        val amMemory = NvPlayer.contexto()?.getSystemService(android.content.Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+        val memory = android.app.ActivityManager.MemoryInfo()
+        amMemory?.getMemoryInfo(memory)
+        val reserve = miniaturaReservaBytes(s.fmt.getInteger(MediaFormat.KEY_WIDTH), s.fmt.getInteger(MediaFormat.KEY_HEIGHT), s.hdr || s.mime != "video/avc")
+        if (!miniaturaMemoriaAdmite(memory.availMem, reserve)) {
+            Log.i(TAG, "direct: decoder admission denied: available=${memory.availMem shr 20} MiB reserve=${reserve shr 20} MiB")
+            return null
         }
         val g = s.gpu ?: run {
             val am = NvPlayer.contexto()?.getSystemService(android.content.Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
@@ -1362,6 +1380,7 @@ object MiniaturaMotor {
         for (nome in nomes) {
             var c: MediaCodec? = null
             try {
+                if (!NvPlayer.miniaturaPodeCriar()) return null
                 c = MediaCodec.createByCodecName(nome)
                 if (s.travadas == 0) f.setInteger(MediaFormat.KEY_PRIORITY, 1) else f.removeKey(MediaFormat.KEY_PRIORITY)
                 c.configure(f, g.surface, null, 0)
@@ -1430,7 +1449,7 @@ object MiniaturaMotor {
             }
             msSeek += android.os.SystemClock.elapsedRealtime() - ts0
             s.fonte.ajustarJanela(n)
-            val dec = decoderDireto(s) ?: return motivo(s, tMs, "direct: no decoder")
+            val dec = s.dec ?: return motivo(s, tMs, "direct: decoder released; explicit admission required")
             val g = s.gpu ?: return null
             dec.flush()
             g.descartarPendentes()

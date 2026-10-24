@@ -28,6 +28,8 @@ void miniatura_preaquecer(const char *url, const char *cabecalhos) { (void)url; 
 #include <sys/system_properties.h>
 #include "miniplat.h"
 #include "miniatura_pixels.h"
+#include "miniatura_lifecycle.h"
+#include <stdatomic.h>
 #ifdef NV_MINI_FFMPEG
 #include "miniatura_motor.h"   // CPU route: Namer03's FFmpeg engine (packet mode)
 #endif
@@ -139,7 +141,7 @@ static int motivoSem;            // M_FALHOU because: 0 the video would not open
 static jclass cls;
 static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo, jLote,
                  jDiag, jConfig, jPerdidos, jAbrirDireto, jQuadroDireto, jKeyframe, jDiagDireto, jHeap, jAudio, jCodecCpu, jPacoteCpu, jPrepDec,
-                 jPixelsDireto, jPixelsDimensoes;
+                 jPixelsDireto, jPixelsDimensoes, jDecPronto;
 static void prepararPixelsDireto(Job *j, long long h, int k, long pts);
 
 static int jniPreparar(void) {
@@ -182,10 +184,11 @@ static int jniPreparar(void) {
     jCodecCpu = (*env)->GetStaticMethodID(env, c, "codecCpu", "(J)I");
     jPacoteCpu = (*env)->GetStaticMethodID(env, c, "pacoteCpu", "(JJ)[B");
     jPrepDec = (*env)->GetStaticMethodID(env, c, "prepararDecoder", "(J)I");
+    jDecPronto = (*env)->GetStaticMethodID(env, c, "decoderPronto", "(J)I");
     jPixelsDireto = (*env)->GetStaticMethodID(env, c, "pixelsDireto", "(J)Ljava/nio/ByteBuffer;");
     jPixelsDimensoes = (*env)->GetStaticMethodID(env, c, "pixelsDimensoes", "(J)I");
     if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jCont || !jAlvo || !jLote ||
-        !jDiag || !jConfig || !jPerdidos || !jAbrirDireto || !jQuadroDireto || !jKeyframe || !jDiagDireto || !jHeap || !jAudio || !jCodecCpu || !jPacoteCpu || !jPrepDec || !jPixelsDireto || !jPixelsDimensoes) {
+        !jDiag || !jConfig || !jPerdidos || !jAbrirDireto || !jQuadroDireto || !jKeyframe || !jDiagDireto || !jHeap || !jAudio || !jCodecCpu || !jPacoteCpu || !jPrepDec || !jDecPronto || !jPixelsDireto || !jPixelsDimensoes) {
       (*env)->ExceptionClear(env);
     } else {
       cls = (jclass)(*env)->NewGlobalRef(env, c);
@@ -413,6 +416,12 @@ static int mPacoteCpu(long long h, long tMs, long *pts, unsigned char **pk, int 
 static int mPrepararDecoder(long long h) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jint r = (*env)->CallStaticIntMethod(env, cls, jPrepDec, (jlong)h);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 0; }
+  return r;
+}
+static int mDecoderPronto(long long h) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jint r = (*env)->CallStaticIntMethod(env, cls, jDecPronto, (jlong)h);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 0; }
   return r;
 }
@@ -1426,7 +1435,7 @@ static int restamNaEtapa(const Job *j, int passo) {
 // ---- SMART PER DEVICE: the CPU route's measured cost on THIS device ----
 // <data>/miniaturas/perfil-cpu.txt: average ms per CPU thumbnail and samples, for pictures up to 1080p and above.
 // While the film plays, downloaded keyframes are decoded on the CPU (Namer03's engine: no hardware decoder, so no
-// HDMI underrun) at most ~half of one core; the hardware burst still runs at the first pause/scrub. A class whose
+// HDMI underrun) at most ~half of one core; the hardware burst still runs at a confirmed pause. A class whose
 // average exceeds its limit (too slow to be worth the CPU next to playback) is skipped on this device until the
 // measurement says otherwise (a title that ran it updates the average). debug.nuvio.miniatura bit 32: CPU route off.
 #define CPU_MAX_MS_HD 1200
@@ -1481,7 +1490,7 @@ static void guardarTileDireto(Job *j, long p, unsigned char *jpg, int nj, int *f
 // for a minute after contention. Fonte's entry points are synchronised on the Kotlin side.
 typedef struct {
   Job *j; long long h; MiniMotor *cpu; long *pend; int *nPend; pthread_mutex_t *mp;
-  volatile int pausa, fim, desligar, recusou, cuidado;
+  _Atomic int pausa, fim, desligar, recusou, cuidado;
   long soma, decSoma, limite; int falhas, feitosAqui, semBloco, threads;
 } CpuFaixa;
 static void *cpuTrabalho(void *u) {
@@ -1500,7 +1509,7 @@ static void *cpuTrabalho(void *u) {
     int r = -1;
     if (!mPacoteCpu(cf->h, kf, &p, &pk, &npk)) {
       // no block to hand over (a layout the block reader does not take, measured 23/10 on a 1080p episode): the
-      // hardware path reads it through the extractor at the first pause/scrub. Not a CPU failure.
+      // hardware path reads it through the extractor at a confirmed pause. Not a CPU failure.
       if (mFalhaRede(cf->h) == 2) cf->recusou = 1;
       pthread_mutex_lock(cf->mp);
       cf->pend[(*cf->nPend)++] = kf;
@@ -1510,6 +1519,15 @@ static void *cpuTrabalho(void *u) {
       continue;
     }
     cf->semBloco = 0;
+    // A packet read may have blocked across a pause/handover. Do not begin a
+    // fresh decode after admission was revoked; preserve the queued keyframe.
+    if (cf->fim || cf->pausa || parou(j)) {
+      free(pk);
+      pthread_mutex_lock(cf->mp);
+      cf->pend[(*cf->nPend)++] = kf;
+      pthread_mutex_unlock(cf->mp);
+      continue;
+    }
     r = mini_motor_pacote(cf->cpu, pk, npk, cf->threads, &jpg, &nj, &q, e, sizeof e);
     free(pk);
     if (r < 0) {
@@ -1530,7 +1548,7 @@ static void *cpuTrabalho(void *u) {
     guardarTileDireto(j, p, jpg, nj, &cf->feitosAqui);
     if (j->cpuFeitos == CPU_AMOSTRAS && j->cpuMs > cf->limite) {
       cf->desligar = 1;
-      printf("[miniatura] cpu route: %ld ms per thumbnail on this device (> %ld): off, hardware burst at the first pause/scrub\n",
+      printf("[miniatura] cpu route: %ld ms per thumbnail on this device (> %ld): off, hardware burst at a confirmed pause\n",
              j->cpuMs, cf->limite);
       fflush(stdout);
     }
@@ -1558,7 +1576,7 @@ static void *preTrabalho(void *u) {
   Uint32 t0 = SDL_GetTicks();
   long long h = mAbrirDireto(a->url, a->cab);
   int dec = 0;
-  if (h && !video_tocando() && !video_falhou()) dec = mPrepararDecoder(h);
+  if (h && !video_pronto() && !video_tocando() && !video_falhou()) dec = mPrepararDecoder(h);
   printf("[miniatura] pre-warm: file %s, hardware decoder %s (%u ms, playback %s)\n", h ? "open" : "not usable",
          dec ? "created" : "not created", SDL_GetTicks() - t0, video_tocando() ? "running" : "not started yet");
   fflush(stdout);
@@ -1622,24 +1640,27 @@ static int trabalharDireto(Job *j, long long *hA) {
   Uint32 janela = SDL_GetTicks();
   double folgaAntes = folgaSeg();
   long long audioAntes = mAudioFalhas();
-  int decodificou = 0, vistoTocando = 0, nPend = 0, avisouEspera = 0, avisouGrade = 0;
+  int decodificou = 0, nPend = 0, avisouEspera = 0, avisouGrade = 0;
+  MiniPauseAdmission admissao = {0};
   // THE HARDWARE DECODER AS EARLY AS POSSIBLE: during the player's opening load, before its audio starts, the
   // HDMI underrun that creating it causes (measured 23/10) falls into silence. Then every thumbnail goes through the
-  // hardware + GPU (~30/s) from the start, no scrub needed. Once playback runs, creation waits for a pause/scrub.
+  // hardware + GPU (~30/s) from the start, no scrub needed. Once playback runs, creation waits for a confirmed pause.
   if (decPre) decodificou = 1;
-  else if (!video_tocando() && !video_falhou()) {
+  else if (!video_pronto() && !video_tocando() && !video_falhou()) {
     Uint32 c0 = SDL_GetTicks();
     decodificou = mPrepararDecoder(*hA);
     printf("[miniatura] direct: hardware decoder %s during the opening load (%u ms, playback %s)\n",
            decodificou ? "created" : "NOT created", SDL_GetTicks() - c0, video_tocando() ? "had started" : "not started yet");
-  } else printf("[miniatura] direct: playback already running: hardware decoder at the first pause/scrub\n");
+  } else printf("[miniatura] direct: playback already running: CPU route until a confirmed pause\n");
   fflush(stdout);
   Uint32 ultimaContencao = 0;
   pthread_mutex_t mp = PTHREAD_MUTEX_INITIALIZER;   // the queue (pend/nPend), shared with the CPU thread
 #ifdef NV_MINI_FFMPEG
   PerfilCpu pf;
   perfilLer(&pf);
-  int classe = j->alturaA > 1080, cpuCod = -1, cpuRodando = 0;
+  long long fonteInfo[6] = {0};
+  mInfo(*hA, fonteInfo);
+  int classe = (fonteInfo[2] > 0 ? fonteInfo[2] : j->alturaA) > 1080, cpuCod = -1, cpuRodando = 0;
   pthread_t cpuT;
   CpuFaixa cf;
   memset(&cf, 0, sizeof cf);
@@ -1664,12 +1685,32 @@ static int trabalharDireto(Job *j, long long *hA) {
     // Measured 23/10 on the Shield (TrueHD passthrough): HDMI audio underruns (nvaudio_hw) 0.35 s and 0.9 s after the
     // thumbnail decoder was created, none while it decoded for minutes. Released only when the player is in trouble
     // (reconnecting/failed), memory is at the floor, on contention, or at the end.
-    if (video_reconectando() || video_falhou()) { mSoltar(*hA); esperarPlayer(j); continue; }
+#ifdef NV_MINI_FFMPEG
+    // Update before every early wait, not below the hardware branch's continue.
+    cf.pausa = mDecoderPronto(*hA) || scrubbing || bufferando || !video_tocando() ||
+               video_reconectando() || video_falhou() || folgaBaixa();
+#endif
+    int pausaAdmitida = mini_pause_admit(&admissao, SDL_GetTicks(), video_pausa_confirmada(), scrubbing, bufferando);
+    if (video_reconectando() || video_falhou()) { mSoltar(*hA); decodificou = 0; esperarPlayer(j); continue; }
     if (bufferando || folgaBaixa()) { esperarPlayer(j); continue; }
     long disp = memDisponivelKB();
     if (disp >= 0 && (j->memMin < 0 || disp < j->memMin)) j->memMin = disp;
-    if (disp >= 0 && disp < PISO_KB) { mSoltar(*hA); dormir(j, 1500); continue; }
-    if (heapApertado(j)) { dormir(j, 1500); continue; }
+    if (disp >= 0 && disp < PISO_KB) {
+#ifdef NV_MINI_FFMPEG
+      cf.pausa = 1;
+      if (cpuRodando) { cf.fim = 1; pthread_join(cpuT, NULL); cpuRodando = 0; }
+      if (cf.cpu) { mini_motor_fechar(cf.cpu); cf.cpu = NULL; }
+      cf.fim = 0;
+#endif
+      if (mDecoderPronto(*hA)) printf("[miniatura] direct: memory floor: releasing hardware, no automatic recreation\n");
+      mSoltar(*hA); decodificou = 0; dormir(j, 1500); continue;
+    }
+    if (heapApertado(j)) {
+#ifdef NV_MINI_FFMPEG
+      cf.pausa = 1;
+#endif
+      dormir(j, 1500); continue;
+    }
     // an audible gap while we work: back off at once, as for dropped frames
     if (mAudioFalhas() != audioAntes) {
       audioAntes = mAudioFalhas();
@@ -1713,10 +1754,24 @@ static int trabalharDireto(Job *j, long long *hA) {
         continue;
       }
     }
-    // may the decoder exist now? once created it stays; before that only while paused or scrubbing/seeking (after
-    // playback was seen running, so never during the player's own start-up)
-    if (video_tocando() && !scrubbing && !bufferando) vistoTocando = 1;
-    int liberado = decodificou || (vistoTocando && (!video_tocando() || scrubbing || bufferando));
+    // Actual Kotlin state is authoritative, including timeout/error releases.
+    decodificou = mDecoderPronto(*hA);
+    if (pausaAdmitida && !decodificou) {
+#ifdef NV_MINI_FFMPEG
+      // No hardware allocation until the current CPU decode has returned and its
+      // reference buffers are freed. A pause flag alone cannot quiesce in-flight work.
+      cf.pausa = 1;
+      if (cpuRodando) { cf.fim = 1; pthread_join(cpuT, NULL); cpuRodando = 0; }
+      if (cf.cpu) { mini_motor_fechar(cf.cpu); cf.cpu = NULL; }
+      cf.fim = 0;
+#endif
+      if (!parou(j) && video_pausa_confirmada() && !scrubbing && !bufferando && !video_reconectando()) {
+        decodificou = mPrepararDecoder(*hA);
+        printf("[miniatura] direct: exclusive paused handover: hardware %s\n", decodificou ? "ready" : "not admitted; CPU fallback");
+        fflush(stdout);
+      }
+    }
+    int liberado = decodificou;
     if (liberado && nPend > 0) {
       // the queued keyframe nearest to where the user is (scrub target, else the playhead) first
       long onde = scrubbing ? posMs : playheadMs, melhor = -1;
@@ -1727,10 +1782,9 @@ static int trabalharDireto(Job *j, long long *hA) {
       long kf = pend[iM];
       pend[iM] = pend[--nPend];
       pthread_mutex_unlock(&mp);
-      if (!decodificou) { printf("[miniatura] direct: %s: creating the decoder, %d keyframes queued\n", scrubbing ? "scrubbing" : !video_tocando() ? "paused" : "seeking", nPend + 1); fflush(stdout); }
       long p; unsigned char *jpg = NULL; int nj = 0;
       int ok = mQuadroDireto(*hA, kf, &p, &jpg, &nj);
-      decodificou = 1;
+      decodificou = mDecoderPronto(*hA);
       if (falhou(j, ok, *hA)) { free(jpg); snprintf(motivo, sizeof motivo, "reads/decodes failing"); break; }
       if (ok && jpg) {
         int dest = (int)((p + GRADE_MS / 2) / GRADE_MS);
@@ -1761,7 +1815,7 @@ static int trabalharDireto(Job *j, long long *hA) {
     cf.pausa = liberado || scrubbing || bufferando || !video_tocando();
     cf.cuidado = j->contencoes && SDL_GetTicks() - ultimaContencao < 60000u;
     if (cf.recusou) { snprintf(motivo, sizeof motivo, "source refused a connection"); break; }
-    if (!cpuRodando && cpuUsar && nPend > 0) {
+    if (!cpuRodando && !liberado && cpuUsar && nPend > 0) {
       if (cpuCod < 0) cpuCod = mCodecCpu(*hA);
       if (cpuCod > 0) {
         long long inf[6]; char e[96] = "";
@@ -1781,8 +1835,8 @@ static int trabalharDireto(Job *j, long long *hA) {
     }
     if (j->cob30 && !j->resumido) resumo(j, j->t0);
 #endif
-    if (!liberado && nPend >= DIR_PENDENTES_MAX) {   // enough downloaded: wait for a pause/scrub
-      if (!avisouEspera) { printf("[miniatura] direct: %d keyframes downloaded, decoding at the first pause/scrub\n", nPend); fflush(stdout); avisouEspera = 1; }
+    if (!liberado && nPend >= DIR_PENDENTES_MAX) {   // enough downloaded: wait for a confirmed pause
+      if (!avisouEspera) { printf("[miniatura] direct: %d keyframes downloaded, decoding at a confirmed pause\n", nPend); fflush(stdout); avisouEspera = 1; }
       dormir(j, 500);
       continue;
     }
@@ -1812,14 +1866,14 @@ static int trabalharDireto(Job *j, long long *hA) {
     if (!nf) {
       if (nPend > 0 && etapaMax >= 4) {             // everything downloaded: the queue waits for the decoder (or the CPU)
         if (!liberado && !avisouEspera && nPend > 0) {
-          printf("[miniatura] direct: %d keyframes downloaded, decoding at the first pause/scrub\n", nPend); fflush(stdout); avisouEspera = 1;
+          printf("[miniatura] direct: %d keyframes downloaded, decoding at a confirmed pause\n", nPend); fflush(stdout); avisouEspera = 1;
         }
         dormir(j, 500);
         continue;
       }
       // nothing open up to this stage: the 10 s grid only with headroom, else wait for scrubbing/headroom
       double folga = folgaSeg();
-      // the 10 s grid is DOWNLOADED while playing too (no decoder needed for that); decoded at the first pause/scrub
+      // the 10 s grid is DOWNLOADED while playing too (no decoder needed for that); decoded at a confirmed pause
       // (memory: 100 MB above the floor; 2x the floor never held on the Shield during 4K playback, 23/10: ~400-500 MB free)
       int memOk = disp < 0 || disp > PISO_KB + 100L * 1024, folgaOk = folga < 0 || folga >= folgaQuer(8.0, 0.7);
       int quieto = !j->contencoes || SDL_GetTicks() - ultimaContencao > 60000u;   // 60 s without contention
@@ -2281,6 +2335,9 @@ static void encerrar(void) {
   geracao++;
   int vivo = j && j->vivo;
   if (j) j->parar = 1;
+  pthread_mutex_lock(&muPre);
+  if (j && !preRodando && !preH && !strcmp(preUrl, j->urlA)) preUrl[0] = 0;
+  pthread_mutex_unlock(&muPre);
   pthread_mutex_unlock(&mu);
   texLimpar();
   if (j && !vivo) {
