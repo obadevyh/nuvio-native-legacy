@@ -428,11 +428,13 @@ object MiniaturaMotor {
         // decoder may exist (pause/scrub, see trabalharDireto). One file per source in the app's cache, at most 900 MB
         // and never below 1 GB free; deleted when the source closes.
         private var disco: java.io.RandomAccessFile? = null
+        private val discoMu = Any()  // completed blocks can be read while Fonte waits for the next HTTP batch
         private var discoArq: java.io.File? = null
         private val noDisco = HashMap<Int, LongArray>()   // cue index -> [file offset, length]
         private var discoFim = 0L
         private var discoFalhou = false
         private fun guardarNoDisco(k: Int, d: ByteArray, de: Int, n: Int) {
+          synchronized(discoMu) {
             if (discoFalhou || k in noDisco || discoFim + n > (900L shl 20)) return
             try {
                 if (disco == null) {
@@ -446,14 +448,17 @@ object MiniaturaMotor {
                 r.seek(discoFim); r.write(d, de, n)
                 noDisco[k] = longArrayOf(discoFim, n.toLong()); discoFim += n
             } catch (e: Exception) { discoFalhou = true }
+          }
         }
         private fun lerDoDisco(k: Int): ByteArray? {
             val e = noDisco[k] ?: return null
             return try { val b = ByteArray(e[1].toInt()); disco?.let { it.seek(e[0]); it.readFully(b) } ?: return null; b } catch (x: Exception) { null }
         }
         fun fecharDisco() {
+          synchronized(discoMu) {
             try { disco?.close() } catch (_: Exception) {}
             disco = null; discoArq?.delete(); discoArq = null; noDisco.clear(); discoFim = 0
+          }
         }
         private val excessos = ArrayDeque<Long>()
         var margem = 192L * 1024; private set
@@ -580,14 +585,29 @@ object MiniaturaMotor {
         // The keyframe for tMs straight from its Matroska block, as Annex B into `out` (start codes, as the decoder
         // takes it): (pts us, bytes) or null when the block is unknown, laced, of another track or malformed (the
         // caller then uses the extractor). Its bytes come from the cache (the batch fetched exactly the block).
-        fun blocoChave(tMs: Long, out: ByteBuffer): Pair<Long, Int>? = synchronized(this) { blocoChave0(tMs, out) }
+        fun blocoChave(tMs: Long, out: ByteBuffer): Pair<Long, Int>? {
+            // Lock order: Fonte -> discoMu for writes/fallback; fast reads never acquire Fonte.
+            // Publish only fully written blocks. RandomAccessFile seek/read stays under discoMu.
+            val pronto = synchronized(discoMu) {
+                val c = cues
+                val k = if (c != null) cueParaTempo(tMs, false) else -1
+                if (k >= 0 && nalTam > 0 && (noDisco[k]?.get(1) ?: Long.MAX_VALUE) <= out.capacity())
+                    lerDoDisco(k)?.let { it to c!![k * 3] / 1000 }
+                else null
+            }
+            if (pronto != null) return converterBloco(pronto.first, pronto.second, out)
+            return synchronized(this) { blocoChave0(tMs, out) }
+        }
         private fun blocoChave0(tMs: Long, out: ByteBuffer): Pair<Long, Int>? {
             val c = cues ?: return null
             if (nalTam <= 0) return null
             val kk = cueParaTempo(tMs, false)
             val a = iniBloco[kk] ?: return null; val fim = fimBloco[kk] ?: return null
             if (fim - a > out.capacity()) return null
-            val b = lerDoDisco(kk) ?: ler(a, (fim - a).toInt()) ?: return null
+            val b = synchronized(discoMu) { lerDoDisco(kk) } ?: ler(a, (fim - a).toInt()) ?: return null
+            return converterBloco(b, c[kk * 3] / 1000, out)
+        }
+        private fun converterBloco(b: ByteArray, ptsUs: Long, out: ByteBuffer): Pair<Long, Int>? {
             val (id, l0) = vint(b, 0, true) ?: return null
             val (_, l1) = vint(b, l0, false) ?: return null
             var i = l0 + l1; var fimB = b.size
@@ -620,10 +640,11 @@ object MiniaturaMotor {
             }
             if (p != fimB || out.position() == 0) return null
             out.flip()
-            nBlocos++
-            return c[kk * 3] / 1000 to out.limit()
+            blocosLidos.incrementAndGet()
+            return ptsUs to out.limit()
         }
-        var nBlocos = 0L
+        private val blocosLidos = java.util.concurrent.atomic.AtomicLong()
+        val nBlocos: Long get() = blocosLidos.get()
         // Direct mode reads the PLAYING file's link: each request takes one of the player's connection permits
         // (ParaleloDataSource.vagas) after the pace wait, and closes its socket (an idle kept-alive socket would
         // still be a 5th connection). The copy route reads another file: no permit.
@@ -918,8 +939,10 @@ object MiniaturaMotor {
     }
     // debug.nuvio.miniatura bits (read by the C side when a title starts): 2 = old closest-cue prefetch (A/B)
     @Volatile private var cueMaisPerto = false
+    @Volatile private var perfilBits = 0
     @JvmStatic
     fun configurar(bits: Int) {
+        perfilBits = bits
         cueMaisPerto = bits and 2 != 0
         dumpar = if (bits and 16 != 0) 12 else 0
         if (bits == 0) return
@@ -1260,6 +1283,12 @@ object MiniaturaMotor {
     }
 
     // ---- CPU ROUTE (src/miniatura_motor.c, Namer03's FFmpeg engine in packet mode) ----
+    // JNI consumes these on the thumbnail thread immediately after quadroDireto, before another capture/close.
+    @JvmStatic
+    fun pixelsDireto(h: Long): ByteBuffer? = sessoes[h]?.gpu?.pixelsProntos()
+    @JvmStatic
+    fun pixelsDimensoes(h: Long): Int = sessoes[h]?.gpu?.let { (it.largura shl 16) or it.altura } ?: 0
+
     // 1 = HEVC (also Dolby Vision's base layer), 2 = H.264, 0 = the CPU route cannot take this source (keyframes are
     // taken straight from Matroska blocks: needs the index and plain, unlaced blocks).
     @JvmStatic
@@ -1307,7 +1336,17 @@ object MiniaturaMotor {
             if (espera > 0) Thread.sleep(espera)
             ultimaCriacao = android.os.SystemClock.elapsedRealtime()
         }
-        val g = s.gpu ?: GpuMiniatura().also { if (!it.iniciar()) { it.soltar(); Log.w(TAG, "direct: GPU step failed to start"); s.errosCodec = 2; return null }; s.gpu = it }
+        val g = s.gpu ?: run {
+            val am = NvPlayer.contexto()?.getSystemService(android.content.Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+            val info = android.app.ActivityManager.MemoryInfo()
+            am?.getMemoryInfo(info)
+            val w = miniaturaLargura(am?.isLowRamDevice == true, info.totalMem, perfilBits)
+            GpuMiniatura(w, w * 9 / 16).also {
+                if (!it.iniciar()) { it.soltar(); Log.w(TAG, "direct: GPU step failed to start"); s.errosCodec = 2; return null }
+                Log.i(TAG, "direct: thumbnail output ${it.largura}x${it.altura}")
+                s.gpu = it
+            }
+        }
         val mime = if (s.mime == "video/dolby-vision") "video/hevc" else s.mime
         val f = MediaFormat(s.fmt)
         f.setString(MediaFormat.KEY_MIME, mime)

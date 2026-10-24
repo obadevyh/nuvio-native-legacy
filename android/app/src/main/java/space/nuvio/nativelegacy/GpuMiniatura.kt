@@ -29,11 +29,11 @@ import java.util.concurrent.TimeUnit
 // the same Hable curve as the CPU path (MiniaturaMotor.pqLut), after BT.2020 -> BT.709.
 //
 // All GL runs on its own thread (one EGL context, never current anywhere else); callers block on it.
-class GpuMiniatura {
+class GpuMiniatura(val largura: Int = MiniaturaMotor.TW, val altura: Int = MiniaturaMotor.TH) {
+    private val TW = largura
+    private val TH = altura
     companion object {
         private const val TAG = "nuvio-miniatura"
-        private const val TW = MiniaturaMotor.TW
-        private const val TH = MiniaturaMotor.TH
 
         private const val VS = """
 attribute vec2 aPos;
@@ -95,6 +95,8 @@ void main() {
     var surface: Surface? = null; private set
     private val pix: ByteBuffer = ByteBuffer.allocateDirect(TW * TH * 4).order(ByteOrder.nativeOrder())
     val bmp: Bitmap = Bitmap.createBitmap(TW, TH, Bitmap.Config.ARGB_8888)
+    // Read only after capturar returns, before the next capture. No extra Java pixel array.
+    fun pixelsProntos(): ByteBuffer = pix.duplicate().apply { position(0) }
     private val quad: FloatBuffer = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
         .apply { put(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)); position(0) }
     private val mtx = FloatArray(16)

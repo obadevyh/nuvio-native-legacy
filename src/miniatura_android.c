@@ -27,6 +27,7 @@ void miniatura_preaquecer(const char *url, const char *cabecalhos) { (void)url; 
 #include <unistd.h>
 #include <sys/system_properties.h>
 #include "miniplat.h"
+#include "miniatura_pixels.h"
 #ifdef NV_MINI_FFMPEG
 #include "miniatura_motor.h"   // CPU route: Namer03's FFmpeg engine (packet mode)
 #endif
@@ -69,7 +70,7 @@ enum { M_PARADO = 0, M_BUSCANDO, M_PRONTO, M_FALHOU };
 typedef struct { double a, b, erro; int inliers; } Mapa;
 // prov = made at offset 0 while the copy's check was still running (optimistic start): relabelled or discarded
 // when the check decides.
-typedef struct { unsigned char *jpg; int n; long pts; unsigned char prov; } Tile;
+typedef struct { unsigned char *jpg; int n; long pts; unsigned char prov, salvo; unsigned revision; } Tile;
 // What the playing file showed at each check anchor: decoded ONCE per title and reused for every copy checked
 // (the 4K decode is what the player feels; a second copy must not pay it again).
 typedef struct { int estado; long pA; int ok; float sig[SIG_N]; } Ancora;   // estado: 0 not yet, 1 read, -1 failed
@@ -114,6 +115,7 @@ typedef struct {
   char arqDireto[640];                     // the direct-mode set (its own identity: never mixed with a copy's)
   Uint32 t0, primeiro, cob60, cob30;       // start; first thumbnail; whole film at 60 s / 30 s spacing (ticks)
   int direto, contencoes;                  // thumbnails from the playing file; playback-contention back-offs
+  int appendPronto;                       // direct tiles are immutable: subsequent checkpoints append only new ones
   int cpuFeitos; long cpuMs, cpuDecMs;     // CPU route: thumbnails made, average total / decode ms
   volatile int parar;
   int vivo;
@@ -136,7 +138,9 @@ static int motivoSem;            // M_FALHOU because: 0 the video would not open
 // ---- JNI (MiniaturaMotor.kt) ----
 static jclass cls;
 static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo, jLote,
-                 jDiag, jConfig, jPerdidos, jAbrirDireto, jQuadroDireto, jKeyframe, jDiagDireto, jHeap, jAudio, jCodecCpu, jPacoteCpu, jPrepDec;
+                 jDiag, jConfig, jPerdidos, jAbrirDireto, jQuadroDireto, jKeyframe, jDiagDireto, jHeap, jAudio, jCodecCpu, jPacoteCpu, jPrepDec,
+                 jPixelsDireto, jPixelsDimensoes;
+static void prepararPixelsDireto(Job *j, long long h, int k, long pts);
 
 static int jniPreparar(void) {
   if (cls) return 1;
@@ -178,8 +182,10 @@ static int jniPreparar(void) {
     jCodecCpu = (*env)->GetStaticMethodID(env, c, "codecCpu", "(J)I");
     jPacoteCpu = (*env)->GetStaticMethodID(env, c, "pacoteCpu", "(JJ)[B");
     jPrepDec = (*env)->GetStaticMethodID(env, c, "prepararDecoder", "(J)I");
+    jPixelsDireto = (*env)->GetStaticMethodID(env, c, "pixelsDireto", "(J)Ljava/nio/ByteBuffer;");
+    jPixelsDimensoes = (*env)->GetStaticMethodID(env, c, "pixelsDimensoes", "(J)I");
     if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jCont || !jAlvo || !jLote ||
-        !jDiag || !jConfig || !jPerdidos || !jAbrirDireto || !jQuadroDireto || !jKeyframe || !jDiagDireto || !jHeap || !jAudio || !jCodecCpu || !jPacoteCpu || !jPrepDec) {
+        !jDiag || !jConfig || !jPerdidos || !jAbrirDireto || !jQuadroDireto || !jKeyframe || !jDiagDireto || !jHeap || !jAudio || !jCodecCpu || !jPacoteCpu || !jPrepDec || !jPixelsDireto || !jPixelsDimensoes) {
       (*env)->ExceptionClear(env);
     } else {
       cls = (jclass)(*env)->NewGlobalRef(env, c);
@@ -960,7 +966,7 @@ static int conferir(Job *j, long long hA, long long hB, long durA, long durB, An
         int k = (int)((an->pA + GRADE_MS / 2) / GRADE_MS);
         pthread_mutex_lock(&mu);
         if (jpg && k >= 0 && k < j->n && labs(an->pA - k * GRADE_MS) <= TOL_MS && !j->tiles[k].jpg) {
-          j->tiles[k].jpg = jpg; j->tiles[k].n = nj; j->tiles[k].pts = an->pA; j->tentado[k] = 1;
+          j->tiles[k].jpg = jpg; j->tiles[k].n = nj; j->tiles[k].pts = an->pA; j->tiles[k].revision++; j->tentado[k] = 1;
           j->feitos++; estado = M_PRONTO; jpg = NULL;
         }
         pthread_mutex_unlock(&mu);
@@ -1106,7 +1112,7 @@ static int carregar(Job *j) {
     unsigned char *b = malloc((size_t)len);
     if (!b || fread(b, 1, (size_t)len, f) != (size_t)len) { free(b); break; }
     pthread_mutex_lock(&mu);
-    if (!j->tiles[k].jpg) { j->tiles[k].jpg = b; j->tiles[k].n = (int)len; j->tiles[k].pts = pts; j->feitos++; lidos++; b = NULL; }
+    if (!j->tiles[k].jpg) { j->tiles[k].jpg = b; j->tiles[k].n = (int)len; j->tiles[k].pts = pts; j->tiles[k].revision++; j->feitos++; lidos++; b = NULL; }
     j->tentado[k] = 1;
     if (job == j && j->feitos) estado = M_PRONTO;
     pthread_mutex_unlock(&mu);
@@ -1156,26 +1162,50 @@ static void limparCache(const char *dirArq) {
 static void salvar(Job *j, int completo) {
   if (!j->arq[0]) return;
   if (!j->feitos) { unlink(j->arq); return; }   // nothing left (a dropped copy): no stale set may survive (22/10, Bond)
-  char dir[512], tmp[620];
+  char dir[sizeof j->arq], tmp[sizeof j->arq + 5];
   snprintf(dir, sizeof dir, "%s", j->arq);
   char *barra = strrchr(dir, '/');
   if (barra) { *barra = 0; mkdir(dir, 0700); }
   snprintf(tmp, sizeof tmp, "%s.tmp", j->arq);
-  FILE *f = fopen(tmp, "wb");
+  int append = j->direto && j->appendPronto;
+  FILE *f = fopen(append ? j->arq : tmp, append ? "r+b" : "wb");
+  if (!f && append) { j->appendPronto = 0; salvar(j, completo); return; }
   if (!f) return;
-  fwrite("NVM3", 1, 4, f);
-  escreverI32(f, j->n); escreverI32(f, j->dur); escreverI32(f, completo);
+  if (append) {
+    // Mark incomplete before appending. A truncated last record remains readable up to the previous checkpoint.
+    if (fseek(f, 12, SEEK_SET)) { fclose(f); j->appendPronto = 0; return; }
+    escreverI32(f, 0);
+    if (fflush(f) || fseek(f, 0, SEEK_END)) { fclose(f); j->appendPronto = 0; return; }
+  } else {
+    fwrite("NVM3", 1, 4, f);
+    escreverI32(f, j->n); escreverI32(f, j->dur); escreverI32(f, 0);
+  }
   for (int k = 0; k < j->n; k++) {
     pthread_mutex_lock(&mu);
     unsigned char *b = j->tiles[k].jpg; int len = j->tiles[k].n; long pts = j->tiles[k].pts;
+    int saved = j->tiles[k].salvo;
     pthread_mutex_unlock(&mu);                                // tiles are only ever added while the job lives
-    if (!b) continue;
+    if (!b || (append && saved)) continue;
     escreverI32(f, k); escreverI32(f, pts); escreverI32(f, len);
     fwrite(b, 1, (size_t)len, f);
+    if (j->direto) { pthread_mutex_lock(&mu); j->tiles[k].salvo = 1; pthread_mutex_unlock(&mu); }
   }
-  int ok = fclose(f) == 0;
-  if (ok && rename(tmp, j->arq) == 0) limparCache(j->arq);
-  else unlink(tmp);
+  int ok = !ferror(f) && fflush(f) == 0;
+  if (ok && completo) {
+    ok = fseek(f, 12, SEEK_SET) == 0;
+    if (ok) { escreverI32(f, 1); ok = !ferror(f); }
+  }
+  if (fclose(f)) ok = 0;
+  if (ok && (append || rename(tmp, j->arq) == 0)) {
+    if (j->direto) j->appendPronto = 1;
+    limparCache(j->arq);
+  } else {
+    j->appendPronto = 0;
+    pthread_mutex_lock(&mu);
+    for (int k = 0; k < j->n; k++) j->tiles[k].salvo = 0;
+    pthread_mutex_unlock(&mu);
+    if (!append) unlink(tmp);
+  }
 }
 
 // ---- which slot next ----
@@ -1276,7 +1306,7 @@ static void *faixa(void *u) {
       pthread_mutex_lock(&mu);
       if (dest < 0 || dest >= j->n || (j->tiles[dest].jpg && dest != k)) dest = k;
       if (!j->tiles[dest].jpg) {
-        j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; j->tiles[dest].prov = (unsigned char)j->otimista;
+        j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; j->tiles[dest].revision++; j->tiles[dest].prov = (unsigned char)j->otimista;
         jpg = NULL; j->feitos++;
         if (!j->primeiro) j->primeiro = SDL_GetTicks();
       }
@@ -1434,7 +1464,7 @@ static void guardarTileDireto(Job *j, long p, unsigned char *jpg, int nj, int *f
   int dest = (int)((p + GRADE_MS / 2) / GRADE_MS);
   pthread_mutex_lock(&mu);
   if (dest >= 0 && dest < j->n && !j->tiles[dest].jpg) {
-    j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; jpg = NULL;
+    j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; j->tiles[dest].revision++; jpg = NULL;
     j->tentado[dest] = 1; j->feitos++; (*feitosAqui)++;
     if (!j->primeiro) j->primeiro = SDL_GetTicks();
     if (job == j) estado = M_PRONTO;
@@ -1706,7 +1736,7 @@ static int trabalharDireto(Job *j, long long *hA) {
         int dest = (int)((p + GRADE_MS / 2) / GRADE_MS);
         pthread_mutex_lock(&mu);
         if (dest >= 0 && dest < j->n && !j->tiles[dest].jpg) {
-          j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; jpg = NULL;
+          j->tiles[dest].jpg = jpg; j->tiles[dest].n = nj; j->tiles[dest].pts = p; j->tiles[dest].revision++; jpg = NULL;
           j->tentado[dest] = 1; j->feitos++; feitosAqui++;
           if (!j->primeiro) j->primeiro = SDL_GetTicks();
           if (job == j) estado = M_PRONTO;
@@ -1714,6 +1744,7 @@ static int trabalharDireto(Job *j, long long *hA) {
         if (!j->cob60 && !restamNaEtapa(j, 6)) j->cob60 = SDL_GetTicks();
         if (!j->cob30 && !restamNaEtapa(j, 3)) j->cob30 = SDL_GetTicks();
         pthread_mutex_unlock(&mu);
+        prepararPixelsDireto(j, *hA, dest, p);
       }
       free(jpg);
       if (feitosAqui && feitosAqui % 10 == 0) {
@@ -2124,28 +2155,58 @@ fim:
 }
 
 // ---- display (main/GL thread) ----
-static struct { GLuint tex; unsigned g; int k; unsigned uso; } texs[NTEX];
+// Keep a bounded cache of generated RGBA pictures: nearby previews need no JPEG decode.
+// Compression remains in the generation path for persistence; no extra Java heap pixel copy.
+static void prepararPixelsDireto(Job *j, long long h, int k, long pts) {
+  if (k < 0 || k >= j->n || labs(pts - (scrubbing ? posMs : playheadMs)) > 60000L) return;
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jobject buffer = (*env)->CallStaticObjectMethod(env, cls, jPixelsDireto, (jlong)h);
+  jint dims = (*env)->CallStaticIntMethod(env, cls, jPixelsDimensoes, (jlong)h);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); if (buffer) (*env)->DeleteLocalRef(env, buffer); return; }
+  int w = (unsigned)dims >> 16, hgt = dims & 65535;
+  unsigned char *rgba = buffer ? (*env)->GetDirectBufferAddress(env, buffer) : NULL;
+  jlong size = buffer ? (*env)->GetDirectBufferCapacity(env, buffer) : 0;
+  SDL_Surface *surface = NULL;
+  if (rgba && w > 0 && w <= 480 && hgt > 0 && hgt <= 270 && size >= (jlong)w * hgt * 4) {
+    surface = SDL_CreateRGBSurfaceWithFormat(0, w, hgt, 32, SDL_PIXELFORMAT_ABGR8888);
+    if (surface) for (int y = 0; y < hgt; y++) memcpy((unsigned char *)surface->pixels + y * surface->pitch, rgba + y * w * 4, (size_t)w * 4);
+  }
+  if (buffer) (*env)->DeleteLocalRef(env, buffer);
+  if (!surface) return;
+  pthread_mutex_lock(&mu);
+  if (job == j && !j->parar && j->tiles[k].jpg && j->tiles[k].pts == pts) {
+    Tile *t = &j->tiles[k];
+    MiniPixKey key = { j->g, k, t->n, t->pts, t->revision };
+    pthread_mutex_lock(&pixMu);
+    pixStore(key, surface);
+    pthread_mutex_unlock(&pixMu);
+    surface = NULL;
+  }
+  pthread_mutex_unlock(&mu);
+  if (surface) SDL_FreeSurface(surface);
+}
+static struct { GLuint tex; MiniPixKey key; unsigned uso; } texs[NTEX];
 static unsigned usoTex;
 static int velho;
 
 static void texLimpar(void) {
+  pixReset();
   for (int i = 0; i < NTEX; i++) if (texs[i].tex) {
     gfx_tex_esquecer(texs[i].tex);
     glDeleteTextures(1, &texs[i].tex); texs[i].tex = 0;
   }
 }
 static GLuint texDe(Job *j, int k) {
+  Tile *tile = &j->tiles[k];
+  MiniPixKey key = { j->g, k, tile->n, tile->pts, tile->revision };
   int livreI = 0;
   for (int i = 0; i < NTEX; i++) {
-    if (texs[i].tex && texs[i].g == j->g && texs[i].k == k) { texs[i].uso = ++usoTex; return texs[i].tex; }
+    if (texs[i].tex && pixEqual(texs[i].key, key)) { texs[i].uso = ++usoTex; return texs[i].tex; }
     if (!texs[i].tex || texs[i].uso < texs[livreI].uso) livreI = i;
   }
   if (!j->tiles[k].jpg) return 0;
-  SDL_RWops *rw = SDL_RWFromConstMem(j->tiles[k].jpg, j->tiles[k].n);
-  SDL_Surface *s = rw ? IMG_Load_RW(rw, 1) : NULL;
-  SDL_Surface *c = s ? SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ABGR8888, 0) : NULL;
-  if (s) SDL_FreeSurface(s);
-  if (!c) return 0;
+  SDL_Surface *c = pixTake(key);
+  if (!c) { pixRequest(key, tile->jpg); return 0; }
   if (texs[livreI].tex) {
     gfx_tex_esquecer(texs[livreI].tex);
     glDeleteTextures(1, &texs[livreI].tex);
@@ -2161,7 +2222,7 @@ static GLuint texDe(Job *j, int k) {
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, c->w, c->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, c->pixels);
   gfx_tex_esquecer(0);  // raw GL binding changed behind the renderer's cache
   SDL_FreeSurface(c);
-  texs[livreI].tex = t; texs[livreI].g = j->g; texs[livreI].k = k; texs[livreI].uso = ++usoTex;
+  texs[livreI].tex = t; texs[livreI].key = key; texs[livreI].uso = ++usoTex;
   return t;
 }
 
@@ -2196,7 +2257,8 @@ static int pQuadros(double posSeg, int n, GLuint *out, double *cueSeg) {
         if (j->tiles[s].pts > pts && (alvos[2] < 0 || j->tiles[s].pts < j->tiles[alvos[2]].pts)) alvos[2] = s;
       }
     }
-    for (int i = 0; i < n; i++) {
+    for (int pass = 0; pass < n; pass++) {
+      int i = n == 3 ? (pass == 0 ? 1 : pass == 1 ? 0 : 2) : pass;  // centre queues first
       int s = alvos[base + i];
       if (s < 0 || s >= j->n || !j->tiles[s].jpg) continue;
       out[i] = texDe(j, s);
