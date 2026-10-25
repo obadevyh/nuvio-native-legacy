@@ -1124,7 +1124,17 @@ object NvPlayer {
     @Volatile private var pausaPedida = false
     @Volatile private var miniaturaTocou = false
     @Volatile private var miniaturaTocando = false
+    @Volatile internal var thumbnailAllocatedBytes = -1L
+    @Volatile internal var thumbnailTargetBytes = -1L
+    @Volatile internal var thumbnailBufferStable = false
+    private val thumbnailBufferHealth = ThumbnailBufferHealth()
+    @Volatile internal var thumbnailBufferMs = -1L
+    @Volatile internal var thumbnailState = 0
+    @Volatile internal var thumbnailPlaying = false
+    @Volatile internal var thumbnailHealthAtMs = 0L
+    @Volatile internal var thumbnailIncidentAtMs = -1L
     internal fun miniaturaPodeCriar(): Boolean = !miniaturaTocando && (!miniaturaTocou || pausaPedida)
+
     @JvmStatic fun pausar(p: Int) {
         principal.post { pausaPedida = p != 0; player?.playWhenReady = !pausaPedida }
     }
@@ -1482,6 +1492,7 @@ object NvPlayer {
             val p = r.p
             recursosAtuais = r
             player = p
+
             processador = r.proc
             r.tap.ligado = tap.ligado
             tap = r.tap
@@ -1698,6 +1709,13 @@ object NvPlayer {
             try { nativePos(p.currentPosition, p.bufferedPosition, p.isCurrentMediaItemLive,
                 recursosAtuais?.carga?.allocator?.totalBytesAllocated ?: -1, geracaoNative)
             } catch (e: UnsatisfiedLinkError) { }
+            thumbnailBufferMs = (p.bufferedPosition - p.currentPosition).coerceAtLeast(0)
+            thumbnailAllocatedBytes = recursosAtuais?.carga?.allocator?.totalBytesAllocated?.toLong() ?: -1L
+            thumbnailTargetBytes = recursosAtuais?.carga?.bytes?.toLong() ?: -1L
+            thumbnailBufferStable = thumbnailBufferHealth.sample(SystemClock.elapsedRealtime(), thumbnailBufferMs, p.isPlaying)
+            thumbnailState = p.playbackState
+            thumbnailPlaying = p.isPlaying
+            thumbnailHealthAtMs = android.os.SystemClock.elapsedRealtime()
             if (++statsTiques >= 4) { statsTiques = 0; relatarStats(p) }
             if (cacheMidia != null && cacheEstado == CacheSessao.ATIVO && ++cacheTiques >= CACHE_RELATO_TIQUES) {
                 cacheTiques = 0
@@ -1722,7 +1740,7 @@ object NvPlayer {
         try {
             nativeStats(if (e.usado) e.bytes.get() else -1L, buf,
                 bufferAlvoMs,
-                if (e.usado) e.conexoes.get().coerceAtLeast(0) else -1,
+                if (e.usado) MediaHttpBudget.active() else -1,
                 e.primeiroByteMs, perdidos, quadros, e.host,
                 bufferMinMs, bufferBytes shr 20, if (p.isLoading) 1 else 0)
         } catch (t: UnsatisfiedLinkError) { }
@@ -2035,6 +2053,7 @@ object NvPlayer {
             if (!atual(minha)) return
             val p = player ?: return
             Log.i(TAG, "[player] onPlaybackStateChanged state=$state renderer=audio(${p.audioFormat?.sampleMimeType}),video(${p.videoFormat?.sampleMimeType}) loadMs=${SystemClock.elapsedRealtime() - abriuEm}")
+            if (state == Player.STATE_BUFFERING) thumbnailIncidentAtMs = SystemClock.elapsedRealtime()
             when (state) {
                 Player.STATE_BUFFERING -> ev(EV_BUFFER, 0)
                 Player.STATE_READY -> {
@@ -2164,6 +2183,7 @@ object NvPlayer {
 
         override fun onPlayerError(error: PlaybackException) {
             if (!atual(minha)) return
+            thumbnailIncidentAtMs = SystemClock.elapsedRealtime()
             val exo = error as? ExoPlaybackException
             val p = player
             val status = generateSequence(error.cause) { it.cause }
@@ -2286,6 +2306,7 @@ object NvPlayer {
         // Audible gaps: logged with their time so on-device thumbnail work can be lined up against them.
         override fun onAudioUnderrun(eventTime: AnalyticsListener.EventTime, bufferSize: Int, bufferSizeMs: Long, elapsedSinceLastFeedMs: Long) {
             if (!atual(minha)) return
+            thumbnailIncidentAtMs = SystemClock.elapsedRealtime()
             audioFalhas++
             Log.w(TAG, "[player] audio underrun #$audioFalhas: buffer ${bufferSizeMs} ms, ${elapsedSinceLastFeedMs} ms since the last feed")
         }

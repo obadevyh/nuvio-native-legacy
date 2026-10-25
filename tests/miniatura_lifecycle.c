@@ -2,6 +2,13 @@
 #include "../src/miniatura_lifecycle.h"
 
 int main(void) {
+  const long floorKB = 300L * 1024;
+  assert(mini_refine_memory_ok(345L * 1024, floorKB, 1));
+  assert(!mini_refine_memory_ok(345L * 1024, floorKB, 0));
+  assert(!mini_refine_memory_ok(floorKB - 1, floorKB, 1));
+  assert(mini_refine_memory_ok(floorKB, floorKB, 1));
+  assert(mini_refine_memory_ok(401L * 1024, floorKB, 0));
+  assert(mini_refine_memory_ok(-1, floorKB, 1));
   MiniPauseAdmission p = {0};
   assert(!mini_pause_admit(&p, 0, 0, 0, 0));
   assert(!mini_pause_admit(&p, 10, 1, 1, 0));

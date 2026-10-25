@@ -81,7 +81,7 @@ int main(void) {
 '''
 with tempfile.TemporaryDirectory() as directory:
     path = Path(directory)
-    (path / "worker.c").write_text(prefix + worker + suffix)
+    (path / "worker.c").write_text(prefix + "\nstatic void mPipelineState(int state,int begin) { (void)state; (void)begin; }\n" + worker + suffix)
     subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
                     str(path / "worker.c"), "-pthread", "-o", str(path / "worker")], check=True)
     subprocess.run([str(path / "worker")], check=True, timeout=15)

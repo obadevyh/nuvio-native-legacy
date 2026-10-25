@@ -43,7 +43,34 @@ object MiniaturaMotor {
     // limit, the player's reconnects are refused and playback stops).
     private class Fonte(url: String, cabecalhos: String, val manter: Boolean) : MediaDataSource() {
         var alvo = url
-        @Volatile var recusado = false    // a connection was refused or timed out: stop reading this title at all
+        private val httpOwner = "thumbnail-${System.identityHashCode(this)}"
+        @Volatile private var closed = false
+        fun abortHttp() { MediaHttpBudget.cancelOwner(httpOwner) }
+        private fun checkHttpCancelled() {
+            if (closed || Thread.currentThread().isInterrupted) throw java.io.InterruptedIOException("thumbnail source cancelled")
+        }
+        private val playbackGate = ThumbnailPlaybackGate()
+        private fun awaitPlayback() {
+            var logged = false
+            while (direto && playbackGate.shouldWait(NvPlayer.miniaturaPodeCriar(),
+                    NvPlayer.thumbnailState, NvPlayer.thumbnailBufferMs,
+                    android.os.SystemClock.elapsedRealtime() - NvPlayer.thumbnailHealthAtMs)) {
+                checkHttpCancelled()
+                if (!logged) { Log.i(TAG, "[playback-gate] holding HTTP bufferMs=${NvPlayer.thumbnailBufferMs} state=${NvPlayer.thumbnailState}"); logged = true }
+                ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.PLAYBACK_GATE).use { Thread.sleep(100) }
+            }
+            if (logged) Log.i(TAG, "[playback-gate] resumed HTTP bufferMs=${NvPlayer.thumbnailBufferMs}")
+        }
+        private fun openHttp(url: URL): HttpURLConnection {
+            awaitPlayback() // Before acquiring a permit; leaves all four available for playback recovery.
+            return MediaHttpBudget.open(url, httpOwner, factory = {
+                if ((perfilBits and 32768) != 0) ThumbnailTransport.open(it)
+                else it.openConnection() as HttpURLConnection
+            }, checkCancelled = ::checkHttpCancelled).also { ThumbnailPayloadExchange.track(it) }
+        }
+        @Volatile var recusado = false    // explicit refusal or exhausted timeout retry: stop this title
+        private val probeRecovery = ThumbnailProbeRecovery()
+        private var optionalProbe = false
         val cab = cabecalhos.split('\n').mapNotNull { l ->
             val i = l.indexOf(':'); if (i <= 0) null else l.substring(0, i).trim() to l.substring(i + 1).trim()
         }
@@ -57,10 +84,6 @@ object MiniaturaMotor {
         private val segs = ArrayList<Pair<Long, ByteArray>>()   // most recently used last
         private var guardados = 0L
 
-        init {
-            pedir(0, 0)
-            if (tamanho > (8L shl 30)) { janela = 2 shl 20; limite = 12L shl 20 }
-        }
 
         // The copy's window follows its keyframes: ~1.6x the largest of the recent ones (+32 KB for the container's
         // block headers), 128-384 KB. Measured 22/10: a fixed 384 KB read ~0.43 MB per 720p thumbnail, about 3x the
@@ -68,10 +91,10 @@ object MiniaturaMotor {
         // Sized from the TYPICAL keyframe (running mean x 1.3 + 32 KB, 96-384 KB), not 1.6x the largest: measured
         // 22/10, an H.264 copy read ~0.5 MB per thumbnail for ~0.2 MB keyframes. A bigger keyframe costs one more
         // small request, never a wrong frame. +64 KB of margin for the block headers around it.
-        private var media = 0
+        @Volatile private var media = 0
         var direto = false    // the PLAYING file read for direct thumbnails: batches allowed, socket closed after each
             private set
-        fun modoDireto() { direto = true; janela = 1 shl 20; limite = 16L shl 20 }   // a ~4 MB batch must fit whole
+        fun modoDireto() { direto = true; janela = 1 shl 20; limite = 16L shl 20; Log.i(TAG, "[fetch-policy] uniform intervalMs=1000 bytesPerSecond=5000000") }   // a ~4 MB batch must fit whole
         // a small read just past a cached range in direct mode (a block header, the rest of a keyframe): 256 KB, not a
         // whole keyframe window
         var fimAtual = -1L                              // block end of the keyframe being decoded (direct mode), -1 unknown
@@ -194,8 +217,10 @@ object MiniaturaMotor {
         // The keyframes' byte positions come from the Matroska index (Cues); a batch of thumbnails is ONE request on
         // the same single connection, stored here, and the extractor's own seek then finds the bytes in memory.
         @Volatile var multiOk = true          // false after one answer that was not multipart: single ranges from then on
-        private var cues: LongArray? = null   // [time ms, absolute cluster position, relative block position] x n
+        @Volatile private var cues: LongArray? = null   // [time ms, absolute cluster position, relative block position] x n
         private var cuesTentado = false
+        private var mp4Index: ThumbnailMp4Index? = null
+        private var prefetchUnsupportedLogged = false
 
         private fun ler(p: Long, n: Int): ByteArray? {
             if (p < 0 || p >= tamanho) return null
@@ -229,6 +254,11 @@ object MiniaturaMotor {
         // base-layer compatibility id, or -1 when there is none. Android 11's extractor does not report it (the track is
         // plain video/hevc), so a profile 5 file (IPT, no HDR10 base) would decode to green/purple pictures unnoticed.
         fun perfilDv(): Int {
+            val header = ler(0, 8) ?: return -1
+            if (header[0] != 0x1a.toByte() || header[1] != 0x45.toByte() ||
+                header[2] != 0xdf.toByte() || header[3] != 0xa3.toByte()) {
+                return ThumbnailDolbyVision.mp4(tamanho) { pos, count -> ler(pos, count) }
+            }
             val h = ler(0, 256 * 1024) ?: return -1
             for (i in 0 until h.size - 12) {
                 if (h[i] != 'd'.code.toByte() || h[i + 1] != 'v'.code.toByte() || (h[i + 2] != 'c'.code.toByte() && h[i + 2] != 'v'.code.toByte()) ||
@@ -251,8 +281,17 @@ object MiniaturaMotor {
             cuesTentado = true
             try {
                 val h = ler(0, 64 * 1024) ?: return null
-                val (ebmlId, l0) = vint(h, 0, true) ?: return null
-                if (ebmlId != 0x1A45DFA3L) return null
+                if (h.size < 4) return null
+                if (h[0] != 0x1a.toByte() || h[1] != 0x45.toByte() || h[2] != 0xdf.toByte() || h[3] != 0xa3.toByte()) {
+                    val index = ThumbnailMp4Index.read(tamanho) { pos, n -> ler(pos, n) }
+                    if (index != null) {
+                        mp4Index = index; nalTam = index.nalLength; cues = index.cues
+                        Log.i(TAG, "[packet-index] container=mp4 syncSamples=${index.sizes.size} nalLength=$nalTam timestamps=edited-presentation")
+                    }
+                    if (index == null) Log.w(TAG, "[packet-index] MP4 packet fallback unavailable: unsupported or invalid sample tables; no downloaded samples claimed")
+                    return cues
+                }
+                val (_, l0) = vint(h, 0, true) ?: return null
                 val (ebmlSz, l1) = vint(h, l0, false) ?: return null
                 var i = (l0 + l1 + ebmlSz).toInt()
                 val (segId, s0) = vint(h, i, true) ?: return null
@@ -391,11 +430,40 @@ object MiniaturaMotor {
         // fetched the NEXT keyframe about half the time, and the extractor then missed and made its own request.
         // Fonte is used by two threads in direct mode (the download loop and the CPU thumbnail thread): its entry
         // points take the Fonte's lock (order: Fonte, then VOO, everywhere).
-        fun prefetch(tempos: LongArray): Int = synchronized(this) { prefetch0(tempos) }
-        private fun prefetch0(tempos: LongArray): Int {
+        private var speculativeLimit = Long.MAX_VALUE
+        fun prefetchBounded(times: LongArray, further: LongArray = longArrayOf()): Int = synchronized(this) {
+            checkHttpCancelled()
+            speculativeLimit = 8L shl 20
+            try { prefetch0(times, further) } finally { speculativeLimit = Long.MAX_VALUE }
+        }
+        private fun boundedRanges(ranges: List<LongArray>): List<LongArray> {
+            if (speculativeLimit == Long.MAX_VALUE) return ranges
+            var remaining = speculativeLimit
+            return ranges.filter { range ->
+                val n = range[1] - range[0] + 1
+                if (n <= remaining) { remaining -= n; true } else false
+            }
+        }
+
+        fun completedOnDisk(times: LongArray): Boolean = synchronized(discoMu) {
+            val c = cues ?: return@synchronized false
+            times.isNotEmpty() && nalTam > 0 && times.all {
+                val k = cueParaTempo(it, false)
+                k >= 0 && k < c.size / 3 && k in noDisco
+            }
+        }
+        fun prefetch(tempos: LongArray, proximos: LongArray = longArrayOf()): Int = synchronized(this) { prefetch0(tempos, proximos) }
+        private fun prefetch0(tempos: LongArray, proximos: LongArray): Int {
             if (!multiOk || (!manter && !direto)) return -1
-            val c = carregarCues() ?: return -1
-            if (direto) return prefetchExato(c, tempos)
+            val c = carregarCues() ?: run {
+                if (!prefetchUnsupportedLogged) {
+                    prefetchUnsupportedLogged = true
+                    Log.i(TAG, "[prefetch] unsupported index; queued targets are not downloaded samples")
+                }
+                return -1
+            }
+            if (direto && mp4Index != null) return prefetchMp4(c, tempos)
+            if (direto) return prefetchExato(c, tempos, proximos)
             val faixas = ArrayList<LongArray>()
             for (t in tempos) {
                 val antes = cueParaTempo(t, false)
@@ -421,8 +489,8 @@ object MiniaturaMotor {
         // ONE batch fetches exactly [cluster start, block end + margin]. The margin covers what Android's parser reads
         // after the keyframe (it walks on to the next video block); it is learnt from the reads actually seen
         // (largest overshoot of the last 16 frames + 16 KB, 16-512 KB).
-        private val fimBloco = HashMap<Int, Long>()     // cue index -> end of its keyframe's block (absolute)
-        private val iniBloco = HashMap<Int, Long>()     // cue index -> start of its keyframe's block (absolute)
+        private val fimBloco = ConcurrentHashMap<Int, Long>()     // cue index -> end of its keyframe's block (absolute)
+        private val iniBloco = ConcurrentHashMap<Int, Long>()     // cue index -> start of its keyframe's block (absolute)
         var trilhaV = -1L; var nalTam = 0               // video track number; NAL length size (0 = blocks not usable)
         // KEYFRAME BLOCKS ON DISK (direct mode): fetched while the film plays, decoded later in a burst once the
         // decoder may exist (pause/scrub, see trabalharDireto). One file per source in the app's cache, at most 900 MB
@@ -433,7 +501,9 @@ object MiniaturaMotor {
         private val noDisco = HashMap<Int, LongArray>()   // cue index -> [file offset, length]
         private var discoFim = 0L
         private var discoFalhou = false
-        private fun guardarNoDisco(k: Int, d: ByteArray, de: Int, n: Int) {
+        private fun guardarNoDisco(k: Int, d: ByteArray, de: Int, n: Int) =
+            ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.DISK).use { guardarNoDisco0(k,d,de,n) }
+        private fun guardarNoDisco0(k: Int, d: ByteArray, de: Int, n: Int) {
           synchronized(discoMu) {
             if (discoFalhou || k in noDisco || discoFim + n > (900L shl 20)) return
             try {
@@ -450,7 +520,9 @@ object MiniaturaMotor {
             } catch (e: Exception) { discoFalhou = true }
           }
         }
-        private fun lerDoDisco(k: Int): ByteArray? {
+        private fun lerDoDisco(k: Int): ByteArray? =
+            ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.DISK).use { lerDoDisco0(k) }
+        private fun lerDoDisco0(k: Int): ByteArray? {
             val e = noDisco[k] ?: return null
             return try { val b = ByteArray(e[1].toInt()); disco?.let { it.seek(e[0]); it.readFully(b) } ?: return null; b } catch (x: Exception) { null }
         }
@@ -461,7 +533,7 @@ object MiniaturaMotor {
           }
         }
         private val excessos = ArrayDeque<Long>()
-        var margem = 192L * 1024; private set
+        @Volatile var margem = 192L * 1024; private set
         var maxLido = 0L                                // furthest byte the extractor read during the current frame
         var nSondas = 0L; var nExatos = 0L; var nChutes = 0L
         fun fimBlocoPara(tMs: Long): Long { if (cues == null) return -1; return fimBloco[cueParaTempo(tMs, false)] ?: -1L }
@@ -470,15 +542,79 @@ object MiniaturaMotor {
             excessos.addLast(maxOf(0L, maxLido - fim)); while (excessos.size > 16) excessos.removeFirst()
             margem = ((excessos.maxOrNull() ?: 0L) + 16 * 1024).coerceIn(16L * 1024, 512L * 1024)
         }
-        private fun prefetchExato(c: LongArray, tempos: LongArray): Int {
+        private fun prefetchMp4(c: LongArray, tempos: LongArray): Int {
+            val index = mp4Index ?: return -1
+            val ks = tempos.map { cueParaTempo(it, false) }.distinct()
+            // MP4 already provides exact sizes. CPU packets bypass ajustarJanela, so without this
+            // feedback the scheduler stays at its four-frame bootstrap batch forever.
+            val average = ks.sumOf { index.sizes[it].toLong() } / ks.size.coerceAtLeast(1)
+            if (average > 0) media = if (media == 0) average.toInt() else ((media * 7L + average) / 8).toInt()
+            Log.i(TAG, "[batch-plan] container=mp4 requestedFrames=${ks.size} averageKeyframeBytes=$average nextBatchFrames=${loteIdeal()} payloadBudgetBytes=${8 shl 20}")
+            for (k in ks) {
+                iniBloco[k] = c[k * 3 + 1]
+                fimBloco[k] = c[k * 3 + 1] + index.sizes[k]
+            }
+            val missing = ks.filter { k ->
+                val a = c[k * 3 + 1]; val end = a + index.sizes[k]
+                val inRam = (fixos.asSequence() + segs.asSequence()).any { a >= it.first && end <= it.first + it.second.size }
+                !inRam && synchronized(discoMu) { k !in noDisco }
+            }
+            val ranges = boundedRanges(missing.map { k -> longArrayOf(c[k * 3 + 1], c[k * 3 + 1] + index.sizes[k] - 1) })
+            if (ranges.isEmpty()) {
+                Log.i(TAG, "[prefetch] container=mp4 cachedSamples=${ks.size} fetchedSamples=0")
+                return 0
+            }
+            // Preserve the existing ~8 MiB batch budget, even for unusual very large sync samples.
+            var fetched = 0
+            var batch = ArrayList<LongArray>(); var batchBytes = 0L
+            fun download(): Boolean {
+                if (batch.isEmpty()) return true
+                val parts = synchronized(VOO) { pedirVarios(batch) } ?: return false
+                for ((a, data) in parts) guardar(a, data)
+                for (k in missing) {
+                    val a = c[k * 3 + 1]; val n = index.sizes[k]
+                    val part = parts.firstOrNull { a >= it.first && a + n <= it.first + it.second.size } ?: continue
+                    synchronized(discoMu) { guardarNoDisco(k, part.second, (a - part.first).toInt(), n) }
+                    iniBloco[k] = a; fimBloco[k] = a + n
+                    fetched++
+                }
+                batch = ArrayList(); batchBytes = 0
+                return true
+            }
+            for (range in ranges) {
+                val n = range[1] - range[0] + 1
+                if (batchBytes + n > (8L shl 20) && !download()) return -1
+                batch.add(range); batchBytes += n
+            }
+            if (!download()) return -1
+            Log.i(TAG, "[prefetch] container=mp4 cachedSamples=${ks.size - missing.size} fetchedSamples=$fetched")
+            return fetched
+        }
+        private fun prefetchExato(c: LongArray, tempos: LongArray, proximos: LongArray): Int {
             val ks = tempos.map { cueParaTempo(it, false) }.distinct()
             D.addAndGet(D_PEDIDOS_LOTE, ks.size.toLong())
             // Find each keyframe's block with small probes. Round 1 reads the cluster's header plus CueRelativePosition
             // (counted from the cluster's DATA) + 64 bytes; when the index has no relative position (measured 23/10: a
             // remux with rel = 0 everywhere) or other elements come first (Timecode, audio blocks), the walk goes on
             // element by element, each further round reading 64 bytes where the previous one stopped (at most 6).
-            val pos = HashMap<Int, Long>()                     // cue -> next absolute position to look at (-1 = cluster start)
-            for (k in ks) if (k !in fimBloco) pos[k] = -1L
+            val required = ks.toSet()
+            val missing = ks.filter { !fimBloco.containsKey(it) }
+            // Amortize tiny HTTP probes, not frame payload. Never add a request
+            // solely for future work; leave the first batch and scrubs prompt.
+            val mixed = (perfilBits and 8192) != 0 && nalTam > 0 && nExatos > 0
+            val knownPayload = if (mixed) ks.mapNotNull { k ->
+                val a = iniBloco[k] ?: return@mapNotNull null
+                val b = fimBloco[k] ?: return@mapNotNull null
+                if (b <= a || (temByte(a) && temByte(b - 1)) || synchronized(discoMu) { k in noDisco }) null
+                else longArrayOf(a, b - 1)
+            } else emptyList()
+            val ahead = if (probeRecovery.allowed(android.os.SystemClock.elapsedRealtime()) && nExatos > 0 && (missing.isNotEmpty() || knownPayload.isNotEmpty())) proximos
+                .map { cueParaTempo(it, false) }.distinct()
+                .filter { it !in required && !fimBloco.containsKey(it) }
+                .take((32 - missing.size).coerceAtLeast(0)) else emptyList()
+            val pos = HashMap<Int, Long>()
+            for (k in missing + ahead) pos[k] = -1L
+            Log.i(TAG, "[fetch-audit] probe-plan source=${System.identityHashCode(this)} required=${missing.size} ahead=${ahead.size}")
             var ronda = 0
             while (pos.isNotEmpty() && ronda < 6) {
                 ronda++
@@ -489,16 +625,48 @@ object MiniaturaMotor {
                     val n = if (p < 0) 12 + minOf(c[k * 3 + 2], 65536L) + 64 else 65536L
                     longArrayOf(a0, minOf(tamanho - 1, a0 + n - 1), k.toLong(), if (p < 0) 1 else 0)
                 }
-                val pedido = alvos.map { longArrayOf(it[0], it[1]) }.sortedBy { it[0] }.distinctBy { it[0] }
+                val probes = alvos.map { longArrayOf(it[0], it[1]) }.sortedBy { it[0] }.distinctBy { it[0] }
+                val pedido = if (mixed && ronda == 1) thumbnailMixedRanges(probes, knownPayload) else probes
+                val fused = pedido.size > probes.size
+                if (fused) Log.i(TAG, "[mixed-batch] probes=${probes.size} payloads=${pedido.size - probes.size} bytes=${pedido.sumOf { it[1] - it[0] + 1 }}")
                 val antes = multiOk
                 semPausa = true
-                val partes = try { synchronized(VOO) { pedirVarios(pedido) } } finally { semPausa = false; multiOk = antes }
+                optionalProbe = pos.keys.any { it !in required }
+                val partes = try { synchronized(VOO) { pedirVarios(pedido) } } finally {
+                    semPausa = false; optionalProbe = false; multiOk = antes
+                }
                 nSondas++
-                if (partes == null) break
+                if (partes == null) {
+                    // A server may reject the larger range list. Retry only the
+                    // current frames, with the normal pacing/permit rules.
+                    if (pos.keys.any { it !in required }) {
+                        pos.keys.retainAll(required)
+                        Log.i(TAG, "[fetch-audit] probe-plan fallback=current-only")
+                        continue
+                    }
+                    break
+                }
+                if (fused) {
+                    for ((a, d) in partes) guardar(a, d)
+                    var fusedPayloadBytes = 0L
+                    for (k in ks) {
+                        val a = iniBloco[k] ?: continue
+                        val b = fimBloco[k] ?: continue
+                        val part = partes.firstOrNull { a >= it.first && b <= it.first + it.second.size } ?: continue
+                        guardarNoDisco(k, part.second, (a - part.first).toInt(), (b - a).toInt())
+                        fusedPayloadBytes += b - a
+                    }
+                    if (speculativeLimit != Long.MAX_VALUE)
+                        speculativeLimit = (speculativeLimit - fusedPayloadBytes).coerceAtLeast(0)
+                }
                 val prox = HashMap<Int, Long>()
                 for (f in alvos) {
                     val k = f[2].toInt()
-                    val parte = partes.firstOrNull { f[0] >= it.first && f[0] < it.first + it.second.size } ?: continue
+                    val parte = partes.firstOrNull { f[0] >= it.first && f[0] < it.first + it.second.size }
+                    if (parte == null) {
+                        if (k in required) prox[k] = if (f[3] == 1L) -1L else f[0]
+                        continue
+                    }
                     val bb = parte.second; val base = parte.first
                     var p = f[0]
                     if (f[3] == 1L) {                              // the cluster's own header first
@@ -537,7 +705,7 @@ object MiniaturaMotor {
                         p += l0 + l1 + tam                         // Timecode, CRC, an audio block...: skip it
                     }
                 }
-                pos.clear(); pos.putAll(prox)
+                pos.clear(); pos.putAll(prox.filterKeys { it in required })
             }
             val faixas = ArrayList<LongArray>()
             for (k in ks) {
@@ -551,12 +719,14 @@ object MiniaturaMotor {
                     fb != null -> fb + margem - 1
                     else -> ini + c[k * 3 + 2] + janela - 1
                 })
-                if (temByte(a0) && temByte(fim)) continue
+                if ((temByte(a0) && temByte(fim)) || synchronized(discoMu) { k in noDisco }) continue
                 faixas += longArrayOf(a0, fim)
             }
             if (faixas.isEmpty()) return 0
             faixas.sortBy { it[0] }
-            val partes = synchronized(VOO) { pedirVarios(faixas) } ?: return -1
+            val payloadRanges = boundedRanges(faixas)
+            if (payloadRanges.isEmpty()) return 0
+            val partes = synchronized(VOO) { pedirVarios(payloadRanges) } ?: return -1
             for ((a, d) in partes) guardar(a, d)
             if (nalTam > 0) for (k in ks) {
                 val ib = iniBloco[k] ?: continue; val fb = fimBloco[k] ?: continue
@@ -569,23 +739,64 @@ object MiniaturaMotor {
         // DIRECT MODE PACE: >= 0.25 s between requests, <= 5 MB/s averaged, and (comVaga) never more connections to the
         // link than the player's own 4. Measured 23/10 (TorBox): a 5th connection next to the player's 4 got the CDN to
         // refuse connections twice (08:59 with a new socket per request, 12:27 with one kept-alive socket).
+        private val speedPacing = ThumbnailPacing()
+        private var lastSpeedPolicy = ThumbnailPacing.NORMAL
+        private var lastPlaybackIncident = -1L
+        private fun speedPolicy(): ThumbnailPacing.Policy {
+            val now = android.os.SystemClock.elapsedRealtime()
+            val incident = NvPlayer.thumbnailIncidentAtMs
+            if (incident > lastPlaybackIncident) {
+                lastPlaybackIncident = incident
+                speedPacing.failure(incident, 15_000)
+            }
+            val policy = speedPacing.policy(now, (perfilBits and 4096) != 0,
+                NvPlayer.thumbnailState == 3, NvPlayer.thumbnailPlaying,
+                NvPlayer.thumbnailBufferMs, now - NvPlayer.thumbnailHealthAtMs,
+                NvPlayer.thumbnailAllocatedBytes, NvPlayer.thumbnailTargetBytes, NvPlayer.thumbnailBufferStable)
+            if (policy != lastSpeedPolicy) Log.i(TAG, "[speed-experiment] intervalMs=${policy.intervalMs} bytesPerSecond=${policy.bytesPerSecond} bufferMs=${NvPlayer.thumbnailBufferMs} allocatedBytes=${NvPlayer.thumbnailAllocatedBytes} targetBytes=${NvPlayer.thumbnailTargetBytes} stable=${NvPlayer.thumbnailBufferStable}")
+            lastSpeedPolicy = policy
+            return policy
+        }
         private var proximaDireta = 0L
-        private fun esperarTaxa() {
-            val espera = proximaDireta - android.os.SystemClock.elapsedRealtime()
-            if (espera > 0) Thread.sleep(espera)
+        private fun esperarTaxa(): Unit = synchronized(payloadDispatchMu) {
+            val policy = speedPolicy()
+            val now = android.os.SystemClock.elapsedRealtime()
+            // Apply backoff before dispatch, even when the previous request used fast pacing.
+            if (policy == ThumbnailPacing.NORMAL && lastDirectStart > 0)
+                proximaDireta = maxOf(proximaDireta, lastDirectStart + maxOf(1000L, lastDirectBytes / 5000L))
+            val espera = proximaDireta - now
+            if (espera > 0) {
+                val before = android.os.SystemClock.elapsedRealtime()
+                ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.PACING).use { Thread.sleep(espera) }
+                Log.i(TAG, "[fetch-audit] wait source=${System.identityHashCode(this)} kind=direct-pace ms=${android.os.SystemClock.elapsedRealtime() - before}")
+            }
+        }
+        private fun auditFetch(kind: String, start: Long, headers: Long,
+                               timing: ThumbnailReadTiming, payload: Int, permitNanos: Long) {
+            probeRecovery.success()
+            val end = System.nanoTime()
+            val body = (end - headers).coerceAtLeast(0)
+            val first = timing.firstReadNanos?.let { (it - start - permitNanos).coerceAtLeast(0) / 1_000_000 } ?: -1
+            Log.i(TAG, "[fetch-audit] response source=${System.identityHashCode(this)} kind=$kind payloadKB=${payload / 1024} wireKB=${timing.bytesRead / 1024} headersMs=${(headers - start - permitNanos).coerceAtLeast(0) / 1_000_000} permitWaitMs=${permitNanos / 1_000_000} dispatchToDoneMs=${(end - start) / 1_000_000} firstReadMs=$first bodyMs=${body / 1_000_000} streamReadMs=${timing.readNanos / 1_000_000} localBodyMs=${(body - timing.readNanos).coerceAtLeast(0) / 1_000_000} totalMs=${(end - start - permitNanos).coerceAtLeast(0) / 1_000_000}")
         }
         // counted from the request's START (from its end, measured 23/10, it halved the rate to ~2.5 MB/s)
-        private fun marcarTaxa(bytes: Long, inicio: Long) {
-            // >= 1 s between requests (probes included) and ~2.5 MB/s: TorBox's CDN refused connections ~50 s into
-            // 2-3 thumbnail requests/s next to the player's own chunk requests (08:59, 12:27, 12:58 on 23/10); the run
-            // at ~2/s survived. Fewer, bigger batches (loteIdeal) keep the bytes per second.
-            proximaDireta = inicio + maxOf(1000L, bytes / 5000L)   // ~5 MB/s: the refusals tracked the request rate, not bytes (12:27 at ~2.3 MB/s)
+        private var lastDirectStart = 0L
+        private var lastDirectBytes = 0L
+        private fun marcarTaxa(bytes: Long, inicio: Long): Unit = synchronized(payloadDispatchMu) {
+            // Same pacing for every addon/source: at least 1 s between requests and approximately 5 MB/s.
+            val policy = speedPolicy()
+            lastDirectStart = inicio; lastDirectBytes = bytes
+            val byBytes = bytes * 1000 / policy.bytesPerSecond
+            val spacing = maxOf(policy.intervalMs, byBytes)
+            proximaDireta = inicio + spacing
+            Log.i(TAG, "[fetch-plan] source=${System.identityHashCode(this)} bytes=$bytes binding=${if (byBytes > policy.intervalMs) "byte-cap" else "request-interval"} spacingMs=$spacing remainingWaitMs=${(proximaDireta - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0)}")
         }
 
         // The keyframe for tMs straight from its Matroska block, as Annex B into `out` (start codes, as the decoder
         // takes it): (pts us, bytes) or null when the block is unknown, laced, of another track or malformed (the
         // caller then uses the extractor). Its bytes come from the cache (the batch fetched exactly the block).
-        fun blocoChave(tMs: Long, out: ByteBuffer): Pair<Long, Int>? {
+        @JvmOverloads
+        fun blocoChave(tMs: Long, out: ByteBuffer, baseOnly: Boolean = false): Pair<Long, Int>? {
             // Lock order: Fonte -> discoMu for writes/fallback; fast reads never acquire Fonte.
             // Publish only fully written blocks. RandomAccessFile seek/read stays under discoMu.
             val pronto = synchronized(discoMu) {
@@ -595,19 +806,26 @@ object MiniaturaMotor {
                     lerDoDisco(k)?.let { it to c!![k * 3] / 1000 }
                 else null
             }
-            if (pronto != null) return converterBloco(pronto.first, pronto.second, out)
-            return synchronized(this) { blocoChave0(tMs, out) }
+            if (pronto != null) {
+                if (mp4Index == null) return converterBloco(pronto.first, pronto.second, out, baseOnly)
+                out.clear()
+                return if (writePacket(pronto.first, out, 0, pronto.first.size, baseOnly)) pronto.second to out.position() else null
+            }
+            return synchronized(this) { blocoChave0(tMs, out, baseOnly) }
         }
-        private fun blocoChave0(tMs: Long, out: ByteBuffer): Pair<Long, Int>? {
+        private fun blocoChave0(tMs: Long, out: ByteBuffer, baseOnly: Boolean): Pair<Long, Int>? {
             val c = cues ?: return null
             if (nalTam <= 0) return null
             val kk = cueParaTempo(tMs, false)
             val a = iniBloco[kk] ?: return null; val fim = fimBloco[kk] ?: return null
             if (fim - a > out.capacity()) return null
             val b = synchronized(discoMu) { lerDoDisco(kk) } ?: ler(a, (fim - a).toInt()) ?: return null
-            return converterBloco(b, c[kk * 3] / 1000, out)
+            return if (mp4Index != null) {
+                out.clear()
+                if (!writePacket(b, out, 0, b.size, baseOnly)) null else c[kk * 3] / 1000 to out.position()
+            } else converterBloco(b, c[kk * 3] / 1000, out, baseOnly)
         }
-        private fun converterBloco(b: ByteArray, ptsUs: Long, out: ByteBuffer): Pair<Long, Int>? {
+        private fun converterBloco(b: ByteArray, ptsUs: Long, out: ByteBuffer, baseOnly: Boolean): Pair<Long, Int>? {
             val (id, l0) = vint(b, 0, true) ?: return null
             val (_, l1) = vint(b, l0, false) ?: return null
             var i = l0 + l1; var fimB = b.size
@@ -628,50 +846,124 @@ object MiniaturaMotor {
             if ((b[i].toInt() and 0x06) != 0) return null          // laced: not a single frame
             i++
             out.clear()
-            var p = i
-            while (p + nalTam <= fimB) {
-                var len = 0L
-                for (q in 0 until nalTam) len = (len shl 8) or (b[p + q].toLong() and 0xff)
-                p += nalTam
-                if (len <= 0 || p + len > fimB || out.remaining() < len + 4) return null
-                out.put(0); out.put(0); out.put(0); out.put(1)
-                out.put(b, p, len.toInt())
-                p += len.toInt()
+            if (baseOnly) {
+                if (!writePacket(b,out,i,fimB,true)) return null
+            } else {
+                var p = i
+                while (p + nalTam <= fimB) {
+                    var len = 0L
+                    for (q in 0 until nalTam) len = (len shl 8) or (b[p + q].toLong() and 0xff)
+                    p += nalTam
+                    if (len <= 0 || p + len > fimB || out.remaining() < len + 4) return null
+                    out.put(0); out.put(0); out.put(0); out.put(1)
+                    out.put(b,p,len.toInt()); p+=len.toInt()
+                }
+                if(p!=fimB || out.position()==0) return null
             }
-            if (p != fimB || out.position() == 0) return null
             out.flip()
             blocosLidos.incrementAndGet()
             return ptsUs to out.limit()
         }
+        private var basePacketLogs=0
+        private fun writePacket(b: ByteArray,out: ByteBuffer,start: Int,end: Int,baseOnly: Boolean): Boolean {
+            if(!baseOnly) return ThumbnailNal.write(b,nalTam,out)
+            val begin=System.nanoTime()
+            val result=ThumbnailNal.writeBaseLayer(b,nalTam,out,start,end) ?: return false
+            if(basePacketLogs++<3) Log.i(TAG,"[hevc-base-layer] path=length-prefix inputBytes=${result.inputBytes} outputBytes=${result.outputBytes} removedBytes=${result.removedBytes} removedNals=${result.removedNals} visitedNals=${result.visitedNals} elapsedUs=${(System.nanoTime()-begin)/1000}")
+            return true
+        }
         private val blocosLidos = java.util.concurrent.atomic.AtomicLong()
         val nBlocos: Long get() = blocosLidos.get()
-        // Direct mode reads the PLAYING file's link: each request takes one of the player's connection permits
-        // (ParaleloDataSource.vagas) after the pace wait, and closes its socket (an idle kept-alive socket would
-        // still be a 5th connection). The copy route reads another file: no permit.
+        // Connection ownership is in MediaHttpBudget/ThumbnailHttpRedirects, never around a request twice.
         private fun <T> comVaga(f: () -> T): T {
-            if (!direto) return f()
-            esperarTaxa()
-            while (!ParaleloDataSource.vagas.tryAcquire(500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                if (recusado) throw IOException("refused earlier")
-            }
-            try { return f() } finally { ParaleloDataSource.vagas.release() }
+            if (direto) esperarTaxa()
+            return f()
         }
-        private fun pedirVarios(faixas: List<LongArray>): List<Pair<Long, ByteArray>>? = comVaga { pedirVarios0(faixas) }
+        // Retry at most one transient timeout. comVaga has already released
+        // the player's permit before any cooldown; refusals/HTTP limits never retry.
+        private fun <T> retryTimeout(request: () -> T): T {
+            var retried = false
+            while (true) {
+                try { return request() } catch (e: java.net.SocketTimeoutException) {
+                    if (retried || recusado) {
+                        recusado = true
+                        Log.w(TAG, "[fetch-audit] timeout retry exhausted: stopping thumbnails for this title")
+                        throw e
+                    }
+                    retried = true
+                    probeRecovery.timeout(android.os.SystemClock.elapsedRealtime())
+                    Log.w(TAG, "[fetch-audit] transient timeout: slot released, cooling lookahead (bounded recovery), retry once after 2000 ms")
+                    ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.PACING).use { Thread.sleep(2000) }
+                }
+            }
+        }
+        private fun pedirVarios(faixas: List<LongArray>): List<Pair<Long, ByteArray>>? = retryTimeout {
+            try { comVaga { pedirVarios0(faixas) } } catch (e: java.net.SocketTimeoutException) {
+                if (!optionalProbe || recusado) throw e
+                probeRecovery.timeout(android.os.SystemClock.elapsedRealtime())
+                Log.w(TAG, "[fetch-audit] expanded probe timed out: slot released, cooling lookahead (bounded recovery), cooldown 2000 ms, current-only fallback")
+                ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.PACING).use { Thread.sleep(2000) }
+                null
+            }
+        }
+        private fun auditDispatch(ranges: Int, requestedBytes: Long) {
+            val age = if (NvPlayer.thumbnailHealthAtMs > 0) android.os.SystemClock.elapsedRealtime() - NvPlayer.thumbnailHealthAtMs else -1
+            Log.i(TAG, "[fetch-dispatch] source=${System.identityHashCode(this)} ranges=$ranges requestedBytes=$requestedBytes bufferMs=${NvPlayer.thumbnailBufferMs} playerState=${NvPlayer.thumbnailState} healthAgeMs=$age")
+        }
+        private val payloadDispatchMu = Any()
+        private fun pedirParalelo(faixas: List<LongArray>): List<Pair<Long, ByteArray>> {
+            val start = android.os.SystemClock.elapsedRealtime()
+            try {
+                val results = ThumbnailPayloadExchange.fetch(faixas, dispatch = { group ->
+                    synchronized(payloadDispatchMu) {
+                        checkHttpCancelled()
+                        esperarTaxa()
+                        marcarTaxa(group.sumOf { it[1]-it[0]+1 }, android.os.SystemClock.elapsedRealtime())
+                    }
+                    ThumbnailHttpRedirects.open(alvo, cab, "bytes=" + group.joinToString(",") { "${it[0]}-${it[1]}" },
+                        !manter && (perfilBits and 32768)==0, {}, ::openHttp)
+                }, lowBuffer = { NvPlayer.thumbnailState != 3 || NvPlayer.thumbnailBufferMs < 2000 })
+                val parts = results.flatMap { it.parts }
+                for ((a,data) in parts) registrarBaixa(a,data.size)
+                val total = results.sumOf { it.bytes }
+                lidos += total; lidosTotal += total; requisicoes += results.size
+                msRede += results.sumOf { (it.elapsedMs-it.permitMs).coerceAtLeast(0) }
+                nLotes += results.size; bytesLotes += total; kfLotes += faixas.size
+                for (r in results) Log.i(TAG,"[payload-parallel] bytes=${r.bytes} elapsedMs=${r.elapsedMs} headersAndDispatchMs=${r.headersMs} bodyMs=${r.bodyMs} permitMs=${r.permitMs}")
+                val overlapNs=(minOf(results[0].bodyEndNs,results[1].bodyEndNs)-maxOf(results[0].bodyStartNs,results[1].bodyStartNs)).coerceAtLeast(0)
+                val unionNs=results.sumOf { it.bodyEndNs-it.bodyStartNs }-overlapNs
+                val bodyRate=if(unionNs>0) total*1000.0/unionNs else 0.0
+                Log.i(TAG,"[payload-parallel] batchMs=${android.os.SystemClock.elapsedRealtime()-start} bytes=$total exchanges=${results.size} bodyOverlapMs=${overlapNs/1_000_000} bodyUnionMs=${unionNs/1_000_000} bodyAggregateMBps=%.2f".format(bodyRate))
+                resultado(android.os.SystemClock.elapsedRealtime()-start,true,total)
+                return parts
+            } catch(e: IOException) {
+                Log.w(TAG,"[payload-parallel] failure type=${e.javaClass.simpleName} reason=${e.message}")
+                checkHttpCancelled()
+                speedPacing.failure(android.os.SystemClock.elapsedRealtime())
+                resultado(0,false)
+                if(e is ThumbnailPayloadExchange.Limited || e is java.net.ConnectException) recusado=true
+                throw e
+            }
+        }
         private fun pedirVarios0(faixas: List<LongArray>): List<Pair<Long, ByteArray>>? {
+            if ((perfilBits and 16384) != 0 && direto && !semPausa && !optionalProbe &&
+                faixas.size >= 2 && faixas.sumOf { it[1]-it[0]+1 } in (1L shl 20)..(8L shl 20) &&
+                NvPlayer.thumbnailState == 3 && NvPlayer.thumbnailBufferMs >= 3000 && !recusado)
+                return pedirParalelo(faixas)
             if (recusado) throw IOException("refused earlier")
             if (direto) esperarTaxa()
             if (!semPausa) pausar()   // a 16-byte probe does not wait for the pace gap (the batch after it does)
-            val c = URL(alvo).openConnection() as HttpURLConnection
+            var c: HttpURLConnection? = null
             val ini = android.os.SystemClock.elapsedRealtime()
+            val auditStart = System.nanoTime()
+            val permitBase = MediaHttpBudget.threadWaitNanos()
+            var receivedHeaders = false
             try {
-                c.instanceFollowRedirects = true
-                c.connectTimeout = 6000
-                c.readTimeout = 6000
-                for ((k, v) in cab) c.setRequestProperty(k, v)
-                c.setRequestProperty("Accept-Encoding", "identity")
-                if (!manter) c.setRequestProperty("Connection", "close")
-                c.setRequestProperty("Range", "bytes=" + faixas.joinToString(",") { "${it[0]}-${it[1]}" })
+                auditDispatch(faixas.size, faixas.sumOf { it[1] - it[0] + 1 })
+                c = ThumbnailHttpRedirects.open(alvo, cab, "bytes=" + faixas.joinToString(",") { "${it[0]}-${it[1]}" }, !manter && (perfilBits and 32768) == 0, {}, ::openHttp)
                 val code = c.responseCode
+                val auditHeaders = System.nanoTime()
+                receivedHeaders = true
                 val tipo = c.contentType ?: ""
                 if (code == 206 && !tipo.lowercase().startsWith("multipart/byteranges")) {
                     // ONE range back for several asked: a server may merge close/overlapping ranges into one (RFC 9110
@@ -686,27 +978,35 @@ object MiniaturaMotor {
                     val usa = cobre && n <= pedido * 3 / 2 + (1 shl 20)
                     if (faixas.size > 1 || !usa) Log.i(TAG, "batch of ${faixas.size} ranges answered as ONE range $a-$b (${n / 1024} KB for ${pedido / 1024} KB asked)" +
                         if (usa) ": used as the batch" else ": single ranges from now on")
-                    if (!usa) { multiOk = false; c.disconnect(); return null }
+                    if (!usa) { multiOk = false; MediaHttpBudget.close(c); return null }
                     val d = ByteArray(n.toInt())
                     var got = 0
-                    c.inputStream.use { s -> while (got < d.size) { val r = s.read(d, got, d.size - got); if (r < 0) break; got += r } }
+                    val timedBody = ThumbnailReadTiming(c.inputStream)
+                    timedBody.use { s -> while (got < d.size) { val r = s.read(d, got, d.size - got); if (r < 0) break; got += r } }
                     if (got != d.size) throw IOException("short read")
-                    if (!manter) c.disconnect()
+                    MediaHttpBudget.close(c)
                     lidos += got; lidosTotal += got; requisicoes++
-                    if (direto) marcarTaxa(got.toLong(), ini)
-                    msRede += android.os.SystemClock.elapsedRealtime() - ini
+                    if (direto) marcarTaxa(got.toLong(), ini + (MediaHttpBudget.threadWaitNanos() - permitBase) / 1_000_000)
+                    msRede += (android.os.SystemClock.elapsedRealtime() - ini - (MediaHttpBudget.threadWaitNanos() - permitBase) / 1_000_000).coerceAtLeast(0)
+                    auditFetch("merged-range", auditStart, auditHeaders, timedBody, got, MediaHttpBudget.threadWaitNanos() - permitBase)
                     nLotes++; bytesLotes += got; kfLotes += faixas.size
-                    resultado(android.os.SystemClock.elapsedRealtime() - ini, true, got)
+                    resultado((android.os.SystemClock.elapsedRealtime() - ini - (MediaHttpBudget.threadWaitNanos() - permitBase) / 1_000_000).coerceAtLeast(0), true, got)
                     registrarBaixa(a, got)
+
                     return listOf(a to d)
+                }
+                if (code in listOf(401, 403, 429, 503, 509)) {
+                    recusado = true
+                    Log.w(TAG, "HTTP $code: stopping thumbnails for this title")
+                    throw IOException("http $code")
                 }
                 if (code != 206) {
                     multiOk = false   // whole file: never again for this file (and read nothing more)
                     Log.w(TAG, "multi-range not served here (http $code, $tipo): single ranges from now on")
-                    c.disconnect()
+                    MediaHttpBudget.close(c)
                     return null
                 }
-                val fronteira = Regex("boundary=\"?([^\";]+)").find(tipo)?.groupValues?.get(1) ?: run { multiOk = false; c.disconnect(); return null }
+                val fronteira = Regex("boundary=\"?([^\";]+)").find(tipo)?.groupValues?.get(1) ?: run { multiOk = false; MediaHttpBudget.close(c); return null }
                 // Parsed AS IT ARRIVES, each part read straight into an array of its exact size: no whole-body buffer
                 // (readBytes grows by doubling) and no copy per part. Measured 23/10 next to a 4K remux (the player holds
                 // ~84 MB of samples on the same heap): those transient 10-20 MB per batch drove the heap to 0 % free,
@@ -714,7 +1014,8 @@ object MiniaturaMotor {
                 val partes = ArrayList<Pair<Long, ByteArray>>()
                 var total = 0
                 val marca = "--$fronteira"
-                c.inputStream.buffered(16 * 1024).use { ins ->
+                val timedMultipart = ThumbnailReadTiming(c.inputStream)
+                timedMultipart.buffered(16 * 1024).use { ins ->
                     fun linha(): String? {
                         val sb = StringBuilder()
                         while (true) {
@@ -743,6 +1044,7 @@ object MiniaturaMotor {
                         while (got < d.size) { val r = ins.read(d, got, d.size - got); if (r < 0) break; got += r }
                         if (got != d.size) break
                         partes += a to d
+
                         total += d.size
                         registrarBaixa(a, d.size)
                         l = linha()                                     // the CRLF ending the part
@@ -751,20 +1053,24 @@ object MiniaturaMotor {
                 }
                 lidos += total
                 lidosTotal += total
-                if (direto) marcarTaxa(total.toLong(), ini)
+                if (direto) marcarTaxa(total.toLong(), ini + (MediaHttpBudget.threadWaitNanos() - permitBase) / 1_000_000)
                 requisicoes++
-                msRede += android.os.SystemClock.elapsedRealtime() - ini
+                msRede += (android.os.SystemClock.elapsedRealtime() - ini - (MediaHttpBudget.threadWaitNanos() - permitBase) / 1_000_000).coerceAtLeast(0)
+                auditFetch("multipart", auditStart, auditHeaders, timedMultipart, total, MediaHttpBudget.threadWaitNanos() - permitBase)
                 nLotes++; bytesLotes += total; kfLotes += faixas.size
-                resultado(android.os.SystemClock.elapsedRealtime() - ini, true, total)
-                if (!manter) c.disconnect()
+                resultado((android.os.SystemClock.elapsedRealtime() - ini - (MediaHttpBudget.threadWaitNanos() - permitBase) / 1_000_000).coerceAtLeast(0), true, total)
+                MediaHttpBudget.close(c)
                 if (partes.isEmpty()) { multiOk = false; return null }
                 return partes
             } catch (e: IOException) {
+                MediaHttpBudget.close(c)
+                checkHttpCancelled()
+                speedPacing.failure(android.os.SystemClock.elapsedRealtime())
                 resultado(0, false)
-                c.disconnect()
-                if (e is java.net.ConnectException || e is java.net.SocketTimeoutException) {
+                Log.w(TAG, "[fetch-audit] failure source=${System.identityHashCode(this)} phase=${if (receivedHeaders) "body" else "headers"} elapsedMs=${(System.nanoTime()-auditStart)/1_000_000} permitWaitMs=${(MediaHttpBudget.threadWaitNanos() - permitBase) / 1_000_000} optionalProbe=$optionalProbe type=${e.javaClass.simpleName}")
+                if (e is java.net.ConnectException) {
                     recusado = true
-                    Log.w(TAG, "connection ${if (e is java.net.ConnectException) "refused" else "timed out"}: stopping this title")
+                    Log.w(TAG, "connection refused: stopping this title")
                 }
                 throw e
             }
@@ -807,31 +1113,35 @@ object MiniaturaMotor {
         // so the lanes share one pooled socket per host and one lane decodes while the other's request is on the wire.
         private fun pedir(a: Long, b: Long): ByteArray = synchronized(VOO) { pedirUm(a, b) }
 
-        private fun pedirUm(a: Long, b: Long): ByteArray = comVaga { pedirUm0(a, b) }
+        private fun pedirUm(a: Long, b: Long): ByteArray = retryTimeout { comVaga { pedirUm0(a, b) } }
         private fun pedirUm0(a: Long, b: Long): ByteArray {
             if (recusado) throw IOException("refused earlier")
             if (direto) esperarTaxa()
             pausar()
             var ultimo: IOException? = null
             for (tentativa in 0 until 2) {
-                if (tentativa > 0) { Thread.sleep(2000); pausar() }
-                val c = URL(alvo).openConnection() as HttpURLConnection
+                if (tentativa > 0) { ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.PACING).use { Thread.sleep(2000) }; pausar() }
+                var c: HttpURLConnection? = null
                 val ini = android.os.SystemClock.elapsedRealtime()
+            val auditStart = System.nanoTime()
+            val permitBase = MediaHttpBudget.threadWaitNanos()
                 try {
-                    c.instanceFollowRedirects = true
-                    c.connectTimeout = 6000
-                    c.readTimeout = 6000
-                    for ((k, v) in cab) c.setRequestProperty(k, v)
-                    c.setRequestProperty("Range", "bytes=$a-$b")
-                    if (!manter) c.setRequestProperty("Connection", "close")
+                    auditDispatch(1, b - a + 1)
+                    c = ThumbnailHttpRedirects.open(alvo, cab, "bytes=$a-$b", !manter && (perfilBits and 32768) == 0, {}, ::openHttp)
                     val code = c.responseCode
+                val auditHeaders = System.nanoTime()
+                    if (code in listOf(401, 403, 429, 503, 509)) {
+                        recusado = true
+                        Log.w(TAG, "HTTP $code: stopping thumbnails for this title")
+                    }
                     if (code != 206) throw IOException("http $code")
                     alvo = c.url.toString()   // after debrid/add-on redirects: later reads go straight to the CDN
                     c.getHeaderField("Content-Range")?.substringAfter('/')?.trim()?.toLongOrNull()?.let { tamanho = it }
                     val n = c.contentLength
                     val d = ByteArray(n)
                     var got = 0
-                    c.inputStream.use { s -> while (got < n) { val r = s.read(d, got, n - got); if (r < 0) break; got += r } }
+                    val timedBody = ThumbnailReadTiming(c.inputStream)
+                    timedBody.use { s -> while (got < n) { val r = s.read(d, got, n - got); if (r < 0) break; got += r } }
                     if (got != n) throw IOException("short read")
                     if (b > a) {   // not the 0-0 size probe
                         val cr = c.getHeaderField("Content-Range") ?: ""
@@ -841,21 +1151,26 @@ object MiniaturaMotor {
                     }
                     lidos += got
                     lidosTotal += got
-                    if (direto) marcarTaxa(got.toLong(), ini)
+                    if (direto) marcarTaxa(got.toLong(), ini + (MediaHttpBudget.threadWaitNanos() - permitBase) / 1_000_000)
                     requisicoes++
-                    msRede += android.os.SystemClock.elapsedRealtime() - ini
-                    resultado(android.os.SystemClock.elapsedRealtime() - ini, true, got)
-                    if (!manter) c.disconnect()
+                    msRede += (android.os.SystemClock.elapsedRealtime() - ini - (MediaHttpBudget.threadWaitNanos() - permitBase) / 1_000_000).coerceAtLeast(0)
+                    auditFetch("single", auditStart, auditHeaders, timedBody, got, MediaHttpBudget.threadWaitNanos() - permitBase)
+                    resultado((android.os.SystemClock.elapsedRealtime() - ini - (MediaHttpBudget.threadWaitNanos() - permitBase) / 1_000_000).coerceAtLeast(0), true, got)
+                    MediaHttpBudget.close(c)
                     return d
                 } catch (e: IOException) {
+                    MediaHttpBudget.close(c)
+                    checkHttpCancelled()
+                    speedPacing.failure(android.os.SystemClock.elapsedRealtime())
                     ultimo = e
                     resultado(0, false)
-                    c.disconnect()
-                    if (e is java.net.ConnectException || e is java.net.SocketTimeoutException) {
+                    if (e is java.net.ConnectException) {
                         recusado = true
-                        Log.w(TAG, "connection ${if (e is java.net.ConnectException) "refused" else "timed out"}: stopping this title")
+                        Log.w(TAG, "connection refused: stopping this title")
                         break
                     }
+                    if (e is java.net.SocketTimeoutException) throw e
+                    if (recusado) break
                 }
             }
             throw ultimo ?: IOException("read failed")
@@ -890,13 +1205,25 @@ object MiniaturaMotor {
         @Volatile var erroRede = false
 
         override fun getSize() = tamanho
-        override fun close() {}
+        // Initialize all request/error state before constructor I/O can fail.
+        init {
+            pedir(0, 0)
+            if (tamanho > (8L shl 30)) { janela = 2 shl 20; limite = 12L shl 20 }
+        }
+        override fun close() {
+            closed = true
+            abortHttp()
+            synchronized(this) { /* Wait for a cancelled prefetch before deleting its files. */ }
+        }
     }
 
     private class Sessao(val fonte: Fonte, val ex: MediaExtractor, val fmt: MediaFormat, val mime: String) {
-        var dec: MediaCodec? = null
+        @Volatile var dec: MediaCodec? = null
         var soft = false
         var hdr = false
+        var dvProfile = -1
+        var warmFrames = 0
+        var hardwareBaselineAvailable = 0L
         // Hardware decoder that gives no frame: first again without the low priority, then (<= 1080p) the software one.
         // Measured 22/10: the Shield's H.264 decoder at priority 1 next to playback timed out on every frame.
         var travadas = 0
@@ -915,6 +1242,8 @@ object MiniaturaMotor {
         var saida: ByteArrayOutputStream? = null   // reused for each direct reply
         var csdAnexoB: ByteArray? = null           // parameter sets (Annex B) for the CPU route
         var amostraCpu: ByteBuffer? = null         // the CPU thread's keyframe buffer
+        var memoryAudit: ThumbnailMemoryAudit? = null
+        var prefetch: ThumbnailPrefetch? = null
     }
 
     private val sessoes = ConcurrentHashMap<Long, Sessao>()
@@ -941,6 +1270,17 @@ object MiniaturaMotor {
     @Volatile private var cueMaisPerto = false
     @Volatile private var perfilBits = 0
     @Volatile private var perfilLargura = 0
+    @JvmStatic fun pipelineStart(elapsedMs: Long) { ThumbnailPipelineTimeline.clock.start(elapsedMs) }
+    @JvmStatic fun pipelineStop() {}
+    @JvmStatic fun pipelineSummary(elapsedMs: Long): String = ThumbnailPipelineTimeline.summary(elapsedMs)
+    private val nativeTimelineScopes = object : ThreadLocal<MutableMap<Int, java.util.ArrayDeque<AutoCloseable>>>() {
+        override fun initialValue() = mutableMapOf<Int, java.util.ArrayDeque<AutoCloseable>>()
+    }
+    @JvmStatic fun pipelineState(state: Int, begin: Boolean) {
+        val scopes = nativeTimelineScopes.get().getOrPut(state) { java.util.ArrayDeque() }
+        if (begin) scopes.addLast(ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.entries[state]))
+        else if (scopes.isNotEmpty()) scopes.removeLast().close()
+    }
     @JvmStatic
     fun configurar(bits: Int, largura: Int) {
         perfilLargura = largura
@@ -973,7 +1313,7 @@ object MiniaturaMotor {
         if (zerar) { nDireto = 0; nDiretoCache = 0; msDiretoCache = 0; nDup = 0; nAvanco = 0; nDiretoFalhas = 0; msGpu = 0; msJpeg = 0; msSeek = 0; msEsperaQuadro = 0 }
         if (zerar) for (i in 0 until D_CACHE) if (i != D_PICO) D.set(i, 0)
         if (zerar) D.set(D_PICO, D.get(D_CACHE))
-        return s
+        return s + " | " + MediaHttpBudget.snapshot()
     }
 
     // Request pacing for ALL sessions together, adaptive. At most ~4/s (250 ms apart; one request takes ~0.29 s, so
@@ -992,7 +1332,11 @@ object MiniaturaMotor {
 
     private fun pausar() = synchronized(this) {
         val espera = ultimaReq + intervalo - android.os.SystemClock.elapsedRealtime()
-        if (espera > 0) Thread.sleep(espera)
+        if (espera > 0) {
+            val before = android.os.SystemClock.elapsedRealtime()
+            ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.PACING).use { Thread.sleep(espera) }
+            Log.i(TAG, "[fetch-audit] wait kind=adaptive-pace ms=${android.os.SystemClock.elapsedRealtime() - before}")
+        }
         ultimaReq = android.os.SystemClock.elapsedRealtime()
     }
 
@@ -1001,7 +1345,9 @@ object MiniaturaMotor {
     // multiplicative: 10 good answers take 25 % off the gap, so ~50 requests from the floor back to full pace.
     private fun resultado(ms: Long, ok: Boolean, bytes: Int = 0) = synchronized(this) {
         if (ok && bytes <= 1) return@synchronized          // the 0-0 size probe: its latency says nothing about the link
-        if (!ok || ms > LENTO_MS + bytes / 1500) {
+        // In the speed experiment, successful slow responses are measured, not treated as failures.
+        // The request's own duration already limits throughput; actual failures retain backoff.
+        if (!ok || ((perfilBits and 4096) == 0 && ms > LENTO_MS + bytes / 1500)) {
             val antes = intervalo
             intervalo = minOf(INTERVALO_MAX_MS, intervalo * 2)
             rapidas = 0
@@ -1097,21 +1443,47 @@ object MiniaturaMotor {
 
     // Prefetch the keyframes for these copy times in one multi-range request. >= 0 fetched, -1 not possible for this
     // file (not Matroska, no index, server answered single ranges), -2 the connection was refused (stop the title).
-    @JvmStatic
-    fun preparar(h: Long, tempos: LongArray): Int {
-        val f = sessoes[h]?.fonte ?: return -1
-        return try { f.prefetch(tempos) } catch (e: IOException) { if (f.recusado) -2 else -1 }
+    private fun pipelineAllowed(s: Sessao): Boolean {
+        if (s.dec == null || (perfilBits and 2048) == 0) return false
+        if (!thumbnailOverlapBufferHealthy(NvPlayer.thumbnailState == 3, NvPlayer.thumbnailPlaying,
+            NvPlayer.thumbnailBufferMs, android.os.SystemClock.elapsedRealtime() - NvPlayer.thumbnailHealthAtMs,
+            NvPlayer.thumbnailAllocatedBytes, NvPlayer.thumbnailTargetBytes, NvPlayer.thumbnailBufferStable)) return false
+        val heap = Runtime.getRuntime().let { it.maxMemory() - it.totalMemory() + it.freeMemory() }
+        if (heap < (96L shl 20)) return false
+        val am = NvPlayer.contexto()?.getSystemService(android.content.Context.ACTIVITY_SERVICE) as? android.app.ActivityManager ?: return false
+        val memory = android.app.ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
+        return memory.availMem >= (364L shl 20)
+    }
+    @JvmStatic @JvmOverloads
+    fun preparar(h: Long, tempos: LongArray, proximos: LongArray = longArrayOf()): Int {
+        val s = sessoes[h] ?: return -1
+        val result = try { s.fonte.prefetch(tempos, proximos) } catch (e: IOException) { if (s.fonte.recusado) -2 else -1 }
+        if (result >= 0 && proximos.isNotEmpty() && pipelineAllowed(s) && s.fonte.completedOnDisk(tempos)) {
+            val ahead = s.prefetch ?: ThumbnailPrefetch(
+                allowed = { pipelineAllowed(s) },
+                prepare = { times -> s.fonte.prefetchBounded(times) },
+                prepareFurther = { times, further -> s.fonte.prefetchBounded(times, further) },
+                abort = { s.fonte.abortHttp() },
+                report = { message -> Log.i(TAG, "[prefetch-pipeline] source=${System.identityHashCode(s.fonte)} $message") }
+            ).also { s.prefetch = it }
+            ahead.offer(proximos.take(16).toLongArray(),
+                if ((perfilBits and 65536) != 0) proximos.drop(16).take(16).toLongArray() else longArrayOf())
+        }
+        return result
     }
 
-    // At most one NEW decoder every 2 s for the whole engine: decoders are a shared resource of this process, and a
-    // burst of them next to the player is what took the player's away (22/10).
+    // 1 ready on disk; 0 still fetching; -1 normal synchronous/fallback path.
+
+
+
+
     private var ultimaCriacao = 0L
     private fun decoder(s: Sessao): MediaCodec? {
         s.dec?.let { return it }
         if (s.errosCodec >= 2) return null
         synchronized(this) {
             val espera = ultimaCriacao + 2000 - android.os.SystemClock.elapsedRealtime()
-            if (espera > 0) Thread.sleep(espera)
+            if (espera > 0) ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.PACING).use { Thread.sleep(espera) }
             ultimaCriacao = android.os.SystemClock.elapsedRealtime()
         }
         val altura = s.fmt.getInteger(MediaFormat.KEY_HEIGHT)
@@ -1150,17 +1522,25 @@ object MiniaturaMotor {
     @JvmStatic
     fun soltarDecoder(h: Long) {
         val s = sessoes[h] ?: return
-        val dec = s.dec ?: return
-        s.dec = null
-        try { dec.stop() } catch (_: Exception) {}
-        try { dec.release() } catch (_: Exception) {}
-        Log.i(TAG, "decoder released: session=$h")
+        s.prefetch?.close(); s.prefetch = null
+        val dec = s.dec
+        s.dec = null; s.pedido++
+        s.memoryAudit?.snapshot("pre-decoder-release")
+        try { dec?.stop() } catch (_: Exception) {}
+        try { dec?.release() } catch (_: Exception) {}
+        // A SurfaceTexture can retain full-resolution graphic buffers after codec release.
+        // Never carry those buffers into another hardware admission attempt.
+        s.gpu?.soltar(); s.gpu = null
+        s.amostra = null
+        s.memoryAudit?.snapshot("post-codec-and-gpu-release")
+        if (dec != null) Log.i(TAG, "decoder and GPU released: session=$h")
     }
 
     @JvmStatic
     fun fechar(h: Long) {
         soltarDecoder(h)
-        sessoes.remove(h)?.let { it.ex.release(); it.fonte.soltarCache(); it.gpu?.soltar(); it.gpu = null }
+        sessoes[h]?.fonte?.close()
+        sessoes.remove(h)?.let { it.ex.release(); it.fonte.soltarCache(); it.gpu?.soltar(); it.gpu = null; it.memoryAudit?.snapshot("post-source-release") }
     }
 
     // The keyframe nearest `tMs` (closest=true) or the one at/before it.
@@ -1276,8 +1656,9 @@ object MiniaturaMotor {
         val dv = s.fonte.perfilDv()
         if (dv >= 0) {
             val perfil = dv / 16; val compat = dv % 16
+            s.dvProfile = perfil
             // compat 1 = HDR10 base (8.1), 2 = SDR (8.2), 4 = HLG (8.4), 6 = profile 7's HDR10 base layer
-            val ok = (perfil == 7 || perfil == 8) && compat in intArrayOf(1, 2, 4, 6)
+            val ok = ThumbnailDolbyVision.supported(dv)
             Log.i(TAG, "direct: Dolby Vision profile $perfil (base-layer compat $compat) ${if (ok) "-> decoding the base layer" else "-> declined"}")
             if (!ok) { fechar(h); return 0L }
             if (compat == 1 || compat == 6) s.hdr = true
@@ -1298,6 +1679,7 @@ object MiniaturaMotor {
     @JvmStatic
     fun codecCpu(h: Long): Int {
         val s = sessoes[h] ?: return 0
+        if (s.fonte.nalTam <= 0) s.fonte.keyframeMs(0)
         if (s.fonte.nalTam <= 0) return 0
         return when (s.mime) { "video/hevc", "video/dolby-vision" -> 1; "video/avc" -> 2; else -> 0 }
     }
@@ -1340,7 +1722,7 @@ object MiniaturaMotor {
         if (s.errosCodec >= 2) return null
         synchronized(this) {
             val espera = ultimaCriacao + 2000 - android.os.SystemClock.elapsedRealtime()
-            if (espera > 0) Thread.sleep(espera)
+            if (espera > 0) ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.PACING).use { Thread.sleep(espera) }
             ultimaCriacao = android.os.SystemClock.elapsedRealtime()
         }
         // Recheck after the rate-limit wait: playback may have resumed meanwhile.
@@ -1351,7 +1733,10 @@ object MiniaturaMotor {
         val amMemory = NvPlayer.contexto()?.getSystemService(android.content.Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
         val memory = android.app.ActivityManager.MemoryInfo()
         amMemory?.getMemoryInfo(memory)
+        if ((perfilBits and 512) != 0 && s.memoryAudit == null) s.memoryAudit = ThumbnailMemoryAudit(System.identityHashCode(s))
+        s.memoryAudit?.snapshot("pre-gpu-admission")
         val reserve = miniaturaReservaBytes(s.fmt.getInteger(MediaFormat.KEY_WIDTH), s.fmt.getInteger(MediaFormat.KEY_HEIGHT), s.hdr || s.mime != "video/avc")
+        Log.i(TAG, "[decoder-admission] source=${System.identityHashCode(s)} width=${s.fmt.getInteger(MediaFormat.KEY_WIDTH)} height=${s.fmt.getInteger(MediaFormat.KEY_HEIGHT)} availableKB=${memory.availMem / 1024} reserveKB=${reserve / 1024} safetyFloorKB=${300 * 1024} recoveryMarginKB=${64 * 1024} requiredKB=${reserve / 1024 + 364 * 1024} decision=${if (miniaturaMemoriaAdmite(memory.availMem, reserve)) "admit" else "deny"}")
         if (!miniaturaMemoriaAdmite(memory.availMem, reserve)) {
             Log.i(TAG, "direct: decoder admission denied: available=${memory.availMem shr 20} MiB reserve=${reserve shr 20} MiB")
             return null
@@ -1369,6 +1754,14 @@ object MiniaturaMotor {
         }
         val mime = if (s.mime == "video/dolby-vision") "video/hevc" else s.mime
         val f = MediaFormat(s.fmt)
+        if ((perfilBits and 131072)!=0 && s.dvProfile==7) {
+            for (key in arrayOf("csd-0","csd-1")) if (f.containsKey(key)) f.getByteBuffer(key)?.let { original ->
+                val view=original.duplicate(); view.position(0)
+                val copy=ByteBuffer.allocate(view.remaining()); copy.put(view); copy.flip()
+                val r=ThumbnailHevcBaseLayer.filter(copy)
+                if(r!=null) { f.setByteBuffer(key,copy); Log.i(TAG,"[hevc-base-layer] config=$key removedBytes=${r.removedBytes}") }
+            }
+        }
         f.setString(MediaFormat.KEY_MIME, mime)
         if (s.mime == "video/dolby-vision") f.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10)
         // the hardware decoder that takes THIS format (profile, bit depth, size), never a software one
@@ -1385,8 +1778,20 @@ object MiniaturaMotor {
                 if (!NvPlayer.miniaturaPodeCriar()) return null
                 c = MediaCodec.createByCodecName(nome)
                 if (s.travadas == 0) f.setInteger(MediaFormat.KEY_PRIORITY, 1) else f.removeKey(MediaFormat.KEY_PRIORITY)
+                if ((perfilBits and 131072)!=0 && android.os.Build.VERSION.SDK_INT>=30) {
+                    val caps=lista.codecInfos.first { it.name==nome }.getCapabilitiesForType(mime)
+                    val lowLatency=caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+                    if(lowLatency) f.setInteger(MediaFormat.KEY_LOW_LATENCY,1)
+                    Log.i(TAG,"[hardware-headroom] decoder=$nome lowLatencySupported=$lowLatency")
+                }
+                s.hardwareBaselineAvailable=memory.availMem; s.warmFrames=0
+                hardwareHeadroom(s,"pre-configure")
+                s.memoryAudit?.snapshot("pre-configure-$nome")
                 c.configure(f, g.surface, null, 0)
+                s.memoryAudit?.snapshot("post-configure")
                 c.start()
+                s.memoryAudit?.snapshot("post-start")
+                hardwareHeadroom(s,"post-start")
                 s.dec = c; s.soft = false
                 criados++
                 Log.i(TAG, "direct: decoder $nome (hardware, ${if (s.hdr) "HDR/PQ" else "SDR"}, ${s.fmt.getInteger(MediaFormat.KEY_WIDTH)}x${s.fmt.getInteger(MediaFormat.KEY_HEIGHT)})")
@@ -1394,10 +1799,24 @@ object MiniaturaMotor {
             } catch (e: Exception) {
                 Log.w(TAG, "direct: decoder $nome refused: ${e.javaClass.simpleName}")
                 try { c?.release() } catch (_: Exception) {}
+                s.memoryAudit?.snapshot("failed-configure-released")
             }
         }
         s.errosCodec++
         return null
+    }
+
+    private fun hardwareHeadroom(s: Sessao, phase: String) {
+        if ((perfilBits and 131072) == 0) return
+        val am = NvPlayer.contexto()?.getSystemService(android.content.Context.ACTIVITY_SERVICE) as? android.app.ActivityManager ?: return
+        val mem = android.app.ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
+        Log.i(TAG,"[hardware-headroom] phase=$phase frames=${s.warmFrames} availableKB=${mem.availMem/1024} systemDropKB=${(s.hardwareBaselineAvailable-mem.availMem)/1024} playerBytes=${NvPlayer.thumbnailAllocatedBytes}")
+    }
+    private fun baseLayerPacket(s: Sessao, data: ByteBuffer): Int? {
+        if ((perfilBits and 131072)==0 || s.dvProfile!=7) return data.limit()
+        val result = ThumbnailHevcBaseLayer.filter(data) ?: return null
+        if (s.warmFrames < 3) Log.i(TAG,"[hevc-base-layer] inputBytes=${result.inputBytes} outputBytes=${result.outputBytes} removedBytes=${result.removedBytes} removedNals=${result.removedNals}")
+        return result.outputBytes
     }
 
     private fun visivel(s: Sessao, of: MediaFormat) {
@@ -1425,6 +1844,7 @@ object MiniaturaMotor {
         val req0 = s.fonte.lidos
         s.fonte.erroRede = false
         val pedido = ++s.pedido
+        var timelineDecode: AutoCloseable? = null
         try {
             s.fonte.fase = F_SEEK; s.fonte.alvoMs = tMs
             s.fonte.maxLido = 0
@@ -1433,7 +1853,7 @@ object MiniaturaMotor {
             val am = s.amostra?.takeIf { it.capacity() >= cap } ?: ByteBuffer.allocateDirect(cap).also { s.amostra = it }
             val ts0 = android.os.SystemClock.elapsedRealtime()
             // the keyframe straight from its block (only its own bytes were fetched); the extractor when that fails
-            val bloco = try { s.fonte.blocoChave(tMs, am) } catch (e: Exception) { null }
+            val bloco = try { s.fonte.blocoChave(tMs, am, (perfilBits and 131072)!=0 && s.dvProfile==7) } catch (e: Exception) { null }
             val st: Long
             var n: Int
             if (bloco != null) {
@@ -1449,10 +1869,15 @@ object MiniaturaMotor {
                 if (n <= 0) return motivo(s, tMs, "direct: keyframe read failed")
                 s.fonte.registrarExcesso(s.fonte.fimAtual)   // how far past the keyframe's block the parser read
             }
+            am.position(0); am.limit(n)
+            // The indexed path already filtered during its bulk-copy conversion.
+            // Only the rare extractor fallback still needs Annex B boundary discovery.
+            if (bloco == null) n = baseLayerPacket(s, am) ?: return motivo(s,tMs,"invalid HEVC base-layer packet")
             msSeek += android.os.SystemClock.elapsedRealtime() - ts0
             s.fonte.ajustarJanela(n)
             val dec = s.dec ?: return motivo(s, tMs, "direct: decoder released; explicit admission required")
             val g = s.gpu ?: return null
+            timelineDecode = ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.DECODE_ONLY)
             dec.flush()
             g.descartarPendentes()
             val eos = if (s.mime == "video/avc") EOS_AVC else EOS_HEVC
@@ -1523,6 +1948,9 @@ object MiniaturaMotor {
                 msJpeg += tj
                 msDecod += tDecod
                 nDireto++
+                s.warmFrames++
+                if(s.warmFrames==1 || s.warmFrames%30==0) hardwareHeadroom(s,"decoded")
+                s.memoryAudit?.frame()
                 val total = android.os.SystemClock.elapsedRealtime() - t0
                 if (s.fonte.lidos == req0) { nDiretoCache++; msDiretoCache += total }
                 if (nDireto <= 5 || nDireto % 25 == 0L)
@@ -1543,6 +1971,7 @@ object MiniaturaMotor {
             if (e is IllegalStateException || e is MediaCodec.CodecException) s.errosCodec++
             return motivo(s, tMs, "direct: error ${e.javaClass.simpleName}${if (s.errosCodec >= 2) ": decoder given up for this file" else ""}")
         } finally {
+            timelineDecode?.close()
             msQuadros += android.os.SystemClock.elapsedRealtime() - t0
         }
     }

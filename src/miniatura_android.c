@@ -12,6 +12,7 @@ void miniatura_preaquecer(const char *url, const char *cabecalhos) { (void)url; 
 #include "dados.h"
 #include "ajustes.h"
 #include "gfx.h"
+#include "tex_cache.h"
 #include "streams.h"
 #include "video.h"
 #include <dirent.h>
@@ -92,7 +93,7 @@ typedef struct {
 typedef struct {
   unsigned g;
   char urlA[4096], cabA[512];
-  int alturaA, larguraSaida, avisoCompleto, cacheChecado, cacheTipo;
+  int alturaA, larguraSaida, avisoCompleto, cacheChecado, cacheTipo, auditarRede;
   long dur;
   Copia copias[TENTATIVAS];
   int nCopias;
@@ -151,7 +152,7 @@ static int motivoSem;            // M_FALHOU because: 0 the video would not open
 static jclass cls;
 static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo, jLote,
                  jDiag, jConfig, jPerdidos, jAbrirDireto, jQuadroDireto, jKeyframe, jDiagDireto, jHeap, jAudio, jCodecCpu, jPacoteCpu, jPrepDec,
-                 jPixelsDireto, jPixelsDimensoes, jDecPronto;
+                 jPixelsDireto, jPixelsDimensoes, jDecPronto, jPrepararFuturo, jPipelineStart, jPipelineSummary, jPipelineState, jPipelineStop;
 static void prepararPixelsDireto(Job *j, long long h, int k, long pts);
 
 static int jniPreparar(void) {
@@ -179,11 +180,16 @@ static int jniPreparar(void) {
     jFalhaRede = (*env)->GetStaticMethodID(env, c, "falhaRede", "(J)I");
     jTela = (*env)->GetStaticMethodID(env, c, "tela", "()[B");
     jPreparar = (*env)->GetStaticMethodID(env, c, "preparar", "(J[J)I");
+    jPrepararFuturo = (*env)->GetStaticMethodID(env, c, "preparar", "(J[J[J)I");
     jCont = (*env)->GetStaticMethodID(env, c, "contadores", "()[J");
     jAlvo = (*env)->GetStaticMethodID(env, c, "alvo", "(J)Ljava/lang/String;");
     jLote = (*env)->GetStaticMethodID(env, c, "lote", "(J)I");
     jDiag = (*env)->GetStaticMethodID(env, c, "diag", "(Z)Ljava/lang/String;");
     jConfig = (*env)->GetStaticMethodID(env, c, "configurar", "(II)V");
+    jPipelineStop = (*env)->GetStaticMethodID(env, c, "pipelineStop", "()V");
+    jPipelineStart = (*env)->GetStaticMethodID(env, c, "pipelineStart", "(J)V");
+    jPipelineSummary = (*env)->GetStaticMethodID(env, c, "pipelineSummary", "(J)Ljava/lang/String;");
+    jPipelineState = (*env)->GetStaticMethodID(env, c, "pipelineState", "(IZ)V");
     jPerdidos = (*env)->GetStaticMethodID(env, c, "perdidos", "()J");
     jAbrirDireto = (*env)->GetStaticMethodID(env, c, "abrirDireto", "(Ljava/lang/String;Ljava/lang/String;)J");
     jQuadroDireto = (*env)->GetStaticMethodID(env, c, "quadroDireto", "(JJ)[B");
@@ -197,8 +203,8 @@ static int jniPreparar(void) {
     jDecPronto = (*env)->GetStaticMethodID(env, c, "decoderPronto", "(J)I");
     jPixelsDireto = (*env)->GetStaticMethodID(env, c, "pixelsDireto", "(J)Ljava/nio/ByteBuffer;");
     jPixelsDimensoes = (*env)->GetStaticMethodID(env, c, "pixelsDimensoes", "(J)I");
-    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jCont || !jAlvo || !jLote ||
-        !jDiag || !jConfig || !jPerdidos || !jAbrirDireto || !jQuadroDireto || !jKeyframe || !jDiagDireto || !jHeap || !jAudio || !jCodecCpu || !jPacoteCpu || !jPrepDec || !jDecPronto || !jPixelsDireto || !jPixelsDimensoes) {
+    if ((*env)->ExceptionCheck(env) || !jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jPrepararFuturo || !jCont || !jAlvo || !jLote ||
+        !jDiag || !jConfig || !jPipelineStart || !jPipelineStop || !jPipelineSummary || !jPipelineState || !jPerdidos || !jAbrirDireto || !jQuadroDireto || !jKeyframe || !jDiagDireto || !jHeap || !jAudio || !jCodecCpu || !jPacoteCpu || !jPrepDec || !jDecPronto || !jPixelsDireto || !jPixelsDimensoes) {
       (*env)->ExceptionClear(env);
     } else {
       cls = (jclass)(*env)->NewGlobalRef(env, c);
@@ -311,6 +317,28 @@ static int mPreparar(long long h, const long *tempos, int n) {
   (*env)->DeleteLocalRef(env, a);
   return r;
 }
+static int mPrepararFuturo(long long h, const long *tempos, int n, const long *future, int count) {
+  if (!count) return mPreparar(h, tempos, n);
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jlongArray a = (*env)->NewLongArray(env, n), b = (*env)->NewLongArray(env, count);
+  if (!a || !b) {
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (a) (*env)->DeleteLocalRef(env, a);
+    if (b) (*env)->DeleteLocalRef(env, b);
+    return -1;
+  }
+  jlong values[LOTE];
+  for (int i = 0; i < n; i++) values[i] = tempos[i];
+  (*env)->SetLongArrayRegion(env, a, 0, n, values);
+  for (int i = 0; i < count; i++) values[i] = future[i];
+  (*env)->SetLongArrayRegion(env, b, 0, count, values);
+  jint r = (*env)->CallStaticIntMethod(env, cls, jPrepararFuturo, (jlong)h, a, b);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = -1; }
+  (*env)->DeleteLocalRef(env, a); (*env)->DeleteLocalRef(env, b);
+  return r;
+}
+static int bitsDebug(void);
+
 // MiniaturaMotor.contadores() since the app started; the summary takes deltas.
 #define NCONT 12
 static int mLote(long long h) {
@@ -450,14 +478,32 @@ static long long mPerdidos(void) {
 // debug.nuvio.miniatura (adb shell setprop): bit 1 = force the direct playing-file path, bit 2 = old closest-cue
 // prefetch (A/B of the read fix). Read when a title starts and handed to the engine.
 static int bitsDebug(void) {
-  char v[PROP_VALUE_MAX] = "";
-  if (__system_property_get("debug.nuvio.miniatura", v) <= 0) return 0;
-  return atoi(v);
+  // Retained shipping profile: overlap, health-gated fast pacing, bounded mixed probes,
+  // two payload exchanges, shared transport, lookahead and measured memory/NAL fixes.
+  return 260096;
 }
+
 static void mConfigurar(int bits) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   (*env)->CallStaticVoidMethod(env, cls, jConfig, (jint)bits, (jint)ajustes_miniatura_largura());
   if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+}
+static void mPipelineState(int state, int begin) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  if (!env || !cls || !jPipelineState) return;
+  (*env)->CallStaticVoidMethod(env, cls, jPipelineState, (jint)state, begin ? JNI_TRUE : JNI_FALSE);
+  if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+}
+static void mPipelineSummary(Job *j, Uint32 t0) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  if (!env || !cls) return;
+  jstring value = (jstring)(*env)->CallStaticObjectMethod(env, cls, jPipelineSummary, (jlong)(SDL_GetTicks() - t0));
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return; }
+  if (value) {
+    const char *text = (*env)->GetStringUTFChars(env, value, NULL);
+    if (text) { printf("[miniatura] SUMMARY-TIMELINE %s | %s\n", j->titulo, text); (*env)->ReleaseStringUTFChars(env, value, text); }
+    (*env)->DeleteLocalRef(env, value);
+  }
 }
 static long long mRitmo(void) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
@@ -1116,7 +1162,14 @@ static void escreverI32(FILE *f, long v) { unsigned char b[4] = { (unsigned char
 static int lerI32(FILE *f, long *v) { unsigned char b[4]; if (fread(b, 1, 4, f) != 4) return 0; *v = (long)((unsigned long)b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]); return 1; }
 
 // Loads what an earlier run made. 1 = the set was complete (nothing to read from the network).
+static int carregar0(Job *j);
 static int carregar(Job *j) {
+  mPipelineState(6, 1);
+  int result = carregar0(j);
+  mPipelineState(6, 0);
+  return result;
+}
+static int carregar0(Job *j) {
   if (!j->arq[0]) return 0;
   struct stat st;
   if (stat(j->arq, &st) == 0 && time(NULL) - st.st_mtime > CACHE_TTL_S) { unlink(j->arq); return 0; }
@@ -1146,7 +1199,7 @@ static int carregar(Job *j) {
 // Publish the result before permitting any progress pill. A saved set is not
 // a fresh generation, even when its retained tile count already exceeds 50%.
 static int carregarInformado(Job *j) {
-  int complete = carregar(j);
+  int complete = j->auditarRede ? 0 : carregar(j);
   pthread_mutex_lock(&mu);
   j->cacheTipo = complete ? 2 : j->feitos > 0 ? 1 : 0;
   j->cacheChecado = 1;
@@ -1189,7 +1242,14 @@ static void limparCache(const char *dirArq) {
   free(v);
 }
 
+static void salvar0(Job *j, int completo);
 static void salvar(Job *j, int completo) {
+  mPipelineState(6, 1);
+  salvar0(j, completo);
+  mPipelineState(6, 0);
+}
+static void salvar0(Job *j, int completo) {
+  if (j->auditarRede) return; // diagnostic cold fetch: preserve the saved set
   if (!j->arq[0]) return;
   if (!j->feitos) { unlink(j->arq); return; }   // nothing left (a dropped copy): no stale set may survive (22/10, Bond)
   char dir[sizeof j->arq], tmp[sizeof j->arq + 5];
@@ -1385,6 +1445,7 @@ static void resumo(Job *j, Uint32 t0) {
          j->feitos, j->n, (SDL_GetTicks() - t0) / 1000.0, evRebuffer, evErro, j->nRecheck, j->falhasRecheck,
          j->reancoras, j->caiuEm ? ", copy dropped mid-film" : "", mPerdidos() - j->perdidos0, mAudioFalhas() - j->audio0, j->memMin / 1024, j->heapMin, j->esperasHeap, marcos, dg,
          dd[0] ? " | " : "", dd);
+  mPipelineSummary(j, t0);
   fflush(stdout);
 }
 
@@ -1439,6 +1500,22 @@ static int proximoDireto(const Job *j, int etapaMax, int *etapa) {
     }
   }
   return -1;
+}
+// Preview the next scheduled targets under the same lock, without claiming
+// their work or making JNI/network calls while the UI mutex is held.
+static int sondasFuturas(Job *j, int stage, long *times, int capacity) {
+  int slots[32], count = 0;
+  if (capacity > 32) capacity = 32;
+  pthread_mutex_lock(&mu);
+  while (count < capacity) {
+    int phase, k = proximoDireto(j, stage, &phase);
+    if (k < 0) break;
+    slots[count] = k; times[count++] = k * GRADE_MS;
+    j->tentado[k] = 1;
+  }
+  for (int i = 0; i < count; i++) j->tentado[slots[i]] = 0;
+  pthread_mutex_unlock(&mu);
+  return count;
 }
 // Slots of a stage still open (for the coverage milestones).
 // A slot of the stage counts as covered when a thumbnail lies within half the stage's spacing of it (the keyframe
@@ -1549,7 +1626,9 @@ static void *cpuTrabalho(void *u) {
       pthread_mutex_unlock(cf->mp);
       continue;
     }
+    mPipelineState(5, 1);
     r = mini_motor_pacote(cf->cpu, pk, npk, cf->threads, &jpg, &nj, &q, e, sizeof e);
+    mPipelineState(5, 0);
     free(pk);
     if (r < 0) {
       pthread_mutex_lock(cf->mp);
@@ -1610,6 +1689,7 @@ static void *preTrabalho(void *u) {
   return NULL;
 }
 void miniatura_preaquecer(const char *url, const char *cabecalhos) {
+  if (bitsDebug() & 1024) return; // playback-only diagnostic, no thumbnail open/decoder
   if (!url || strncmp(url, "http", 4)) return;
   pthread_mutex_lock(&muPre);
   if (preRodando || !strcmp(preUrl, url)) { pthread_mutex_unlock(&muPre); return; }
@@ -1620,6 +1700,8 @@ void miniatura_preaquecer(const char *url, const char *cabecalhos) {
   if (velho) mFechar(velho);                    // a title that never started its job
   if (bitsDebug() & 8 || !jniPreparar()) return;
   mConfigurar(bitsDebug());
+  // This entry point is called by the SDL/render thread while opening the player.
+  if (bitsDebug() & 131072) { tex_aliviar(); printf("[miniatura] hardware preparation: reclaimed optional artwork caches\n"); fflush(stdout); }
   PreArgs *a = calloc(1, sizeof *a);
   if (!a) return;
   snprintf(a->url, sizeof a->url, "%s", url);
@@ -1694,8 +1776,8 @@ static int trabalharDireto(Job *j, long long *hA) {
 #endif
   long *pend = malloc(sizeof(long) * (size_t)j->n);
   if (!pend) { printf("[miniatura] direct: out of memory\n"); fflush(stdout); return 1; }
-  int etapaMax = 3, lotes = 0, feitosAqui = 0, erros0 = evErro;
   j->tentado[0] = 1;                               // t = 0 is a black/logo frame that will not decode alone (measured 23/10)
+  int etapaMax = 3, lotes = 0, feitosAqui = 0, erros0 = evErro;
   long fila[LOTE];
   printf("[miniatura] direct: thumbnails from the playing file, stages scrub > playhead > 60 s > 30 s > 10 s\n"); fflush(stdout);
   while (!parou(j)) {
@@ -1797,10 +1879,13 @@ static int trabalharDireto(Job *j, long long *hA) {
     if (liberado && nPend > 0) {
       // the queued keyframe nearest to where the user is (scrub target, else the playhead) first
       long onde = scrubbing ? posMs : playheadMs, melhor = -1;
-      int iM = 0;
+      int iM = -1;
       pthread_mutex_lock(&mp);
       if (nPend <= 0) { pthread_mutex_unlock(&mp); continue; }
-      for (int i = 0; i < nPend; i++) { long d = labs(pend[i] - onde); if (melhor < 0 || d < melhor) { melhor = d; iM = i; } }
+      for (int i = 0; i < nPend; i++) {
+        long d = labs(pend[i] - onde); if (melhor < 0 || d < melhor) { melhor = d; iM = i; }
+      }
+      if (iM < 0) { pthread_mutex_unlock(&mp); dormir(j,20); continue; }
       long kf = pend[iM];
       pend[iM] = pend[--nPend];
       pthread_mutex_unlock(&mp);
@@ -1861,12 +1946,12 @@ static int trabalharDireto(Job *j, long long *hA) {
     if (j->cob30 && !j->resumido) resumo(j, j->t0);
 #endif
     if (!liberado && nPend >= DIR_PENDENTES_MAX) {   // enough downloaded: wait for a confirmed pause
-      if (!avisouEspera) { printf("[miniatura] direct: %d keyframes downloaded, decoding at a confirmed pause\n", nPend); fflush(stdout); avisouEspera = 1; }
+      if (!avisouEspera) { printf("[miniatura] direct: %d targets queued (not a download count), waiting for decoder admission\n", nPend); fflush(stdout); avisouEspera = 1; }
       dormir(j, 500);
       continue;
     }
     // claim a batch of distinct keyframes
-    int nf = 0, etapa = 9;
+    int nf = 0, etapa = 9, prioridadeCurta = 0;
     int quer = scrubbing ? 2 : mLote(*hA);
     pthread_mutex_lock(&mu);
     while (nf < quer) {
@@ -1885,26 +1970,27 @@ static int trabalharDireto(Job *j, long long *hA) {
       if (repetido) continue;                     // same random-access frame as one made or queued
       if (e < etapa) etapa = e;
       fila[nf] = kf; nf++;
-      if (e <= 1 && nf >= 2) break;               // near targets: small batches, quick answers
+      if (e <= 1 && nf >= 2) { prioridadeCurta = 1; break; }               // near targets: small batches, quick answers
     }
     pthread_mutex_unlock(&mu);
     if (!nf) {
       if (nPend > 0 && etapaMax >= 4) {             // everything downloaded: the queue waits for the decoder (or the CPU)
         if (!liberado && !avisouEspera && nPend > 0) {
-          printf("[miniatura] direct: %d keyframes downloaded, decoding at a confirmed pause\n", nPend); fflush(stdout); avisouEspera = 1;
+          printf("[miniatura] direct: %d targets queued (not a download count), waiting for decoder admission\n", nPend); fflush(stdout); avisouEspera = 1;
         }
         dormir(j, 500);
         continue;
       }
       // nothing open up to this stage: the 10 s grid only with headroom, else wait for scrubbing/headroom
       double folga = folgaSeg();
-      // the 10 s grid is DOWNLOADED while playing too (no decoder needed for that); decoded at a confirmed pause
-      // (memory: 100 MB above the floor; 2x the floor never held on the Shield during 4K playback, 23/10: ~400-500 MB free)
-      int memOk = disp < 0 || disp > PISO_KB + 100L * 1024, folgaOk = folga < 0 || folga >= folgaQuer(8.0, 0.7);
+      // Existing hardware needs no new decoder allocation to refine the grid.
+      // Recheck actual state: a safety release must not inherit this admission.
+      int hardwareReady = mDecoderPronto(*hA);
+      int memOk = mini_refine_memory_ok(disp, PISO_KB, hardwareReady), folgaOk = folga < 0 || folga >= folgaQuer(8.0, 0.7);
       int quieto = !j->contencoes || SDL_GetTicks() - ultimaContencao > 60000u;   // 60 s without contention
       if (etapaMax < 4 && quieto && folgaOk && memOk) {
         etapaMax = 4;
-        printf("[miniatura] direct: headroom (%.0f s buffered, %ld MB free): refining to the 10 s grid\n", folga, disp / 1024); fflush(stdout);
+        printf("[miniatura] direct: headroom (%.0f s buffered, %ld MB free, hardware %s): refining to the 10 s grid\n", folga, disp / 1024, hardwareReady ? "ready" : "absent"); fflush(stdout);
         continue;
       }
       if (etapaMax >= 4) break;                   // everything made
@@ -1917,9 +2003,14 @@ static int trabalharDireto(Job *j, long long *hA) {
       dormir(j, 3000);                            // the decoder stays: waiting for a scrub or for headroom
       continue;
     }
+    printf("[miniatura] batch-plan: frames=%d target=%d stage=%d reason=%s\n", nf, quer, etapa,
+           prioridadeCurta ? "playhead-priority" : nf >= quer ? "frame-or-byte-budget" : "available-distinct-targets");
+    fflush(stdout);
     esperarFolga(j);
     if (nf > 1) {
-      int r = mPreparar(*hA, fila, nf);
+      long future[32];
+      int count = !scrubbing && etapa >= 2 ? sondasFuturas(j, etapaMax, future, (bitsDebug() & 65536) ? 32 : 16) : 0;
+      int r = mPrepararFuturo(*hA, fila, nf, future, count);
       if (r == -2) { snprintf(motivo, sizeof motivo, "source refused a connection"); break; }
       if (r >= 0) lotes++;
     }
@@ -1966,6 +2057,9 @@ static void *trabalhar(void *u) {
   mDiag(1, NULL, 0);
   int bits = bitsDebug();
   mConfigurar(bits);
+  JNIEnv *timelineEnv = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  (*timelineEnv)->CallStaticVoidMethod(timelineEnv, cls, jPipelineStart, (jlong)(SDL_GetTicks() - t0));
+  if ((*timelineEnv)->ExceptionCheck(timelineEnv)) (*timelineEnv)->ExceptionClear(timelineEnv);
   j->t0 = t0;
   evRebuffer = evErro = 0;
   j->perdidos0 = mPerdidos();                   // (before any branch: the forced-direct one returned before these)
@@ -1994,7 +2088,7 @@ static void *trabalhar(void *u) {
     goto fim;
   }
   if (j->nCopias == 0) {                        // nothing smaller to make them from: the playing file is not opened
-    printf("[miniatura] no smaller copy in the list: no thumbnails for this title\n"); fflush(stdout);
+    printf("[miniatura] playing source unavailable for thumbnails; no compatible fallback\n"); fflush(stdout);
     pthread_mutex_lock(&mu); if (job == j) { estado = M_FALHOU; motivoSem = 1; } pthread_mutex_unlock(&mu);
     goto fim;
   }
@@ -2219,6 +2313,8 @@ static void *trabalhar(void *u) {
     mFechar(f1.h); mFechar(f2.h);
   }
 fim:
+  (*timelineEnv)->CallStaticVoidMethod(timelineEnv, cls, jPipelineStop);
+  if ((*timelineEnv)->ExceptionCheck(timelineEnv)) (*timelineEnv)->ExceptionClear(timelineEnv);
   mFechar(hB);
   mFechar(hA);
   resumo(j, t0);
@@ -2372,6 +2468,11 @@ static void encerrar(void) {
 }
 
 static void pPedir(const SeekrFonte *f) {
+  if (bitsDebug() & 1024) {
+    pthread_mutex_lock(&mu); int running = job != NULL; pthread_mutex_unlock(&mu);
+    if (running) encerrar();
+    return;
+  }
   posMs = f->posMs; playheadMs = f->playheadMs; scrubbing = f->scrubbing;
   if (avisoPronto && avisoPronto == geracao) {          // the playing title's set is complete
     avisoPronto = 0;
@@ -2396,6 +2497,7 @@ static void pPedir(const SeekrFonte *f) {
   j->tentado = calloc((size_t)j->n, 1);
   if (!j->tiles || !j->tentado) { free(j->tiles); free(j->tentado); free(j); return; }
   snprintf(j->urlA, sizeof j->urlA, "%s", f->url);
+  j->auditarRede = (bitsDebug() & 256) != 0;
   j->larguraSaida = ajustes_miniatura_largura();
   char cacheMode[64];
   snprintf(cacheMode, sizeof cacheMode, "thumb-w%d", j->larguraSaida);
@@ -2433,7 +2535,7 @@ static const char *pRotulo(int est) {
   switch (est) {
     case SEEKR_BUSCANDO: return "Fazendo miniaturas neste aparelho";
     case SEEKR_PRONTO: return "Miniaturas disponíveis";
-    case SEEKR_SEM_PREVIA: return motivoSem ? "Sem cópia menor para fazer as miniaturas" : "Este aparelho não conseguiu ler este vídeo";
+    case SEEKR_SEM_PREVIA: return "Este título não tem miniaturas";
     default: return "Fazendo miniaturas neste aparelho";
   }
 }

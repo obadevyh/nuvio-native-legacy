@@ -5,6 +5,12 @@
 
 typedef struct { uint32_t pausedSince; int waiting, attempted; } MiniPauseAdmission;
 
+// Refining an existing hardware session allocates no additional source decoder.
+// Keep the normal floor; retain extra headroom when hardware is absent.
+static inline int mini_refine_memory_ok(long availableKB, long floorKB, int ready) {
+  return availableKB < 0 || availableKB >= floorKB + (ready ? 0 : 100L * 1024);
+}
+
 // A scrub/buffer transition is never a creation window. One attempt per genuine
 // pause: failures/releases cannot cause a retry loop while playback runs or rests.
 static inline int mini_pause_admit(MiniPauseAdmission *p, uint32_t now,

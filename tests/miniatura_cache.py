@@ -2,13 +2,14 @@
 from pathlib import Path
 import subprocess
 import tempfile
+import re
 
 root = Path(__file__).resolve().parents[1]
 text = (root / "src/miniatura_android.c").read_text()
 
 
 def extract(signature):
-    start = text.index(signature)
+    start = re.search(re.escape(signature) + r"[^;{}]*\)\s*\{", text).start()
     end = text.index("{", start) + 1
     depth = 1
     while depth:
@@ -30,7 +31,7 @@ prefix = r'''
 #define CACHE_TTL_S 7200
 #define M_PRONTO 1
 typedef struct { unsigned char *jpg; int n; long pts; unsigned char prov, salvo; unsigned revision; } Tile;
-typedef struct { int n, feitos, direto, appendPronto, cacheTipo, cacheChecado; long dur; Tile *tiles; unsigned char *tentado; char arq[640]; } Job;
+typedef struct { int n, feitos, direto, appendPronto, cacheTipo, cacheChecado, auditarRede; long dur; Tile *tiles; unsigned char *tentado; char arq[640]; } Job;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static Job *job;
 static int estado;
@@ -55,6 +56,10 @@ int main(int argc, char **argv) {
   assert(resumed.cacheChecado && resumed.cacheTipo==2);
   assert(resumed.tiles[2].pts==20000 && !memcmp(resumed.tiles[2].jpg,"def",3));
   release(&resumed);
+  Job audit=create(argv[1]); audit.auditarRede=1; job=&audit;
+  assert(!carregarInformado(&audit) && audit.feitos==0 && audit.cacheTipo==0);
+  long preserved=size(argv[1]); salvar(&audit,0); assert(size(argv[1])==preserved);
+  release(&audit);
   FILE *f=fopen(argv[1],"r+b"); assert(f); fseek(f,12,SEEK_SET); escreverI32(f,0); fseek(f,0,SEEK_END);
   escreverI32(f,2); escreverI32(f,20000); escreverI32(f,100); fputc(1,f); fclose(f);
   resumed=create(argv[1]); job=&resumed;
@@ -68,8 +73,8 @@ int main(int argc, char **argv) {
   puts("PASS: incremental checkpoints, no duplicate records, resume and interrupted append recovery");
 }
 '''
-source = prefix + "\n".join(extract(sig) for sig in (
-    "static void escreverI32(", "static int lerI32(", "static int carregar(", "static int carregarInformado(", "static void salvar(")) + checks
+source = prefix + "\nstatic void salvar(Job *j,int completo);\nstatic void mPipelineState(int state,int begin) { (void)state; (void)begin; }\n" + "\n".join(extract(sig) for sig in (
+    "static void escreverI32(", "static int lerI32(", "static int carregar0(", "static int carregar(", "static int carregarInformado(", "static void salvar0(", "static void salvar(")) + checks
 with tempfile.TemporaryDirectory(prefix="nuvio-cache-") as tmp:
     c = Path(tmp) / "cache.c"
     exe = Path(tmp) / "cache"
