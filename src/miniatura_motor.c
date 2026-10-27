@@ -12,6 +12,7 @@
 #include <libavformat/avformat.h>
 #include <libavutil/sha.h>
 #include <libavutil/pixdesc.h>
+#include "miniatura_dovi.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -65,6 +66,12 @@ struct MiniMotor {
   pthread_t preT; int preVivo;
   int64_t preIni; long preQuer, preGot; unsigned char *preBuf;
   AVCodecParameters *parPac;        // packet mode: the stream's parameters (no container)
+  unsigned long long resizeNs, colourNs;
+  float *gpuSamples;
+  unsigned char *gpuRgba;
+  int gpuW,gpuH,gpuFailed,gpuValidated;
+  int doviRequired;
+  int doviLogged;
   int hdrDica;                      // packet mode: PQ when the bitstream does not say
 };
 
@@ -551,6 +558,10 @@ static int abrirJpeg(MiniMotor *m) {
   return 0;
 }
 
+static MiniDoviLut doviLut;
+static pthread_once_t doviLutOnce=PTHREAD_ONCE_INIT;
+static void initDoviLut(void) { mini_dv_lut_init(&doviLut); }
+static unsigned long long colourClock(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (unsigned long long)t.tv_sec*1000000000ULL+t.tv_nsec; }
 // ------------------------------------------------------------------ colour
 static float hable(float x) {
   const float A = 0.15f, B = 0.50f, C = 0.10f, D = 0.20f, E = 0.02f, F = 0.30f;
@@ -594,6 +605,62 @@ static float media(const AVFrame *f, int p, int prof, int x0, int x1, int y0, in
   return n ? (float)acc / (float)n : 0.0f;
 }
 
+#ifdef __ANDROID__
+extern int mini_dovi_gpu_convert(int,int,const float *,const float *,unsigned char *);
+extern void mini_dovi_gpu_close(void);
+static int reduzirDolbyGpu(MiniMotor *m,const MiniDovi *dv,int sw,int sh,int ox,int oy,int depth) {
+  if(m->gpuFailed)return 0;
+  if(m->gpuW!=sw || m->gpuH!=sh) {
+    free(m->gpuSamples);free(m->gpuRgba);
+    m->gpuSamples=malloc((size_t)sw*sh*3*sizeof(float));m->gpuRgba=malloc((size_t)sw*sh*4);
+    m->gpuW=sw;m->gpuH=sh;
+    if(!m->gpuSamples || !m->gpuRgba) {m->gpuFailed=1;return 0;}
+  }
+  AVFrame *f=m->quadro,*o=m->saida;float max=(1<<depth)-1;
+  unsigned long long start=colourClock();
+  for(int y=0;y<sh;y++)for(int x=0;x<sw;x++) {
+    int x0=(int)((long)x*f->width/sw),x1=(int)((long)(x+1)*f->width/sw);
+    int y0=(int)((long)y*f->height/sh),y1=(int)((long)(y+1)*f->height/sh);
+    if(x1<=x0)x1=x0+1;if(y1<=y0)y1=y0+1;
+    int cx1=(x1+1)/2,cy1=(y1+1)/2;
+    if(cx1>(f->width+1)/2)cx1=(f->width+1)/2;
+    if(cy1>(f->height+1)/2)cy1=(f->height+1)/2;
+    float *v=m->gpuSamples+((size_t)y*sw+x)*3;
+    v[0]=media(f,0,depth,x0,x1,y0,y1)/max;
+    v[1]=media(f,1,depth,x0/2,cx1,y0/2,cy1)/max;
+    v[2]=media(f,2,depth,x0/2,cx1,y0/2,cy1)/max;
+  }
+  m->resizeNs=colourClock()-start;
+  float metadata[1024];mini_dv_pack(dv,metadata);start=colourClock();
+  int result=mini_dovi_gpu_convert(sw,sh,m->gpuSamples,metadata,m->gpuRgba);
+  if(result!=1) {m->gpuFailed=1;mini_dovi_gpu_close();printf("[miniatura-dv5-gpu] CPU fallback (result %d)\n",result);fflush(stdout);return 0;}
+  if(!m->gpuValidated) {
+    int worst=0;double sum=0;
+    for(int k=0;k<sw*sh;k++) {
+      float ref[3];mini_dv_rgb(dv,m->gpuSamples+(size_t)k*3,ref);
+      for(int c=0;c<3;c++) {int expected=(int)(ref[c]*255+.5f);int delta=abs(expected-m->gpuRgba[(size_t)k*4+c]);sum+=delta;if(delta>worst)worst=delta;}
+    }
+    double mean=sum/(sw*sh*3);
+    printf("[miniatura-dv5-gpu] real-frame RGB check pixels=%d maxError=%d meanError=%.4f decision=%s\n",sw*sh,worst,mean,worst<=3 && mean<=.25 ? "accept" : "CPU fallback");fflush(stdout);
+    if(worst>3 || mean>.25) {m->gpuFailed=1;mini_dovi_gpu_close();return 0;}
+    m->gpuValidated=1;
+  }
+  for(int by=0;by<sh;by+=2)for(int bx=0;bx<sw;bx+=2) {
+    float u=0,v=0;
+    for(int dy=0;dy<2;dy++)for(int dx=0;dx<2;dx++) {
+      const unsigned char *p=m->gpuRgba+((size_t)(by+dy)*sw+bx+dx)*4;
+      float r=p[0],g=p[1],b=p[2];
+      o->data[0][(size_t)(oy+by+dy)*o->linesize[0]+ox+bx+dx]=(uint8_t)clamp255(.299f*r+.587f*g+.114f*b);
+      u+=-.168736f*r-.331264f*g+.5f*b;v+=.5f*r-.418688f*g-.081312f*b;
+    }
+    o->data[1][(size_t)((oy+by)/2)*o->linesize[1]+(ox+bx)/2]=(uint8_t)clamp255(u/4+128);
+    o->data[2][(size_t)((oy+by)/2)*o->linesize[2]+(ox+bx)/2]=(uint8_t)clamp255(v/4+128);
+  }
+  m->colourNs=colourClock()-start;
+  return 1;
+}
+#endif
+
 // Shrinks the decoded frame into m->saida (yuvj420p 320x180, letter/pillarboxed).
 static int reduzir(MiniMotor *m) {
   int outputW = m->cfg.larguraSaida ? m->cfg.larguraSaida : MINI_W, outputH = outputW * 9 / 16;
@@ -602,6 +669,23 @@ static int reduzir(MiniMotor *m) {
   if (!d || (d->flags & AV_PIX_FMT_FLAG_RGB) || d->nb_components < 3 || d->log2_chroma_w != 1 || d->log2_chroma_h != 1)
     return -1;                                   // 4:2:0 only (what TV sources are)
   int prof = d->comp[0].depth, max = (1 << prof) - 1;
+  AVFrameSideData *dvSide=m->doviRequired ? av_frame_get_side_data(f,AV_FRAME_DATA_DOVI_METADATA) : NULL;
+  MiniDovi dv; int useDv=0;
+  if(dvSide && dvSide->size>=sizeof(AVDOVIMetadata)) {
+    const AVDOVIMetadata *meta=(const AVDOVIMetadata *)dvSide->data;
+    if(meta->header_offset<=dvSide->size && sizeof(AVDOVIRpuDataHeader)<=dvSide->size-meta->header_offset &&
+       meta->mapping_offset<=dvSide->size && sizeof(AVDOVIDataMapping)<=dvSide->size-meta->mapping_offset &&
+       meta->color_offset<=dvSide->size && sizeof(AVDOVIColorMetadata)<=dvSide->size-meta->color_offset)
+      useDv=mini_dv_prepare(&dv,av_dovi_get_header(meta),av_dovi_get_mapping(meta),av_dovi_get_color(meta));
+  }
+  if(useDv) pthread_once(&doviLutOnce,initDoviLut);
+  m->resizeNs=0; m->colourNs=0;
+  if(m->doviRequired && !useDv) {
+    if(!m->doviLogged) { printf("[miniatura-dv5] rejected frame: complete Dolby colour metadata unavailable\n"); fflush(stdout); m->doviLogged=1; }
+    return -1;
+  }
+  if(useDv && !m->doviLogged) { printf("[miniatura-dv5] applying per-frame RPU reshaping and colour matrices to decoded YUV\n"); fflush(stdout); m->doviLogged=1; }
+
   int cheio = f->color_range == AVCOL_RANGE_JPEG || f->format == AV_PIX_FMT_YUVJ420P;
   float yMin = cheio ? 0 : 16 << (prof - 8), yEsc = cheio ? max : 219 << (prof - 8);
   float cMeio = 128 << (prof - 8), cEsc = cheio ? max : 224 << (prof - 8);
@@ -632,8 +716,28 @@ static int reduzir(MiniMotor *m) {
     memset(o->data[1] + (size_t)y * (size_t)o->linesize[1], 128, outputW / 2);
     memset(o->data[2] + (size_t)y * (size_t)o->linesize[2], 128, outputW / 2);
   }
+#ifdef __ANDROID__
+  if(useDv && reduzirDolbyGpu(m,&dv,sw,sh,ox,oy,prof)) return 0;
+#endif
   // Per 2x2 output block: four luma samples, one chroma pair.
+  float sampled[2][640][3]; // two output rows only: bounded 15 KiB scratch
   for (int by = 0; by < sh; by += 2) {
+    unsigned long long rowStart=useDv ? colourClock() : 0;
+    if(useDv) {
+      for(int dy=0;dy<2;dy++) for(int x=0;x<sw;x++) {
+        int y=by+dy;
+        int x0=(int)((long)x*f->width/sw),x1=(int)((long)(x+1)*f->width/sw);
+        int y0=(int)((long)y*f->height/sh),y1=(int)((long)(y+1)*f->height/sh);
+        if(x1<=x0) x1=x0+1; if(y1<=y0) y1=y0+1;
+        int cx1=(x1+1)/2,cy1=(y1+1)/2;
+        if(cx1>(f->width+1)/2) cx1=(f->width+1)/2;
+        if(cy1>(f->height+1)/2) cy1=(f->height+1)/2;
+        sampled[dy][x][0]=media(f,0,prof,x0,x1,y0,y1);
+        sampled[dy][x][1]=media(f,1,prof,x0/2,cx1,y0/2,cy1);
+        sampled[dy][x][2]=media(f,2,prof,x0/2,cx1,y0/2,cy1);
+      }
+      unsigned long long now=colourClock(); m->resizeNs+=now-rowStart; rowStart=now;
+    }
     for (int bx = 0; bx < sw; bx += 2) {
       float cbAcc = 0, crAcc = 0;
       for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) {
@@ -642,15 +746,22 @@ static int reduzir(MiniMotor *m) {
         int y0 = (int)((long)y * f->height / sh), y1 = (int)((long)(y + 1) * f->height / sh);
         if (x1 <= x0) x1 = x0 + 1;
         if (y1 <= y0) y1 = y0 + 1;
-        float Y = media(f, 0, prof, x0, x1, y0, y1);
+        float Y,U,V;
+        if(useDv) { Y=sampled[dy][x][0]; U=sampled[dy][x][1]; V=sampled[dy][x][2]; }
+        else {
+        Y = media(f, 0, prof, x0, x1, y0, y1);
         int cx0 = x0 / 2, cx1 = (x1 + 1) / 2, cy0 = y0 / 2, cy1 = (y1 + 1) / 2;
         if (cx1 > (f->width + 1) / 2) cx1 = (f->width + 1) / 2;
         if (cy1 > (f->height + 1) / 2) cy1 = (f->height + 1) / 2;
-        float U = media(f, 1, prof, cx0, cx1, cy0, cy1), V = media(f, 2, prof, cx0, cx1, cy0, cy1);
+        U = media(f, 1, prof, cx0, cx1, cy0, cy1); V = media(f, 2, prof, cx0, cx1, cy0, cy1);
+        }
         float yn = (Y - yMin) / yEsc, cb = (U - cMeio) / cEsc, cr = (V - cMeio) / cEsc;
         float r = yn + 2 * (1 - kr) * cr, b = yn + 2 * (1 - kb) * cb;
         float g = (yn - kr * r - kb * b) / kg;
-        if (pq || hlg) {
+        if (useDv) {
+          float signal[3]={Y/max,U/max,V/max}, rgb[3];
+          mini_dv_rgb_fast(&dv,&doviLut,signal,rgb); r=rgb[0]; g=rgb[1]; b=rgb[2];
+        } else if (pq || hlg) {
           // PQ/HLG signal -> linear (LUT, already Hable-tonemapped) -> BT.2020 to BT.709 -> gamma.
           float lr = m->lutPq[(int)(clamp01(r) * 1023 + 0.5f)];
           float lg = m->lutPq[(int)(clamp01(g) * 1023 + 0.5f)];
@@ -672,6 +783,7 @@ static int reduzir(MiniMotor *m) {
       o->data[1][ci * (size_t)o->linesize[1] + cj] = (uint8_t)clamp255(cbAcc / 4 + 128);
       o->data[2][ci * (size_t)o->linesize[2] + cj] = (uint8_t)clamp255(crAcc / 4 + 128);
     }
+    if(useDv) m->colourNs+=colourClock()-rowStart;
   }
   return 0;
 }
@@ -783,7 +895,8 @@ MiniMotor *mini_motor_abrir_pacotes(int hevc, int largura, int altura, int hdr, 
   m->info.bits = hdr ? 10 : 8;
   snprintf(m->info.codec, sizeof m->info.codec, "%s", hevc ? "hevc" : "h264");
   snprintf(m->info.formato, sizeof m->info.formato, "packets");
-  m->hdrDica = hdr;
+  m->hdrDica = hdr != 0;
+  m->doviRequired = hdr == 2;
   return m;
 }
 
@@ -815,8 +928,11 @@ int mini_motor_pacote(MiniMotor *m, const unsigned char *dados, int n, int threa
   td = agoraMs() - d0;
   if (m->quadro->width > 4096 || m->quadro->height > 2304) { erroDe(erro, nerro, "picture size not supported (above 4K)"); goto fim; }
   if (reduzir(m) < 0) { erroDe(erro, nerro, "pixel format not supported"); goto fim; }
+  q->resizeMs=(unsigned)(m->resizeNs/1000000); q->colourMs=(unsigned)(m->colourNs/1000000);
   av_frame_unref(m->quadro);
+  unsigned jpegStart=agoraMs();
   if (codificar(m, jpg, njpg) < 0) { erroDe(erro, nerro, "jpeg encode failed"); goto fim; }
+  q->jpegMs=agoraMs()-jpegStart;
   r = 0;
 fim:
   av_frame_unref(m->quadro);
@@ -831,6 +947,10 @@ fim:
 void mini_motor_fechar(MiniMotor *m) {
   if (!m) return;
   preTerminar(m);
+#ifdef __ANDROID__
+  if(m->gpuSamples) mini_dovi_gpu_close();
+#endif
+  free(m->gpuSamples);free(m->gpuRgba);
   avcodec_parameters_free(&m->parPac);
   avcodec_free_context(&m->cc);
   av_frame_free(&m->cinza);

@@ -1658,8 +1658,8 @@ object MiniaturaMotor {
             val perfil = dv / 16; val compat = dv % 16
             s.dvProfile = perfil
             // compat 1 = HDR10 base (8.1), 2 = SDR (8.2), 4 = HLG (8.4), 6 = profile 7's HDR10 base layer
-            val ok = ThumbnailDolbyVision.supported(dv)
-            Log.i(TAG, "direct: Dolby Vision profile $perfil (base-layer compat $compat) ${if (ok) "-> decoding the base layer" else "-> declined"}")
+            val ok = ThumbnailDolbyVision.supported(dv) || ThumbnailDolbyVision.requiresDolbyColour(dv)
+            Log.i(TAG, "direct: Dolby Vision profile $perfil (base-layer compat $compat) ${if (ok) "-> decoding compatible video" else "-> declined"}")
             if (!ok) { fechar(h); return 0L }
             if (compat == 1 || compat == 6) s.hdr = true
         }
@@ -1669,6 +1669,25 @@ object MiniaturaMotor {
 
     // ---- CPU ROUTE (src/miniatura_motor.c, Namer03's FFmpeg engine in packet mode) ----
     // JNI consumes these on the thumbnail thread immediately after quadroDireto, before another capture/close.
+    private val colourGpu=ThreadLocal<DolbyThumbnailGpu>()
+
+    @JvmStatic
+    fun converterDolbyGpu(w: Int,h: Int,signal: ByteBuffer,metadata: ByteBuffer,rgba: ByteBuffer): Int {
+        if(w !in 2..640 || h !in 2..360 || signal.capacity()!=w*h*12 || metadata.capacity()!=4096 || rgba.capacity()!=w*h*4)return -1
+        return try {
+            var gpu=colourGpu.get()
+            if(gpu==null) {
+                val am=NvPlayer.contexto()?.getSystemService(android.content.Context.ACTIVITY_SERVICE) as? android.app.ActivityManager ?: return -1
+                val memory=android.app.ActivityManager.MemoryInfo().also {am.getMemoryInfo(it)}
+                if(memory.availMem<(384L shl 20))return -1
+                gpu=DolbyThumbnailGpu();colourGpu.set(gpu)
+            }
+            if(gpu.convert(w,h,signal,metadata,rgba))1 else -1
+        } catch(e: Exception) {Log.w(TAG,"[dv5-gpu] CPU fallback: ${e.javaClass.simpleName}: ${e.message?.take(180)}");fecharDolbyGpu();-1}
+    }
+    @JvmStatic
+    fun fecharDolbyGpu() {try {colourGpu.get()?.close()}finally {colourGpu.remove()}}
+
     @JvmStatic
     fun pixelsDireto(h: Long): ByteBuffer? = sessoes[h]?.gpu?.pixelsProntos()
     @JvmStatic
@@ -1679,6 +1698,7 @@ object MiniaturaMotor {
     @JvmStatic
     fun codecCpu(h: Long): Int {
         val s = sessoes[h] ?: return 0
+        if (s.dvProfile == 5) return 3 // HEVC plus mandatory per-frame Dolby RPU colour conversion.
         if (s.fonte.nalTam <= 0) s.fonte.keyframeMs(0)
         if (s.fonte.nalTam <= 0) return 0
         return when (s.mime) { "video/hevc", "video/dolby-vision" -> 1; "video/avc" -> 2; else -> 0 }
@@ -1718,6 +1738,10 @@ object MiniaturaMotor {
 
     // The hardware decoder for this source rendering into the GPU step's Surface. Rate-limited like decoder().
     private fun decoderDireto(s: Sessao): MediaCodec? {
+        if (s.dvProfile == 5) {
+            Log.i(TAG, "[dv5] CPU RPU colour route: Shield surface output was not colour-correct")
+            return null
+        }
         s.dec?.let { return it }
         if (s.errosCodec >= 2) return null
         synchronized(this) {
@@ -1826,6 +1850,7 @@ object MiniaturaMotor {
         val rot = if (s.fmt.containsKey(MediaFormat.KEY_ROTATION)) s.fmt.getInteger(MediaFormat.KEY_ROTATION) else 0
         if (rot == 90 || rot == 270) { val t = w; w = h; h = t }
         s.visW = w; s.visH = h
+        if (s.dvProfile == 5) Log.i(TAG, "[dv5] output format: $of")
         if (of.containsKey(MediaFormat.KEY_COLOR_TRANSFER) && of.getInteger(MediaFormat.KEY_COLOR_TRANSFER) == MediaFormat.COLOR_TRANSFER_ST2084) s.hdr = true
     }
 

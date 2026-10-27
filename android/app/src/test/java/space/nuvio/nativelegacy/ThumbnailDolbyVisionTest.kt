@@ -27,6 +27,13 @@ class ThumbnailDolbyVisionTest {
         assertEquals(129, parse(movie(extended = true)))
         assertTrue(ThumbnailDolbyVision.supported(parse(movie())))
     }
+    @Test fun profileFiveRequiresDolbyColourConversion() {
+        assertTrue(ThumbnailDolbyVision.requiresDolbyColour(parse(movie(5, 0))))
+        assertFalse(ThumbnailDolbyVision.supported(parse(movie(5, 0))))
+        assertFalse(ThumbnailDolbyVision.requiresDolbyColour(parse(movie(8, 1))))
+        assertFalse(ThumbnailDolbyVision.requiresDolbyColour(-1))
+        assertFalse(ThumbnailDolbyVision.requiresDolbyColour(5 * 16 + 1))
+    }
     @Test fun recognizesDvcCAndPreservesProfileFiveRejection() {
         assertEquals(80, parse(movie(5, 0, type = "dvcC")))
         assertFalse(ThumbnailDolbyVision.supported(parse(movie(5, 0, type = "dvcC"))))

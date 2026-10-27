@@ -46,6 +46,7 @@ typedef struct {
 typedef struct {
   long ptsMs;           // time of the frame actually shown
   unsigned decodMs;     // decode only
+  unsigned resizeMs, colourMs, jpegMs; // packet path: resample, Dolby colour+YUV packing, JPEG
   unsigned totalMs;     // seek + read + decode + shrink + JPEG
   long bytesLidos;      // bytes read from the source for this frame
   long bytesPacote;     // keyframe packet size
@@ -89,7 +90,8 @@ void mini_motor_config(MiniMotor *m, const MiniConfig *c);
 void mini_motor_proximo(MiniMotor *m, long alvoMs, long tolMs);
 // PACKET MODE (Android): no container. The caller hands in each keyframe as an Annex B access unit WITH its
 // parameter sets (VPS/SPS/PPS or SPS/PPS) in front; `hdr` = 1 when the stream is PQ (used when the bitstream does
-// not say). Same decoder settings, shrink, tone map and JPEG as mini_motor_quadro.
+// not say); 2 requires Dolby RPU metadata and Profile 5 colour conversion.
+// Same decoder settings, shrink, tone map and JPEG as mini_motor_quadro.
 MiniMotor *mini_motor_abrir_pacotes(int hevc, int largura, int altura, int hdr, char *erro, size_t nerro);
 int mini_motor_pacote(MiniMotor *m, const unsigned char *dados, int n, int threads,
                       unsigned char **jpg, int *njpg, MiniQuadro *q, char *erro, size_t nerro);

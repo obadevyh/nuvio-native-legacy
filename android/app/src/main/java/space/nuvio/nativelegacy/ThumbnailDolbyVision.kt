@@ -2,6 +2,8 @@ package space.nuvio.nativelegacy
 
 /** Reads only MP4 box headers and Dolby configuration, never the movie's mdat payload. */
 internal object ThumbnailDolbyVision {
+    fun requiresDolbyColour(config: Int): Boolean = config == 5 * 16
+
     fun supported(config: Int): Boolean = config >= 0 &&
         config / 16 in intArrayOf(7, 8) && config % 16 in intArrayOf(1, 2, 4, 6)
 

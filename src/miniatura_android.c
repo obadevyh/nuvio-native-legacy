@@ -150,6 +150,7 @@ static int motivoSem;            // M_FALHOU because: 0 the video would not open
 
 // ---- JNI (MiniaturaMotor.kt) ----
 static jclass cls;
+static jmethodID jDolbyGpu,jDolbyGpuClose;
 static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo, jLote,
                  jDiag, jConfig, jPerdidos, jAbrirDireto, jQuadroDireto, jKeyframe, jDiagDireto, jHeap, jAudio, jCodecCpu, jPacoteCpu, jPrepDec,
                  jPixelsDireto, jPixelsDimensoes, jDecPronto, jPrepararFuturo, jPipelineStart, jPipelineSummary, jPipelineState, jPipelineStop;
@@ -169,6 +170,8 @@ static int jniPreparar(void) {
   jclass c = (jclass)(*env)->CallObjectMethod(env, loader, lcm, nome);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); c = NULL; }
   if (c) {
+    jDolbyGpu=(*env)->GetStaticMethodID(env,c,"converterDolbyGpu","(IILjava/nio/ByteBuffer;Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)I");
+    jDolbyGpuClose=(*env)->GetStaticMethodID(env,c,"fecharDolbyGpu","()V");
     jAbrir = (*env)->GetStaticMethodID(env, c, "abrir", "(Ljava/lang/String;Ljava/lang/String;Z)J");
     jInfo = (*env)->GetStaticMethodID(env, c, "info", "(J)[J");
     jQuadro = (*env)->GetStaticMethodID(env, c, "quadro", "(JJZZ)[B");
@@ -221,6 +224,25 @@ static int jniPreparar(void) {
 }
 
 // `manter`: keep the socket between requests (the copy). The playing file closes it after every request.
+// Synchronous: native buffers remain owned by this CPU worker throughout the GL call.
+int mini_dovi_gpu_convert(int w,int h,const float *samples,const float *metadata,unsigned char *rgba) {
+  if(!jniPreparar() || !jDolbyGpu)return -1;
+  JNIEnv *env=(JNIEnv *)SDL_AndroidGetJNIEnv();
+  jobject a=(*env)->NewDirectByteBuffer(env,(void *)samples,(jlong)w*h*12);
+  jobject b=(*env)->NewDirectByteBuffer(env,(void *)metadata,4096);
+  jobject c=(*env)->NewDirectByteBuffer(env,rgba,(jlong)w*h*4);
+  int result=-1;
+  if(a && b && c)result=(*env)->CallStaticIntMethod(env,cls,jDolbyGpu,w,h,a,b,c);
+  if((*env)->ExceptionCheck(env)) {(*env)->ExceptionClear(env);result=-1;}
+  if(a)(*env)->DeleteLocalRef(env,a);if(b)(*env)->DeleteLocalRef(env,b);if(c)(*env)->DeleteLocalRef(env,c);
+  return result;
+}
+void mini_dovi_gpu_close(void) {
+  if(!cls || !jDolbyGpuClose)return;
+  JNIEnv *env=(JNIEnv *)SDL_AndroidGetJNIEnv();
+  (*env)->CallStaticVoidMethod(env,cls,jDolbyGpuClose);
+  if((*env)->ExceptionCheck(env))(*env)->ExceptionClear(env);
+}
 static long long mAbrir(const char *url, const char *cab, int manter) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jstring u = (*env)->NewStringUTF(env, url), c = (*env)->NewStringUTF(env, cab ? cab : "");
@@ -1641,8 +1663,8 @@ static void *cpuTrabalho(void *u) {
     j->cpuFeitos++; cf->soma += q.totalMs; cf->decSoma += q.decodMs;
     j->cpuMs = cf->soma / j->cpuFeitos; j->cpuDecMs = cf->decSoma / j->cpuFeitos;
     if (j->cpuFeitos <= 3 || j->cpuFeitos % 50 == 0) {
-      printf("[miniatura] cpu route: %ld s in %u ms (decode %u ms, keyframe %ld KB), %d made\n", p / 1000, q.totalMs,
-             q.decodMs, q.bytesPacote / 1024, j->cpuFeitos);
+      printf("[miniatura] cpu route: %ld s in %u ms (decode %u ms, resize %u ms, colour+pack %u ms, JPEG %u ms, keyframe %ld KB), %d made\n", p / 1000, q.totalMs,
+             q.decodMs, q.resizeMs, q.colourMs, q.jpegMs, q.bytesPacote / 1024, j->cpuFeitos);
       fflush(stdout);
     }
     guardarTileDireto(j, p, jpg, nj, &cf->feitosAqui);
@@ -1657,6 +1679,7 @@ static void *cpuTrabalho(void *u) {
     // the frame's time as a rest only for a minute after real contention (dropped frames / audio underrun).
     usleep(cf->cuidado ? (useconds_t)q.totalMs * 500 : 30000);
   }
+  mini_dovi_gpu_close(); // release on the GL-owning CPU worker before it exits
   return NULL;
 }
 #endif
@@ -1927,7 +1950,7 @@ static int trabalharDireto(Job *j, long long *hA) {
       if (cpuCod > 0) {
         long long inf[6]; char e[96] = "";
         mInfo(*hA, inf);
-        cf.cpu = mini_motor_abrir_pacotes(cpuCod == 1, (int)inf[1], (int)inf[2], inf[3] != 0, e, sizeof e);
+        cf.cpu = mini_motor_abrir_pacotes(cpuCod != 2, (int)inf[1], (int)inf[2], cpuCod == 3 ? 2 : inf[3] != 0, e, sizeof e);
         if (cf.cpu) {
           MiniConfig config; mini_motor_config_padrao(&config);
           config.larguraSaida = j->larguraSaida;
@@ -2502,7 +2525,7 @@ static void pPedir(const SeekrFonte *f) {
   char cacheMode[64];
   snprintf(cacheMode, sizeof cacheMode, "thumb-w%d", j->larguraSaida);
   chaveArquivo(f, j->arq, sizeof j->arq, cacheMode);
-  snprintf(cacheMode, sizeof cacheMode, "direct-gpu-kf1-w%d", j->larguraSaida);
+  snprintf(cacheMode, sizeof cacheMode, "direct-gpu-kf1-dvcolour1-w%d", j->larguraSaida);
   chaveArquivo(f, j->arqDireto, sizeof j->arqDireto, cacheMode);
   snprintf(j->cabA, sizeof j->cabA, "%s", f->cabecalhos ? f->cabecalhos : "");
   const Stream *st = stream_item(stream_atual());
