@@ -18,12 +18,13 @@ prefix = r'''
 #include <unistd.h>
 typedef struct { int parar, cpuFeitos; long cpuMs, cpuDecMs; } Job;
 typedef struct { int unused; } MiniMotor;
-typedef struct { unsigned totalMs, decodMs; long bytesPacote; } MiniQuadro;
+typedef struct { unsigned totalMs, decodMs, resizeMs, colourMs, jpegMs; long bytesPacote; } MiniQuadro;
 #define PISO_KB (300L * 1024)
 #define CPU_AMOSTRAS 20
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
-static int reading, proceed, decodes;
+static int reading, proceed, decodes, gpuCloses;
+static void mini_dovi_gpu_close(void) { gpuCloses++; }
 static int parou(Job *j) { return j->parar; }
 static long memDisponivelKB(void) { return 1024L * 1024; }
 static size_t mini_motor_memoria(MiniMotor *m, int threads) { (void)m; (void)threads; return 1; }
@@ -50,7 +51,7 @@ int main(void) {
   // Both a normal pause and a handover/stop must revoke a decode whose packet
   // read was already in progress; the queued picture must remain available.
   for (int stop = 0; stop < 2; stop++) {
-    reading = proceed = decodes = 0;
+    reading = proceed = decodes = gpuCloses = 0;
     Job j = {0}; MiniMotor motor = {0};
     long pending[2] = {42000}; int count = 1;
     pthread_mutex_t queue = PTHREAD_MUTEX_INITIALIZER;
@@ -73,6 +74,7 @@ int main(void) {
     }
     pthread_join(thread, NULL);
     assert(decodes == 0 && count == 1 && pending[0] == 42000);
+    assert(gpuCloses == 1); // GL cleanup occurs on the exiting worker, even after cancellation.
     pthread_mutex_destroy(&queue);
   }
   puts("PASS: pause and handover revoke a blocked CPU packet read without losing its keyframe");
