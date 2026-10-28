@@ -349,3 +349,5 @@
   0, 0, 0, 0, 0, 0, 0, 0, 0, /* OpenSeek shared library: info + offset/undo/reject actions */
 
   0, // miniaturaResolutionLocal: Auto
+
+  1, /* Android stereo downmix: Off */

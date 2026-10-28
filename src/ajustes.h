@@ -827,4 +827,5 @@ int ajustes_shot_valor(const char *chave, int v);   // capturas: opcao pela chav
 #endif
 
 int ajustes_miniatura_largura(void);
+int ajustes_android_estereo(void); /* Android stereo PCM downmix */
 #endif

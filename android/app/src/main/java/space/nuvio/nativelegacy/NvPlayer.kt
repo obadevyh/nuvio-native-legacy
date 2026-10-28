@@ -169,6 +169,7 @@ object NvPlayer {
     @JvmStatic external fun nativeIniciar()
     @JvmStatic external fun nativeLimitedStatus(): Int
     @JvmStatic external fun nativeTunneling(): Boolean
+    @JvmStatic external fun nativeStereoDownmix(): Boolean
     @JvmStatic external fun nativeEvento(tipo: Int, a: Int, b: Int)
     // flags (#287): 1 = forcada (SELECTION_FLAG_FORCED), 2 = SDH
     // (ROLE_FLAG_DESCRIBES_MUSIC_AND_SOUND); nome = Format.label.
@@ -656,6 +657,7 @@ object NvPlayer {
     }
 
     private class RecursosPlayer(val carga: CargaPlayer, val alvoMs: Int, val idiomaAudio: String = "") {
+        val stereoDownmix = nativeStereoDownmix()
         lateinit var p: ExoPlayer
         lateinit var origem: OrigemPlayer
         lateinit var rede: (Long) -> DataSource.Factory
@@ -981,7 +983,7 @@ object NvPlayer {
             val r = s?.recursos
             if (preparoPedido == pedidosPreparo.get() && s != null && r != null && s.token == token &&
                 s.url == url && s.cab == cabecalhos && s.inicioMs == inicio && s.fracao == f &&
-                s.idiomaAudio == idiomaAudio &&
+                s.idiomaAudio == idiomaAudio && r.stereoDownmix == nativeStereoDownmix() &&
                 s.buffer == bufferPreset && s.cacheMb == cacheMbPedido && (!r.construido() || r.p.playerError == null) &&
                 (f == 0 || s.inicioAceito || s.fracaoPendente > 0)) {
                 preparo = null
@@ -1379,7 +1381,7 @@ object NvPlayer {
                     // Sonic needs integer PCM; float output bypasses audio processors.
                     AudioSyncSink(DefaultAudioSink.Builder(context).setEnableFloatOutput(false)
                         .setEnableAudioTrackPlaybackParams(false)
-                        .setAudioProcessors(arrayOf(r.proc)).build(), r.tap, { r.velocidadePcm })
+                        .setAudioProcessors(if(r.stereoDownmix) arrayOf(stereoDownmixProcessor(),r.proc) else arrayOf(r.proc)).build(), r.tap, { r.velocidadePcm || r.stereoDownmix })
             }.setExtensionRendererMode(androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
                 .setEnableDecoderFallback(true)
             r.fabricaMidia = DefaultMediaSourceFactory(act)
@@ -1397,6 +1399,7 @@ object NvPlayer {
                     report = { Log.i(TAG, it) },
                 ))
             if (construir) construirPlayer(act, r)
+            Log.i(TAG, "[audio] stereoDownmix=${r.stereoDownmix} forcePcm=${r.stereoDownmix} tunnelingAllowed=${!r.stereoDownmix}")
             Log.i(TAG, "[player] buffer preset=$preset min=${minMs / 1000}s max=${maxMs / 1000}s teto=${bytes shr 20}MB preparo=$preparando")
             return r
         } catch (e: Exception) {
@@ -1413,7 +1416,7 @@ object NvPlayer {
         val seletor = if (r.idiomaAudio.isNotEmpty()) SeletorAudioPreparo(act, r.idiomaAudio)
                       else DefaultTrackSelector(act)
         seletor.parameters = seletor.parameters.buildUpon()
-            .setTunnelingEnabled(nativeTunneling()).build()
+            .setTunnelingEnabled(nativeTunneling() && !r.stereoDownmix).build()
         builder.setTrackSelector(seletor)
         r.fioPreparo?.let { builder.setPlaybackLooper(it.looper) }
         r.bandaPreparo?.let { builder.setBandwidthMeter(it) }
