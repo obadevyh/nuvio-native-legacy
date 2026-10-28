@@ -73,15 +73,7 @@ android {
     // Assinatura de release so existe com keystore no ambiente; sem ela o
     // assembleRelease nem e chamado (tools/android.sh).
     val ks = System.getenv("NUVIO_KEYSTORE")
-    // Build "sharing" (OpenSeek 2.0 client para distribuir a poucas pessoas): chave PROPRIA, nunca a de producao.
-    val sks = System.getenv("NUVIO_SHARING_KEYSTORE")
     signingConfigs {
-        if (sks != null) create("sharing") {
-            storeFile = file(sks)
-            storePassword = System.getenv("NUVIO_SHARING_PASS")
-            keyAlias = "nuvio-sharing"
-            keyPassword = System.getenv("NUVIO_SHARING_PASS")
-        }
         if (ks != null) create("release") {
             storeFile = file(ks)
             storePassword = System.getenv("NUVIO_KEYSTORE_PASS")
@@ -99,14 +91,7 @@ android {
             isMinifyEnabled = false
             if (ks != null) signingConfig = signingConfigs.getByName("release")
         }
-        // Nao depurável, id proprio (".sharing"): convive com a producao e com os builds strictdebug sem substituir nenhum.
-        create("sharing") {
-            initWith(getByName("release"))
-            applicationIdSuffix = ".sharing"
-            versionNameSuffix = "-sharing"
-            matchingFallbacks += "release"
-            signingConfig = signingConfigs.findByName("sharing")
-        }
+
     }
 
     // O nucleo abre libcurl.so/libjpeg.so por dlopen: precisam estar em

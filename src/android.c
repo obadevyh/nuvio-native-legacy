@@ -317,8 +317,7 @@ int android_instalar_apk(const char *caminho) {
   if (js) (*env)->DeleteLocalRef(env, js);
   if (cls) (*env)->DeleteLocalRef(env, cls);
   (*env)->DeleteLocalRef(env, act);
-  printf("[atualizacao] android: instalador %s\n", r == 1 ? "aberto" : r == 2 ? "pede permissao" : r == 3 ? "RECUSADO (pacote/assinatura)" :
-         r == 4 ? "RECUSADO (nao e mais nova)" : r == 5 ? "RECUSADO (arquivo ilegivel)" : "falhou");
+  printf("[atualizacao] android: instalador %s\n", r == 1 ? "aberto" : r == 2 ? "pede permissao" : "falhou");
   fflush(stdout);
   return r;
 }

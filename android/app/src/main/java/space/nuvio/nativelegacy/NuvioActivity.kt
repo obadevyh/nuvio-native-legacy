@@ -510,9 +510,6 @@ class NuvioActivity : SDLActivity() {
         return try {
             val arq = File(caminho)
             if (!arq.isFile) return 0
-            // 3 = outro pacote/outra chave, 4 = nao e mais nova, 5 = ilegivel: o arquivo e recusado AQUI, antes de qualquer tela do sistema.
-            val v = ApkVerifica.verificar(packageManager, packageName, caminho)
-            if (v != ApkVerifica.OK) return v
             if (Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
                 startActivity(
                     Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))
