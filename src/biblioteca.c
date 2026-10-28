@@ -308,6 +308,7 @@ static LstLista aberta;          // lista aberta (EST_ITENS)
 static int  temAberta;
 static char abertaMidia[8] = "MOVIE";
 static int  acaoSel = 0;
+
 static char recado[160];         // resposta de uma acao ("Fixada", o porque do nao)
 static float recadoAte;
 
@@ -321,6 +322,12 @@ static int totalModo = 0;
 // do seletor segmentado. Refeito em reconstruir(), nunca por quadro.
 static int contaModo[2];
 static Foco foco;
+
+void biblioteca_teste_foco(int *fileira, int *coluna, int *acao) {
+  *fileira = foco.fileira;
+  *coluna = foco.coluna;
+  *acao = acaoSel;
+}
 static float animModo[BIB_N_MODOS];
 static float animPick[3];
 static float animFoco[BIB_MAX_LINHAS][BIB_COLUNAS_MAX];
@@ -958,6 +965,7 @@ static void executarAcao(int a) {
            strcasecmp(abertaMidia, "TV") ? "TV" : "MOVIE");
   lst_abrir(&aberta, abertaMidia);
   remapear(0);
+  foco.coluna = acaoSel;
 }
 
 // ---------------------------------------------------------------- eventos
@@ -1073,12 +1081,11 @@ static void menuNaCelula(int i) {
 
 static void eventoAberta(SDL_Keycode k) {
   if (foco.fileira == 0) {
-    if (k == SDLK_UP) { pediuRelogio = 1; return; }
+    if (k == SDLK_UP) { if (ajustes_menu_topo()) sair = 1; else pediuRelogio = 1; return; }
     if (k == SDLK_RIGHT && acaoSel < 2) { acaoSel++; foco.coluna = acaoSel; return; }
     if (k == SDLK_LEFT  && acaoSel > 0) { acaoSel--; foco.coluna = acaoSel; return; }
     if (k == SDLK_LEFT) { sair = 1; return; }   // comeco da fileira: o app abre a barra
     if (k == SDLK_DOWN) { if (nCelulas) { foco.fileira = 1; foco.coluna = 0; } return; }
-    if (k == SDLK_UP && ajustes_menu_topo()) { sair = 1; return; }
     if (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_SPACE) executarAcao(acaoSel);
     return;
   }
@@ -1158,12 +1165,11 @@ static void biblioteca_evento_(const SDL_Event *e) {
   // a partir de "Salvos" era preciso atravessar "Coleção" e "Listas", trocando
   // de aba (e pedindo a rede, nas listas) a cada passo.
   if (foco.fileira == BIB_FIL_MODO) {
-    if (k == SDLK_UP) { pediuRelogio = 1; return; }
+    if (k == SDLK_UP) { if (ajustes_menu_topo()) sair = 1; else pediuRelogio = 1; return; }
     if (k == SDLK_LEFT  && foco.coluna > 0) { foco.coluna--; return; }
     if (k == SDLK_LEFT) { sair = 1; return; }   // 1a aba: o app abre a barra
     if (k == SDLK_RIGHT && foco.coluna < BIB_N_MODOS - 1) { foco.coluna++; return; }
     if (k == SDLK_RIGHT) { pickSel = 0; foco.fileira = BIB_FIL_PICK; foco.coluna = 0; return; }
-    if (k == SDLK_UP && ajustes_menu_topo()) { sair = 1; return; }
     if (k == SDLK_DOWN) { descerDaFaixa(); return; }
     if (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_SPACE) {
       int novo = foco.coluna;
@@ -1182,11 +1188,10 @@ static void biblioteca_evento_(const SDL_Event *e) {
   // menu suspenso; num D-pad, ciclar no proprio seletor poupa a viagem de ida
   // e volta ate a lista.
   if (foco.fileira == BIB_FIL_PICK) {
-    if (k == SDLK_UP) { pediuRelogio = 1; return; }
+    if (k == SDLK_UP) { if (ajustes_menu_topo()) sair = 1; else pediuRelogio = 1; return; }
     if (k == SDLK_RIGHT && pickSel < 2) { pickSel++; foco.coluna = pickSel; return; }
     if (k == SDLK_LEFT  && pickSel > 0) { pickSel--; foco.coluna = pickSel; return; }
     if (k == SDLK_LEFT)  { foco.fileira = BIB_FIL_MODO; foco.coluna = BIB_N_MODOS - 1; return; }
-    if (k == SDLK_UP && ajustes_menu_topo()) { sair = 1; return; }
     if (k == SDLK_DOWN) { descerDaFaixa(); return; }
     if (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_SPACE) {
       if (modo == MODO_LISTAS) {
@@ -1414,6 +1419,12 @@ static int pilula(GfxRect r, float raio, float f, int escolhida) {
 // a tinta principal do texto (clara nos dois estados).
 static int superficieLinha(GfxRect r, float raio, float f, float a) {
   float v = anim_clamp(f, 0.0f, 1.0f);
+  if (ajustes_foco_acento()) {
+    if (ajustes_vidro()) gfx_cor(r, raio, 1, 1, 1, .05f * a);
+    else gfx_cor(r, raio, .10f, .11f, .13f, a);
+    gfx_foco_placa(r, raio, v, a);
+    return v > .5f ? bibTinta() : 235;
+  }
   if (ajustes_vidro()) gfx_cor(r, raio, 1, 1, 1, (.05f + .07f * v) * a);
   else {
     gfx_cor(r, raio, 0.10f, 0.11f, 0.13f, a);

@@ -1,4 +1,5 @@
 #include "streams.h"
+#include "mediaurl.h"
 #include "badges.h"
 #include "js.h"
 #include <ctype.h>
@@ -44,6 +45,23 @@ static const char *propriedadeRaiz(const char *p, const char *fim, const char *n
 }
 static const char *valorRaiz(const char *p, const char *fim, const char *nome) {
   return propriedadeRaiz(p, fim, nome, NULL);
+}
+
+// strstr LIMITADO a [ini,fim). O strstr comum varre ate o NUL do documento e a
+// guarda `q < fim` so descarta o achado DEPOIS da varredura: cada chave ausente
+// num stream (sources, proxyHeaders...) era uma leitura do resto inteiro da
+// resposta — quadratico no numero de fontes e o motivo da lista travar em TVs
+// fracas com respostas de milhares de streams.
+static const char *buscaEm(const char *ini, const char *fim, const char *termo) {
+  size_t n = strlen(termo);
+  if (!ini || !fim || fim < ini) return NULL;
+  while ((size_t)(fim - ini) >= n) {
+    const char *p = memchr(ini, termo[0], (size_t)(fim - ini) - n + 1);
+    if (!p) return NULL;
+    if (!memcmp(p, termo, n)) return p;
+    ini = p + 1;
+  }
+  return NULL;
 }
 
 static const char *objetoRaiz(const char *p, const char *fim, const char *nome) {
@@ -884,12 +902,12 @@ static void lerProxyHeaders(const char *bh, const char *fim, char *dst, unsigned
   const char *ph, *rq, *q;
   unsigned u = 0;
   dst[0] = 0;
-  ph = strstr(bh, "\"proxyHeaders\"");
-  if (!ph || ph >= fim) return;
-  rq = strstr(ph, "\"request\"");
-  if (!rq || rq >= fim) return;
-  q = strchr(rq, '{');
-  if (!q || q >= fim) return;
+  ph = buscaEm(bh, fim, "\"proxyHeaders\"");
+  if (!ph) return;
+  rq = buscaEm(ph, fim, "\"request\"");
+  if (!rq) return;
+  q = memchr(rq, '{', (size_t)(fim - rq));
+  if (!q) return;
   q++;
   // Varre pares "nome":"valor" ate a chave que fecha o objeto. Valor de
   // cabecalho e string, entao um '{' aqui e coisa que nao se esperava: encerra
@@ -977,10 +995,10 @@ static int cacheDeclarado(const char *p, const char *fim) {
 // A entrada que nao cabe inteira fica de fora (nunca cortada no meio: um
 // tracker pela metade e endereco torto). \/ vira / (JSON escapa a barra).
 static void lerFontesP2P(const char *ini, const char *fim, char *dst, unsigned tam) {
-  const char *q = strstr(ini, "\"sources\"");
+  const char *q = buscaEm(ini, fim, "\"sources\"");
   unsigned u = 0;
   dst[0] = 0;
-  if (!q || q >= fim) return;
+  if (!q) return;
   q += 9;
   while (q < fim && (*q == ' ' || *q == ':' || *q == '\n' || *q == '\t')) q++;
   if (q >= fim || *q != '[') return;
@@ -1044,6 +1062,15 @@ int stream_extrair(const char *json, const char *provedor, Stream **saida) {
     if (!fim || fim <= p) break;
     // externalUrl abre fora do player; sem midia/hash a fonte fica oculta.
     js_texto_raiz_em(p, fim, "url", s.url, sizeof s.url);
+    if (strlen(s.url) == sizeof s.url - 1) {
+      size_t tam = (size_t)(fim - p) + 1;
+      char *url = malloc(tam);
+      if (!url) { p = js_prox(fim); continue; }
+      js_texto_raiz_em(p, fim, "url", url, tam);
+      int ok = !strncmp(url, "http", 4) && nv_media_url_guardar(url, s.url, sizeof s.url);
+      free(url);
+      if (!ok) { p = js_prox(fim); continue; }
+    }
     { const char *bh = valorRaiz(p, fim, "behaviorHints");
       const char *hint = bh ? valorRaiz(bh, fim, "notWebReady") : NULL;
       s.notWebReady = hint && fim - hint >= 4 && !memcmp(hint, "true", 4) &&
@@ -1053,9 +1080,9 @@ int stream_extrair(const char *json, const char *provedor, Stream **saida) {
     // Torrent puro: sem url, com infoHash (no topo ou dentro de clientResolve,
     // como o AIOStreams manda). A url nasce depois, no debrid.
     if (!s.url[0] || strncmp(s.url, "http", 4)) {
-      const char *cr = strstr(p, "\"clientResolve\"");
+      const char *cr = objetoRaiz(p, fim, "clientResolve");
       s.url[0] = 0;
-      if (!js_texto(p, fim, "infoHash", s.infoHash, sizeof s.infoHash) && cr && cr < fim)
+      if (!js_texto(p, fim, "infoHash", s.infoHash, sizeof s.infoHash) && cr)
         js_texto(cr, fim, "infoHash", s.infoHash, sizeof s.infoHash);
       double indice = js_num(p, fim, "fileIdx", -1);
       if (isfinite(indice) && indice >= 0 && indice <= INT_MAX)
@@ -1064,13 +1091,12 @@ int stream_extrair(const char *json, const char *provedor, Stream **saida) {
     } else {
       // Fonte com link: o hash, quando o addon manda, so serve para achar o
       // torrent na conta TorBox (partes.h). Nao vira infoHash.
-      const char *cr = strstr(p, "\"clientResolve\"");
-      if (!js_texto(p, fim, "infoHash", s.hashTorrent, sizeof s.hashTorrent) && cr && cr < fim)
+      const char *cr = objetoRaiz(p, fim, "clientResolve");
+      if (!js_texto(p, fim, "infoHash", s.hashTorrent, sizeof s.hashTorrent) && cr)
         js_texto(cr, fim, "infoHash", s.hashTorrent, sizeof s.hashTorrent);
     }
-    // Nao tocar URL cortada; sem url e sem hash nao ha o que tocar.
-    if ((s.infoHash[0] || !strncmp(s.url, "http", 4)) &&
-        strlen(s.url) < sizeof s.url - 1) {
+    // Without a complete URL/hash there is nothing to play.
+    if (s.infoHash[0] || !strncmp(s.url, "http", 4)) {
       js_texto_raiz_em(p, fim, "name", s.rotulo, sizeof s.rotulo);
       // So o name da PROPRIA fonte, inteiro, conta para o FHD (#402): o
       // rotulo de 192 bytes pode cortar "...FHDx" em "...FHD", e o provedor
@@ -1102,8 +1128,8 @@ int stream_extrair(const char *json, const char *provedor, Stream **saida) {
       //    js.h: procurar solto pega a primeira ocorrencia, que nem sempre e a
       //    que se quer. Nas respostas que deu para inspecionar aqui o js_texto
       //    solto daria o mesmo resultado; ancorar e seguro de graca.
-      { const char *bh = strstr(p, "\"behaviorHints\"");
-        if (bh && bh < fim) {
+      { const char *bh = objetoRaiz(p, fim, "behaviorHints");
+        if (bh) {
           js_texto_raiz_em(bh, fim, "bingeGroup", s.bingeGroup, sizeof s.bingeGroup);
           js_texto_raiz_em(bh, fim, "videoHash", s.videoHash, sizeof s.videoHash);
           lerProxyHeaders(bh, fim, s.cabecalhos, sizeof s.cabecalhos);
@@ -1138,7 +1164,7 @@ int stream_extrair(const char *json, const char *provedor, Stream **saida) {
         s.altura = 1080;
         s.badges |= badges_bit("r-1080");
       }
-      s.mp4 = token(texto, "mp4") || contem(s.url, ".mp4");
+      s.mp4 = token(texto, "mp4") || contem(nv_media_url(s.url), ".mp4");
       // "av1" tambem casa "av1.0.0" (nivel/perfil, comum em nome de release);
       // token() basta porque nao ha AV1 escrito colado a outra palavra nos
       // nomes que os addons mandam (ao contrario de "dv", que precisa do

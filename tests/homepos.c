@@ -13,6 +13,20 @@
 #include <assert.h>
 #include "../src/home.c"
 void desc_sinopse_hero(const int *idx, int n) { (void)idx; (void)n; }
+int contalib_tem_conta(void) { return 0; }
+int trakt_ativo(void) { return 0; }
+int simkl_ativo(void) { return 0; }
+unsigned addons_versao(void) { return 0; }
+float gfx_escala(void) { return 1.0f; }
+float gfx_escala_txt(void) { return 1.0f; }
+float gfx_escala_tela_txt(void) { return 1.0f; }
+float gfx_poster_k(void) { return 1.0f; }
+const char *i18n(const char *s) { return s; }
+int prox_seguinte(const CatItem *ci, const CatEp *eps, int n, int limiarPct,
+                  long long agoraMs, ProxSugestao *saida) {
+  (void)ci; (void)eps; (void)n; (void)limiarPct; (void)agoraMs; (void)saida;
+  return 0;
+}
 
 // #204: o "Ocultar filmes assistidos" da descoberta, parado neste teste.
 void desc_ocultar_vistos_atualizar(void) {}
@@ -237,6 +251,74 @@ int main(void) {
     sincronizarFileiras();
     assert(foco.fileira == idx("pos_3") && foco.coluna == 0);
     free(rede);
+  }
+
+  // #677: repeated snapshots must follow navigation before a rebuild.
+  reabrir();
+  for (int i = 0; i < 6; i++) ontem[i].n = 8;
+  montar(itens, ontem, 6);
+  // Rebuild at column 5, then Right must select column 6's next item.
+  alvo = idx("pos_3");
+  foco.fileira = alvo; foco.coluna = 5;
+  posCapturar();
+  filsAplicadas = -1;
+  sincronizarFileiras();
+  assert(focus_mover(&foco, 1, 0));
+  assert(foco.coluna == 6);
+  assert(!strcmp(cat_item(fileiraItemIndice(&fileiras[alvo], 6))->imdb,
+                 "tt-item-18"));
+
+  // Reordering moves the selected ID from 5 to 4. Right returns to 5,
+  // which must not resurrect the old snapshot's ID on the next rebuild.
+  foco.coluna = 5;
+  posCapturar();
+  { CatItem t = itens[16]; itens[16] = itens[17]; itens[17] = t; }
+  cat_definir_tudo(itens, 48, ontem, 6);
+  sincronizarFileiras();
+  assert(foco.coluna == 4);
+  assert(focus_mover(&foco, 1, 0));
+  assert(foco.coluna == 5);
+  posCapturar();
+  filsAplicadas = -1;
+  sincronizarFileiras();
+  assert(focus_mover(&foco, 1, 0));
+  assert(foco.coluna == 6);
+  assert(!strcmp(cat_item(fileiraItemIndice(&fileiras[alvo], foco.coluna))->imdb,
+                 "tt-item-18"));
+  { CatItem t = itens[16]; itens[16] = itens[17]; itens[17] = t; }
+  cat_definir_tudo(itens, 48, ontem, 6);
+  sincronizarFileiras();
+
+  for (int ranked = 0; ranked < 2; ranked++) {
+    alvo = idx("pos_3");
+    if (ranked) fil_definir_tipo("pos_3", FIL_TIPO_RANKING);
+    foco.fileira = alvo; foco.coluna = 1;
+    posCapturar();
+    foco.coluna = 5;
+    posCapturar();
+    posCapturar();
+    filsAplicadas = -1;
+    sincronizarFileiras();
+    alvo = idx("pos_3");
+    assert(foco.fileira == alvo && foco.coluna == 5);
+    assert(!strcmp(cat_item(fileiraItemIndice(&fileiras[alvo], foco.coluna))->imdb,
+                   "tt-item-17"));
+    // A new publication moves the selected ID to another column.
+    posCapturar();
+    { CatItem t = itens[17]; itens[17] = itens[18]; itens[18] = t; }
+    cat_definir_tudo(itens, 48, ontem, 6);
+    sincronizarFileiras();
+    assert(foco.fileira == alvo && foco.coluna == 6);
+    { CatItem t = itens[17]; itens[17] = itens[18]; itens[18] = t; }
+    cat_definir_tudo(itens, 48, ontem, 6);
+    sincronizarFileiras();
+    // The See More tile has no catalogue item identity.
+    foco.coluna = fileiras[alvo].n;
+    posCapturar();
+    assert(!posAchar(posViva, nPosViva, "pos_3")->itemId[0]);
+    filsAplicadas = -1;
+    sincronizarFileiras();
+    assert(foco.coluna == fileiras[alvo].n);
   }
 
   free(itens);

@@ -14,6 +14,7 @@
 #include <SDL2/SDL.h>
 #include <stdint.h>
 #include "streamfit.h"
+#include "mediaurl.h"
 #include "fontefalha.h"
 #include "fontefiltro.h"
 
@@ -33,7 +34,8 @@ typedef struct Stream {
   // silencio. O servidor entao respondia com um MP4 de aviso de 120s que TOCA
   // NORMALMENTE — o app parecia funcionar e mostrava o cartao de erro. Nao ha
   // erro para detectar nesse caminho, so o tamanho do campo.
-  char url[4096];
+  // Complete signed URL; storage follows the lifetime of each list/value copy.
+  char url[NV_MEDIA_URL_MAX];
   int  altura;          // 2160, 1080, 720...
   int  dolbyVision;
   int  dolbyAtmos;
@@ -123,6 +125,7 @@ typedef struct Stream {
   // naovideo.h): linha de aviso do addon. A folha a mostra apagada ("Nao e
   // video") e o automatico a pula. Marcada na verificacao, nunca no parser.
   int  naoVideo;
+  int  tsContinuo;     // Confirmed by the bounded live-source probe.
   int  notWebReady;     // behaviorHints: sem URL direta, so oferecer com P2P ativo
   // PACOTE DE SELOS ATIVO (selospacote.h): os filtros que casaram com esta
   // fonte, calculados UMA vez (quando a lista chega, ou quando o pacote muda;
@@ -318,6 +321,8 @@ void stream_vod_falhou(int indice);
 void stream_vod_tocou(int indice);
 long stream_vod_falhou_ha(int indice);
 int  stream_automatico_excluir(int indice);
+// A warning clip ends this provider's attempts for the current list.
+int  stream_automatico_excluir_aviso(int indice);
 // Exclui tambem as IRMAS da candidata (mesmo addon e mesmo rotulo), mas so
 // quando sobra outra candidata: quando o player nao conectou numa, as outras
 // costumam falhar igual.

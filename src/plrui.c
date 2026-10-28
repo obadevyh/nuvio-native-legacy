@@ -48,6 +48,7 @@ void plrui_cartao(GfxRect r, float raioPx, float a) {
 void plrui_linha_foco(GfxRect r, float raioPx, float a) {
   float raio = raioDe(r, raioPx);
   if (a <= 0.002f) return;
+  if (gfx_foco_placa(r, raio, 1.0f, a)) return;
   if (ajustes_vidro()) { gfx_cor(r, raio, 1, 1, 1, 0.12f * a); return; }
   gfx_rect((GfxRect){ r.x - 14.0f, r.y - 2.0f, r.w + 28.0f, r.h + 30.0f }, 0, GFX_SOMBRA,
            1.0f, 0, 0, 0.5f, 0, 0, 0, 0.40f * a);
@@ -174,7 +175,7 @@ static float dicas(const char *const *teclas, const char *const *rotulos, int n,
       TxtLinha l = txt_linha(TXT_ILHA_APOIO, rotulos[i], 128, 128, 126, 255);
       float kw = (float)k.w + 18.0f;
       if (kw < 34.0f) kw = 34.0f;
-      if (pass == 1) {
+      if (pass == 1 && x >= 0.0f) {
         GfxRect kr = { xx, yc - KBD_H * 0.5f, kw, KBD_H };
         if (ajustes_vidro()) gfx_cor(kr, 0.5f, 1, 1, 1, 0.09f * a);
         else if (video) gfx_cor(kr, 0.5f, 0.082f, 0.086f, 0.102f,

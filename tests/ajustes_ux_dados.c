@@ -24,7 +24,7 @@ static void prazoDosAddonsIntegrado(void) {
   assert(valor[AJ_FONTE_PRAZO] == 2 && valorPadrao[AJ_FONTE_PRAZO] == 2);
   assert(ajustes_fonte_prazo_ms() == 5000);
   assert(!dePerfil(AJ_FONTE_PRAZO));
-  assert(!strcmp(uxEscopo(AJ_FONTE_PRAZO), "Só nesta TV"));
+  assert(!strcmp(uxEscopo(AJ_FONTE_PRAZO), "Todos os perfis desta TV"));
   assert(uxTemPadrao(AJ_FONTE_PRAZO) && !uxDiferente(AJ_FONTE_PRAZO));
   assert(OPCOES[AJ_FONTE_PRAZO].n == 7);   /* #202: Instantaneo, 3, 5, 8, 15, 30 s, Todos */
   assert(!strcmp(OPCOES[AJ_FONTE_PRAZO].valores[2], "5 s"));
@@ -73,8 +73,8 @@ static void escoposPorValor(void) {
   assert(dePerfil(AJ_TEMA));
   for (v = 0; v < AJ_N_TEMAS_OPC; v++)
     assert(!strcmp(uxEscopoValor(AJ_TEMA, v),
-      v >= AJ_TEMA_DINAMICA ? "Só nesta TV" : "Conta/perfil"));
-  assert(!strcmp(uxEscopoValor(AJ_TMDB_IDIOMA, 0), "Só nesta TV"));
+      v >= AJ_TEMA_DINAMICA ? "Só este perfil, nesta TV" : "Conta/perfil"));
+  assert(!strcmp(uxEscopoValor(AJ_TMDB_IDIOMA, 0), "Só este perfil, nesta TV"));
   assert(!strcmp(uxEscopoValor(AJ_TMDB_IDIOMA, 1), "Conta/perfil"));
   /* "Da conta" muda a origem efetiva, nao retira a escolha do perfil. */
   assert(dePerfil(AJ_LEG_LINGUA) && dePerfil(AJ_AUD_LINGUA));
@@ -90,9 +90,9 @@ static void escoposPorValor(void) {
   assert(legendaEspera == legendaAntes);
   assert(!strcmp(audioAntes, ling_audio()) && !strcmp(legAntes, ling_legenda()));
   valor[AJ_TEMA] = AJ_TEMA_DINAMICA;
-  assert(!strcmp(uxEscopo(AJ_TEMA), "Só nesta TV"));
+  assert(!strcmp(uxEscopo(AJ_TEMA), "Só este perfil, nesta TV"));
   // O padrao da 2.0 e a Imersiva, que e desta TV (a conta nao a conhece).
-  assert(!strcmp(uxEscopoValor(AJ_TEMA, uxValorPadrao(AJ_TEMA)), "Só nesta TV"));
+  assert(!strcmp(uxEscopoValor(AJ_TEMA, uxValorPadrao(AJ_TEMA)), "Só este perfil, nesta TV"));
   assert(!strcmp(uxEscopoValor(AJ_TEMA, 0), "Conta/perfil"));
   assert(valor[AJ_TEMA] == AJ_TEMA_DINAMICA);
   valor[AJ_TEMA] = AJ_TEMA_DINAMICA - 1;
@@ -131,9 +131,9 @@ static void padroesEValores(void) {
   assert(strstr(texto, "4K"));
   SEGURO = 0;
   valor[AJ_RESOLUCAO] = valorPadrao[AJ_RESOLUCAO];
-  assert(!strcmp(uxEscopo(AJ_IDIOMA), "Só nesta TV"));
-  assert(!strcmp(uxEscopo(AJ_RESOLUCAO), "Só nesta TV"));
-  assert(!strcmp(uxEscopo(AJ_VIDRO), "Só nesta TV"));
+  assert(!strcmp(uxEscopo(AJ_IDIOMA), "Todos os perfis desta TV"));
+  assert(!strcmp(uxEscopo(AJ_RESOLUCAO), "Todos os perfis desta TV"));
+  assert(!strcmp(uxEscopo(AJ_VIDRO), "Só este perfil, nesta TV"));
   assert(!strcmp(uxEscopo(AJ_AUD_LINGUA), "Conta/perfil"));
   assert(!strcmp(uxEscopo(AJ_FOCO_TRAILER), "Conta/perfil"));
   assert(!strstr(uxEscopo(AJ_FOCO_TRAILER), "sincronizado"));
@@ -303,7 +303,7 @@ static void cacheSeek(void) {
   assert(!strcmp(OPCOES[AJ_CACHE_SEEK].valores[0], "Desligado"));
   assert(!strcmp(OPCOES[AJ_CACHE_SEEK].valores[3], "1 GB"));
   assert(!dePerfil(AJ_CACHE_SEEK) && somenteDesteAparelho(AJ_CACHE_SEEK));
-  assert(!strcmp(uxEscopo(AJ_CACHE_SEEK), "Só nesta TV"));
+  assert(!strcmp(uxEscopo(AJ_CACHE_SEEK), "Todos os perfis desta TV"));
   assert(familiaPreviaOpcao(AJ_CACHE_SEEK) == AJPV_REPRO);
   for (i = 0; i < AJ_N_TELA; i++) {
     if (TELA[i].tipo == IT_SEC) categoria = TELA[i].titulo;
@@ -539,7 +539,7 @@ int main(void) {
   // N3: "Receber enquetes" is the LAST option: local, On by default, in "Notificações".
   assert(AJ_ENQUETES == AJ_ABERTURA + 1 && AJ_ENQUETES == AJ_FONTE_ESCOPO - 14);
   assert(!strcmp(CHAVE[AJ_ENQUETES], "enquetesLocal") && OPCOES[AJ_ENQUETES].n == 2 && valorPadrao[AJ_ENQUETES] == 0);
-  assert(somenteDesteAparelho(AJ_ENQUETES) && !dePerfil(AJ_ENQUETES));
+  assert(somenteDesteAparelho(AJ_ENQUETES) && ajustes_escopo(AJ_ENQUETES) == 3);
   { int vezesE = 0, k; for (k = 0; k < AJ_N_TELA; k++) if (TELA[k].tipo == IT_OPC && TELA[k].op == AJ_ENQUETES) vezesE++; assert(vezesE == 1); }
   assert(indiceResultado(AJ_ENQUETES, ajustes_buscar("enquete", resultados, AJ_N)) >= 0);
   /* #231: Cinemeta fora da busca. Ultima opcao, local, Ligado de fabrica (comportamento de antes). */
@@ -604,7 +604,7 @@ int main(void) {
   // 2.0.2: "Tambem em Continuar assistindo". Local, last, default OFF (= one title, one place), once on screen.
   assert(AJ_CW_RETIDO_TAMBEM == AJ_PROPORCAO_PADRAO + 1 && AJ_CW_RETIDO_TAMBEM == AJ_FONTE_ESCOPO + 10 && AJ_DV_MKV == AJ_FONTE_ESCOPO + 13);
   assert(!strcmp(CHAVE[AJ_CW_RETIDO_TAMBEM], "cwRetidoTambemLocal") && OPCOES[AJ_CW_RETIDO_TAMBEM].n == 2 && valorPadrao[AJ_CW_RETIDO_TAMBEM] == 1);
-  assert(somenteDesteAparelho(AJ_CW_RETIDO_TAMBEM) && !dePerfil(AJ_CW_RETIDO_TAMBEM));
+  assert(somenteDesteAparelho(AJ_CW_RETIDO_TAMBEM) && ajustes_escopo(AJ_CW_RETIDO_TAMBEM) == 3);
   { int vz = 0, k; for (k = 0; k < AJ_N_TELA; k++) if (TELA[k].tipo == IT_OPC && TELA[k].op == AJ_CW_RETIDO_TAMBEM) vz++; assert(vz == 1); }
   // 2.0.2: "Dolby Vision em MKV (experimental)". Local, last, default OFF, once on screen (webOS/Mac).
   assert(!strcmp(CHAVE[AJ_DV_MKV], "dvMkvLocal") && OPCOES[AJ_DV_MKV].n == 2 && valorPadrao[AJ_DV_MKV] == 1 && !ajustes_dv_mkv());
@@ -798,7 +798,7 @@ int main(void) {
   // R4: second subtitle position/style, local, appended; default = as before (top, same as primary).
   assert(!strcmp(CHAVE[AJ_LEG2_POS], "legenda2PosLocal") && OPCOES[AJ_LEG2_POS].n == 2 && valorPadrao[AJ_LEG2_POS] == 0);
   assert(AJ_LEG2_TAMANHO == AJ_LEG2_POS + 1 && AJ_LEG2_COR == AJ_LEG2_POS + 2 && AJ_LEG2_FUNDO == AJ_LEG2_POS + 3 && AJ_LEG2_BORDA == AJ_LEG2_POS + 4);
-  assert(somenteDesteAparelho(AJ_LEG2_POS) && !dePerfil(AJ_LEG2_BORDA));
+  assert(somenteDesteAparelho(AJ_LEG2_POS) && ajustes_escopo(AJ_LEG2_BORDA) == 3);
   for (int i = AJ_LEG2_POS; i <= AJ_LEG2_BORDA; i++) { int vezes2 = 0, k; for (k = 0; k < AJ_N_TELA; k++) if (TELA[k].tipo == IT_OPC && TELA[k].op == i) vezes2++; assert(vezes2 == 1 && valorPadrao[i] == 0); }
   { int a0 = valor[AJ_LEG2_POS], t0 = valor[AJ_LEG2_TAMANHO];
     assert(!ajustes_leg2_junto() && ajustes_leg2_tamanho() == 0 && ajustes_leg2_cor() == -1 && ajustes_leg2_fundo() == -1 && ajustes_leg2_borda() == -1);

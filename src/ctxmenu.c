@@ -91,8 +91,12 @@ enum { CTX_PENDENTE = 1, CTX_CONFIRMADA = 2, CTX_FALHA = 3 };
 // copia do CatItem nao tem a marca — so a da watchlist tem. Pergunta a todas as
 // fontes que sabem: a copia do cartao, a lista local, qualquer outra copia do
 // catalogo (watchlist do Trakt) e o Plan to Watch do Simkl.
+static int doPainel, doSocial;
 static int tituloSalvo(const CatItem *ci) {
   if (!ci) return 0;
+  // Owner 21/10: a title opened from the Saved panel IS saved, so its card
+  // offers "Remover" (never "Salvar"), whatever source the card copy knows.
+  if (doPainel && !doSocial) return 1;
   int fonte = ajustes_fonte_biblioteca();
   if (ci->naLista && (ci->listaFontes & (1u << fonte))) return 1;
   if (!ci->imdb[0]) return 0;
@@ -1361,7 +1365,8 @@ static void linhaCtxTinta(GfxRect r, const char *rot, const char *icone, float f
     lum = .80f + .20f * k;
     if (k > 0.01f) gfx_cor(r, 0.5f, tinta, tinta, tinta, .12f * k * a);
   } else if (k > 0.01f) {
-    if (ajustes_vidro()) { if (!gfx_foco_placa(r, 0.5f, k, a)) gfx_cor(r, 0.5f, 1, 1, 1, .14f * k * a); }
+    if (gfx_foco_placa(r, 0.5f, k, a)) { /* Shared accent plate. */ }
+    else if (ajustes_vidro()) gfx_cor(r, 0.5f, 1, 1, 1, .14f * k * a);
     else gfx_cor(r, 0.5f, .19f, .195f, .215f, k * a);
   }
   if (icone && icone[0])

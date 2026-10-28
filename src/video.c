@@ -1,5 +1,6 @@
 #include "app_id.h"
 #include "video.h"
+#include "mediaurl.h"
 #include "webosver.h"
 #include "audioinfo.h"
 #include "esmaecer.h"
@@ -22,6 +23,7 @@
 #include "rede.h"
 #include "velocidade.h"
 #include "cacheboost.h"
+#include "moviebuffer.h"
 #include "memlog.h"
 #include "dts/dts_playback.h"
 #include "dts_tv.h"
@@ -244,7 +246,7 @@ static void aplicarEstilo(void);
 // aqui porque o parse do sourceInfo, bem acima, e quem dispara o fio.
 // Mesmo limite de Stream.url: o pipeline recebe a URL original, e cortar a
 // copia faria somente a sonda MKV/ASS falhar (inclusive apos tentar de novo).
-static char  urlAtual[4096];
+static char  urlAtual[NV_MEDIA_URL_MAX];
 #if !defined(NV_TPK) && !defined(NV_ANDROID)   // .tpk e Android: video_url_atual vem do video_*.c do alvo
 const char *video_url_atual(void) { return urlAtual; }
 #endif
@@ -290,7 +292,7 @@ static NvDvSonda mkvRetry;
 static Uint32 mkvRetryEm;
 static unsigned mkvFioSessao;   // sessao em que o fio lerMkv atual nasceu
 static unsigned mkvRetrySessao;
-static char   mkvRetryUrl[4096];   // do tamanho de urlAtual: o strcmp nao pode falhar por corte
+static char   mkvRetryUrl[NV_MEDIA_URL_MAX];   // do tamanho de urlAtual: o strcmp nao pode falhar por corte
 static Uint32 seekRetryEm;   // != 0: reenviar seekAlvo quando o relogio passar disto
 static int    seekEnvAlvo, seekEnvAviso;
 static int    srcSeekable = -1, srcTrickable = -1;
@@ -1595,7 +1597,7 @@ static void chamarEm(const char *servico, const char *metodo,
 
 static void protegerScreensaver(void);
 static int modoLoad;   // video_modo_live_consumir do load em curso
-static char cargaBufferPadrao[8192];
+static char cargaBufferPadrao[NV_MEDIA_URL_MAX + 4096];
 static int bufferCustom;
 static int aoCarregar(LSHandle *h, LSMessage *m, void *u);
 static void repetirBufferPadrao(void *u) {
@@ -2643,13 +2645,8 @@ static void montarCarga(char *dst, size_t tam, const char *url, int modo,
 }
 
 static int tocarInterno(const char *url, int comDV) {
-  // 8 KB E NAO 2: a URL de fonte vai ate 4096 (Stream.url) e a do Pluto TV
-  // leva ~1,7 KB de query com JWT. Com 2048 o snprintf CORTAVA o JSON no meio
-  // e o uMS respondia `Method "load" for category "/" was not handled` — que
-  // se le como "o servico sumiu", nao como "mandei JSON pela metade". MEDIDO
-  // na C9 em 18/09 com dois canais do Pluto. A conferencia de tamanho logo
-  // abaixo transforma o proximo estouro em erro com nome.
-  char carga[8192];
+  // Complete supported URL plus load options/headers; reject overflow below.
+  char carga[NV_MEDIA_URL_MAX + 4096];
   unsigned minhaSessao;
   if (!ligado && !video_iniciar()) return 0;
   pararSessao();
@@ -2743,14 +2740,22 @@ static int tocarInterno(const char *url, int comDV) {
       dvNaCarga = 1;
     }
   }
+  char bufferedUrl[256];
+  const char *loadUrl=url;
+  // Recheck available RAM immediately before creating the read-ahead ring.
+  // Keep the official floor active; the proxy replaces custom native buffering.
+  int ownBuffer = !modoLoad && moviebuffer_url(url,cabsHttp,
+      cacheboost_buffer_mb(ajustes_buffer_preset(),memlog_livre_mb()),
+      bufferedUrl,sizeof bufferedUrl);
+  if(ownBuffer)loadUrl=bufferedUrl;
   { char hh[768];
     montarHttpHeader(hh, sizeof hh);
-    montarCarga(carga, sizeof carga, url, modoLoad, dolby, hh,
+    montarCarga(carga, sizeof carga, nv_media_url(loadUrl), modoLoad, dolby, hh,
                 expWin[0] ? expWin : "window_id_dummy",
-                ajustes_buffer_preset(), memlog_livre_mb());
+                ownBuffer ? 0 : ajustes_buffer_preset(), memlog_livre_mb());
     bufferCustom = strstr(carga, "\"userBufferCtrl\":true") != NULL;
     if (bufferCustom)
-      montarCarga(cargaBufferPadrao, sizeof cargaBufferPadrao, url, modoLoad,
+      montarCarga(cargaBufferPadrao, sizeof cargaBufferPadrao, nv_media_url(loadUrl), modoLoad,
                   dolby, hh, expWin[0] ? expWin : "window_id_dummy", 0, 0);
     if (strlen(carga) >= sizeof carga - 1) {
       printf("[video] carga do load nao coube em %zu bytes (URL de %zu): recusando\n",
@@ -2820,6 +2825,7 @@ static void pararSessao(void) {
   /* Invalidate native callbacks before closing the DTS worker. A closing
    * pipeline must not queue an error for the replacement source. */
   __atomic_add_fetch(&sessao, 1, __ATOMIC_ACQ_REL);
+  moviebuffer_stop();
   int tinhaDts = dtsSessao != NULL;
   DtsPlayback *antigoDts = dtsSessao;
   dtsSessao = NULL;
@@ -3514,7 +3520,28 @@ void video_janela_fonte(int sx, int sy, int sw, int sh,
 
 double video_pos(void)      { return posSeg; }
 double video_duracao(void)  { return durSeg; }
-double video_buffer_fim(void) { return bufferSeg; }
+double video_buffer_fim(void) {
+  DtsBufferInfo b={0};double end=bufferSeg;
+  if(dtsSessao) {
+    DtsPlaybackStatus st={0};dts_playback_status(dtsSessao,&st);
+    if(!st.failed && st.prepared) {
+      if(st.buffered_until>end)end=st.buffered_until;
+      if(st.buffer.total>0 && st.buffer.contiguous_bytes>0 && durSeg>0) {
+        double estimate=posSeg+(double)st.buffer.contiguous_bytes*durSeg/(double)st.buffer.total;
+        if(estimate>end)end=estimate;
+      }
+      if(durSeg>0 && end>durSeg)end=durSeg;
+    }
+    return end;
+  }
+  if(!dtsSessao && moviebuffer_info(&b)>0 && b.total>0 && b.ready_bytes>0 && durSeg>0) {
+    // Estimate only the standard buffered rail from measured payload and
+    // average file bitrate. No labels, counters or extra player overlay.
+    double estimate=bufferSeg+(double)b.ready_bytes*durSeg/(double)b.total;
+    if(estimate>end)end=estimate>durSeg?durSeg:estimate;
+  }
+  return end;
+}
 // webOS: so o buffer em SEGUNDOS e real (bufferRange do uMS); bytes, conexoes
 // e quadros o uMS nao conta. O host e o do link pedido (o uMS nao diz o final).
 void video_estatisticas(VideoStats *s) {

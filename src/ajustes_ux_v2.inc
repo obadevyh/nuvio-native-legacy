@@ -103,7 +103,7 @@ static float aj2Ln = 58.0f, aj2Gap = 3.0f, aj2GtEx = 18.0f, aj2Fade = 70.0f;
 // Ambar, Violeta): o `fill` tinge o fundo e a `marca` (a versao clara do
 // matiz, feita para o escuro) pinta o icone. Nao dependem do acento escolhido.
 #define AJ2_CHIP_ICO 28.0f
-static const unsigned char AJ2_CHIP_TEMA[3] = { 2, 5, 3 };   // Oceano, Ambar, Violeta
+static const unsigned char AJ2_CHIP_TEMA[4] = { 2, 5, 3, 4 };   // Oceano, Ambar, Violeta, e o do perfil (2.1)
 static struct {
   float x[3], w[3];        // posicao (relativa ao miolo da ilha) e largura abertas
   int lin[3], linhas;      // a fileira de cada uma
@@ -366,12 +366,14 @@ static void aj2DesenharMenu(const Aj2Pose *p) {
   // A superficie de foco (vidro 14%, solido #2B2D34 com sombra).
   if (f >= 2) {
     GfxRect r = { m.x + AJ2_MENU_PAD, topo + aj2SupY - aj2MRol, m.w - 2 * AJ2_MENU_PAD, aj2SupH };
-    if (ajVid()) gfx_cor(r, 38.0f / r.h, 1, 1, 1, 0.14f);
-    else {
-      gfx_rect((GfxRect){ r.x - 10, r.y + 2, r.w + 20, r.h + 26 }, 0, GFX_SOMBRA, 1.0f, 0, 0, 0.5f, 0, 0, 0, 0.30f);
-      gfx_cor(r, 38.0f / r.h, 0.169f, 0.176f, 0.204f, 1);
-    }
-    gfx_cor(r, 38.0f / r.h, ar, ag, ab, 0.14f);   // um toque leve do acento
+    if (!gfx_foco_placa(r, 38.0f / r.h, 1, 1)) {
+      if (ajVid()) gfx_cor(r, 38.0f / r.h, 1, 1, 1, 0.14f);
+      else {
+        gfx_rect((GfxRect){ r.x - 10, r.y + 2, r.w + 20, r.h + 26 }, 0, GFX_SOMBRA, 1.0f, 0, 0, 0.5f, 0, 0, 0, 0.30f);
+        gfx_cor(r, 38.0f / r.h, 0.169f, 0.176f, 0.204f, 1);
+      }
+      gfx_cor(r, 38.0f / r.h, ar, ag, ab, 0.14f);
+    }   // um toque leve do acento
   }
   // As tres pilulas do alto (aj2Chips). Recolhido (rotulos a 0) viram so o
   // icone, cada uma no comeco da sua fileira, para caberem na coluna de
@@ -699,7 +701,7 @@ static void aj2TopoTexto(int t, char *b, size_t n, char *det, size_t nd) {
   } else if (t == AJ2_T_DIF) {
     snprintf(b, n, "%s", i18n("Diferentes do padrão"));
     if (uxNDifs) snprintf(det, nd, " · %d", uxNDifs);
-  } else snprintf(b, n, i18n("Perfil: %s"), textoLeitura(AJ_PERFIL_ATIVO));
+  } else pfRotuloChip(b, n);
 }
 static const char *aj2TopoIcone(int t) {
   return t == AJ2_T_BUSCA ? "aj_search" : t == AJ2_T_AV ? (lig(AJ_AVANCADAS) ? "aj_eye" : "aj_eye-off")
@@ -734,8 +736,10 @@ static GfxRect aj2TopoR(int t) {
   float wb = cw + (cw + AJ2_G_VAO) / 3.0f, wa = aj2TopoLargura(AJ2_T_AV), wp = aj2TopoLargura(AJ2_T_PERFIL);
   float wl = ajLayoutSelecionavel() ? aj2TopoLargura(AJ2_T_LAYOUT) : 0.0f, wd = aj2TopoLargura(AJ2_T_DIF);
   float gap = ajLayoutSelecionavel() ? 80.0f : 60.0f;
-  // Search yields first when localized labels do not fit; layout may be hidden.
-  if (wb + gap + wa + wp + wd + wl > fim - x) { wb = fim - x - gap - wa - wp - wd - wl; if (wb < 300) wb = 300; }
+  // Drop the optional Advanced state before shortening Search or the profile name.
+  if (wb + gap + wa + wp + wd + wl > fim - x)
+    wa = 30 + 34 + 16 + (float)txt_largura(TXT_V3_CHIP, i18n("Avançadas")) + 32;
+  if (wb + gap + wa + wp + wd + wl > fim - x) { wb = fim - x - gap - wa - wp - wd - wl; if (wb < 240) wb = 240; }
   if (wb + gap + wa + wp + wd + wl > fim - x) { float k = (fim - x - gap - wb) / (wa + wp + wd + wl); wa *= k; wp *= k; wd *= k; wl *= k; }
   if (t == AJ2_T_BUSCA) return (GfxRect){ x, y, wb, AJ2_G_CHIP };
   if (t == AJ2_T_AV) return (GfxRect){ x + wb + 20, y, wa, AJ2_G_CHIP };

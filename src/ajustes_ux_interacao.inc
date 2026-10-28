@@ -49,7 +49,7 @@ static int uxRequisito(int op) {
     case AJ_PROXIMO_CONTAGEM: return AJ_PROXIMO_AUTO;
     case AJ_FONTE_GRUPO_SESSOES: return AJ_FONTE_GRUPO;
     case AJ_LINK_PRAZO: return AJ_LINK_REUSAR;
-    case AJ_VIDRO_CONTORNO: case AJ_FOCO_ACENTO: case AJ_VIDRO_OPAC: case AJ_VIDRO_FOSCO: case AJ_VIDRO_QUALIDADE: return AJ_VIDRO;
+    case AJ_VIDRO_CONTORNO: case AJ_VIDRO_OPAC: case AJ_VIDRO_FOSCO: case AJ_VIDRO_QUALIDADE: return AJ_VIDRO;
     case AJ_RAIL: case AJ_RAIL_BLUR: return AJ_RAIL_MODERNA;
     case AJ_HERO_CHEIO: return AJ_HOME_LAYOUT;
     case AJ_HERO_CATALOGOS: return AJ_HERO;
@@ -441,7 +441,7 @@ static int uxEvento(SDL_Keycode k) {
           else uxNotificar("Não foi possível salvar. O valor anterior foi mantido.");
           return 1;
         }
-        if (t == AJ2_T_PERFIL) { focarOpcao(AJ_PERFIL_ATIVO); return 1; }
+        if (t == AJ2_T_PERFIL) { pfAbrir(); return 1; }
         // Diferentes do padrao: abre a lista (degrau 1); Voltar devolve a pilula (uxTopo fica nela).
         if (t == AJ2_T_DIF) { uxListarDiferencas(); uxDifFoco = 0; uxIndice = 1; focoIndice = 0; return 1; }
         if (t == AJ2_T_LAYOUT) return uxAlternarLayout();   // o foco fica na pilula

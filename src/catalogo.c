@@ -797,7 +797,8 @@ static const char *cacheMetadataLanguage(void) {
 // Version 8 adds per-source Saved membership, including builds where padding
 // keeps sizeof(CatItem) unchanged. Old shared marks cannot identify a source.
 // Version 9 records metadata language: cached poster URLs are localized too.
-#define CACHE_VERSAO 9
+// Version 10 adds exact remote episode identity, even if padding keeps sizeof stable.
+#define CACHE_VERSAO 10
 // Mesmo cabecalho, itens CODIFICADOS (zeros em corrida). Um CatItem tem ~16 KB
 // e quase tudo e zero (buffers de URL dimensionados para o pior caso): 1600
 // titulos eram 25,6 MB gravados na MEMFS dentro da trava do sistema de arquivos
@@ -1450,8 +1451,10 @@ static int normalizarIndice(int indice) {
 static void apontarEpisodio(int indice, int temporada, int episodio) {
   int e;
   if (!(temporada >= 0 && episodio > 0)) return;
-  if (itens[indice].temporada != temporada || itens[indice].episodio != episodio)
+  if (itens[indice].temporada != temporada || itens[indice].episodio != episodio) {
     itens[indice].nomeEpisodio[0] = 0;
+    itens[indice].tvdbEp = 0;
+  }
   itens[indice].temporada = temporada;
   itens[indice].episodio  = episodio;
   mudou();
@@ -1530,7 +1533,10 @@ void cat_aplicar_progresso(int indice, double posSeg, double durSeg, int tempora
 // nada aqui — so limpava o nome quando o episodio muda, e isso continua.
 static void apontarEm(CatItem *v, int i, int temporada, int episodio) {
   if (!(temporada >= 0 && episodio > 0)) return;
-  if (v[i].temporada != temporada || v[i].episodio != episodio) v[i].nomeEpisodio[0] = 0;
+  if (v[i].temporada != temporada || v[i].episodio != episodio) {
+    v[i].nomeEpisodio[0] = 0;
+    v[i].tvdbEp = 0;
+  }
   v[i].temporada = temporada;
   v[i].episodio  = episodio;
 }
@@ -1550,6 +1556,13 @@ static void aplicarUmEm(CatItem *v, int i, double posSeg, double durSeg, int tem
 // A COPIA QUE A PESSOA TIROU NAO E FONTE. Isto rodava DEPOIS de
 // podarContinuar(removidoVence) e o card tirado ja nao estava no vetor; agora
 // roda antes da publicacao (e da poda), entao a mesma regra entra aqui.
+// A Next Up seed shares the watched episode's timestamp, but points ahead.
+// Replaying that episode's progress must not turn the seed back into it.
+static int aSeguirAdiante(const CatItem *item, int t, int e, long long ms) {
+  return !strcmp(item->tipo, "series") && item->progresso == 0 &&
+         item->retomadoMs > 0 && item->retomadoMs >= ms && e > 0 &&
+         (item->temporada > t || (item->temporada == t && item->episodio > e));
+}
 static void espalharEm(CatItem *v, int m) {
   int i, j, k, nf = 0, *fontes;
   for (i = 0; i < m; i++) if (v[i].progresso > 0 && v[i].imdb[0]) nf++;
@@ -1563,6 +1576,7 @@ static void espalharEm(CatItem *v, int m) {
     for (k = 0; k < nf; k++) {
       i = fontes[k];
       if (!mesmaCopiaEm(v, i, j)) continue;
+      if (aSeguirAdiante(&v[j], v[i].temporada, v[i].episodio, v[i].retomadoMs)) continue;
       if (v[j].progresso > 0 && v[i].retomadoMs <= v[j].retomadoMs) continue;
       if (melhor < 0 || v[i].retomadoMs > v[melhor].retomadoMs) melhor = i;
     }
@@ -1571,6 +1585,7 @@ static void espalharEm(CatItem *v, int m) {
     v[j].restanteMin = v[melhor].restanteMin;
     v[j].retomadoMs  = v[melhor].retomadoMs;
     apontarEm(v, j, v[melhor].temporada, v[melhor].episodio);
+    v[j].tvdbEp = v[melhor].tvdbEp;
   }
   free(fontes);
 }
@@ -1605,7 +1620,8 @@ static int aplicarProgressoEm(CatItem *v, int m, const ProgRegistro *regs, int k
           v[j].retomadoMs > 0 && v[j].retomadoMs > regs[i].lastWatchedMs) maisNova = 1;
     for (j = 0; j < m; j++) {
       if (tocado[j] || !v[j].imdb[0] || !mesmoTitulo(v[j].imdb, regs[i].contentId)) continue;
-      if (maisNova) { tocado[j] = 1; continue; }
+      if (maisNova || aSeguirAdiante(&v[j], regs[i].temporada, regs[i].episodio,
+                                   regs[i].lastWatchedMs)) { tocado[j] = 1; continue; }
       // O ITEM QUE JA E MAIS NOVO QUE O DISCO NAO VOLTA NO TEMPO. O item do
       // Trakt (pausado ou "a seguir", issue #66) traz o instante em
       // retomadoMs; um registro local mais velho — o S1E1 a 3% de 8/9 quando
@@ -1858,7 +1874,8 @@ int cat_id_stream(int indiceItem, int t, int e, char *dst, unsigned tam) {
   if (!c || !c->imdb[0]) return 0;
   idbase_copiar(c->imdb, base, sizeof base);
   if (t < 0 || e <= 0) { snprintf(dst, tam, "%s", c->imdb); return 1; }
-  if (!idbase_e_imdb(c->imdb) || t == 0) {
+  { // CW copies may have no episodes; reuse the loaded copy's published IDs.
+    indiceItem = cat_indice_titulo(c->imdb, indiceItem);
     n = cat_n_episodios(indiceItem);
     for (i = 0; i < n; i++) {
       const CatEp *ep = cat_episodio(indiceItem, i);
@@ -1877,6 +1894,115 @@ int cat_id_stream(int indiceItem, int t, int e, char *dst, unsigned tam) {
   }
   snprintf(dst, tam, "%s:%d:%d", base, t, e);
   return 1;
+}
+
+static int episodioFaixaValidaEx(int indice, const char *id, int exigirFinal) {
+  size_t a, b;
+  if (!id || indice < 0 || indice >= n || !itens || !epIni || !epQtd ||
+      indice >= nFaixas || (exigirFinal && itens[indice].epsParciais) ||
+      strcmp(itens[indice].tipo, "series") || epIni[indice] < 0 ||
+      epQtd[indice] <= 0 || epIni[indice] > CAT_EP_MAX - epQtd[indice]) return 0;
+  a = idbase_len(itens[indice].imdb);
+  b = idbase_len(id);
+  return a == b && !strncmp(itens[indice].imdb, id, a);
+}
+
+static int episodioFaixaValida(int indice, const char *id) {
+  return episodioFaixaValidaEx(indice, id, 1);
+}
+
+int cat_episodios_finais(int indice, const char *id) {
+  int ok;
+  catTravar();
+  pthread_mutex_lock(&epTrava);
+  ok = episodioFaixaValida(indice, id);
+  pthread_mutex_unlock(&epTrava);
+  pthread_mutex_unlock(&pubTrava);
+  return ok;
+}
+
+int cat_episodio_tvdb(int indice, const char *id, int t, int e) {
+  int tvdb = 0;
+  catTravar();
+  pthread_mutex_lock(&epTrava);
+  if (episodioFaixaValida(indice, id)) {
+    const CatEp *v = eps + epIni[indice];
+    int q = epQtd[indice];
+    for (int i = 0; i < q; i++) if (v[i].temporada == t && v[i].episodio == e) {
+      if (v[i].tvdbEp <= 0 || (tvdb && tvdb != v[i].tvdbEp)) { tvdb = 0; break; }
+      tvdb = v[i].tvdbEp;
+    }
+    if (tvdb) {
+      int mt = 0, me = 0, achou = 0;
+      for (int i = 0; i < q; i++) if (v[i].tvdbEp == tvdb) {
+        if (!achou) { mt = v[i].temporada; me = v[i].episodio; achou = 1; }
+        else if (mt != v[i].temporada || me != v[i].episodio) { tvdb = 0; break; }
+      }
+    }
+  }
+  pthread_mutex_unlock(&epTrava);
+  pthread_mutex_unlock(&pubTrava);
+  return tvdb;
+}
+
+// Playback can open while the fast provisional list is still visible. A
+// proven TVDB id from that snapshot remains the same episode after an addon
+// replaces its season/episode numbering, so capture it before replacement.
+int cat_episodio_tvdb_qualquer(int indice, const char *id, int t, int e) {
+  int tvdb = 0;
+  catTravar();
+  pthread_mutex_lock(&epTrava);
+  if (episodioFaixaValidaEx(indice, id, 0)) {
+    const CatEp *v = eps + epIni[indice];
+    int q = epQtd[indice];
+    for (int i = 0; i < q; i++) if (v[i].temporada == t && v[i].episodio == e) {
+      if (v[i].tvdbEp <= 0 || (tvdb && tvdb != v[i].tvdbEp)) { tvdb = 0; break; }
+      tvdb = v[i].tvdbEp;
+    }
+    if (tvdb) {
+      int mt = 0, me = 0, achou = 0;
+      for (int i = 0; i < q; i++) if (v[i].tvdbEp == tvdb) {
+        if (!achou) { mt = v[i].temporada; me = v[i].episodio; achou = 1; }
+        else if (mt != v[i].temporada || me != v[i].episodio) { tvdb = 0; break; }
+      }
+    }
+  }
+  pthread_mutex_unlock(&epTrava);
+  pthread_mutex_unlock(&pubTrava);
+  return tvdb;
+}
+
+int cat_episodio_existe_final(int indice, const char *id, int t, int e) {
+  int ok = 0;
+  catTravar();
+  pthread_mutex_lock(&epTrava);
+  if (episodioFaixaValida(indice, id)) {
+    const CatEp *v = eps + epIni[indice];
+    int q = epQtd[indice];
+    for (int i = 0; i < q; i++)
+      if (v[i].temporada == t && v[i].episodio == e) { ok = 1; break; }
+  }
+  pthread_mutex_unlock(&epTrava);
+  pthread_mutex_unlock(&pubTrava);
+  return ok;
+}
+
+int cat_episodio_por_tvdb(int indice, const char *id, int tvdb, int *t, int *e) {
+  int ok = 0, mt = 0, me = 0;
+  catTravar();
+  pthread_mutex_lock(&epTrava);
+  if (tvdb > 0 && episodioFaixaValida(indice, id)) {
+    const CatEp *v = eps + epIni[indice];
+    int q = epQtd[indice];
+    for (int i = 0; i < q; i++) if (v[i].tvdbEp == tvdb) {
+      if (!ok) { mt = v[i].temporada; me = v[i].episodio; ok = mt >= 0 && me > 0; }
+      else if (mt != v[i].temporada || me != v[i].episodio) { ok = 0; break; }
+    }
+  }
+  pthread_mutex_unlock(&epTrava);
+  pthread_mutex_unlock(&pubTrava);
+  if (ok) { if (t) *t = mt; if (e) *e = me; }
+  return ok;
 }
 
 int cat_copiar_por_id(const char *id, const char *tipo, CatItem *saida) {

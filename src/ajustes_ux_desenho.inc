@@ -175,9 +175,9 @@ static void ajIlhaMiolo(GfxRect r, float raioPx, float miolo) {
 // Superficie de FOCO de linha: um degrau mais clara (vidro 12%, solido #2B2D34).
 static void ajFocoLinha(GfxRect r, float raioPx, float f, float a) {
   if (f <= 0.01f) return;
+  if (gfx_foco_placa(r, raioPx / r.h, f, a)) return;
   if (ajVid()) {
     float ar, ag, ab;
-    if (gfx_foco_placa(r, raioPx / r.h, f, a)) return;
     gfx_cor(r, raioPx / r.h, 1, 1, 1, 0.12f * f * a);
     ajustes_acento(&ar, &ag, &ab);
     gfx_vidro_aro(r, raioPx / r.h, 2.0f, ar, ag, ab, 0.96f * f * a);
@@ -821,7 +821,7 @@ static const char *ajSelo(int op) {
   if (op == AJ_LEG_SYNC_AUDIO) return "Android";
   if (uxAvancada(op)) return "Avançado";
   if (!uxTemPadrao(op)) return NULL;
-  return !strcmp(uxEscopo(op), "Conta/perfil") ? "Este perfil" : "Esta TV";
+  return escopoDe(op) == ESC_TV ? "Esta TV" : "Este perfil";
 }
 static float ajLinhaH(int i) {
   int op = TELA[i].op;
@@ -882,7 +882,7 @@ static void ajDesenharIndice(void) {
     // Na janela recortada so entram categorias inteiras: meia linha cortada
     // pelo recorte parece defeito, nao rolagem.
     if (indRecorte && (r.y < ilha.y + 7.0f || r.y + 58.0f > indFim + 1.0f)) { y += 62.0f; continue; }
-    if (foco) ajNeutro(r, 29.0f, 0.14f, 0.169f, 0.176f, 0.204f, 1);
+    if (foco) { if (!gfx_foco_placa(r, .5f, 1, 1)) ajNeutro(r, 29.0f, 0.14f, 0.169f, 0.176f, 0.204f, 1); }
     else if (sel) gfx_cor((GfxRect){ r.x + 7.0f, r.y + 26.5f, 5, 5 }, 0.5f, ar, ag, ab, 1);
     ajIcone(icone, r.x + 20.0f, r.y + 16.0f, 26.0f, al);
     { TxtLinha t = ajTxtC(TXT_AJ_ITEM, titulo, r.w - 82.0f);
@@ -1354,8 +1354,8 @@ static void ajDesenharLinha(int item, float y, float f, float a) {
     }
     { const char *selo = ajSelo(op);
       if (selo) {
-        float w = ajCaps(TXT_V3_SELO, selo, 2.2f, -1, 0, 0);
-        if (rx + 18 + w < tx + maxW) ajCaps(TXT_V3_SELO, selo, 2.2f, rx + 18, tyc - 11, 0.42f * aT);
+        float w = ajCaps(TXT_G22M, selo, 1.0f, -1, 0, 0);
+        if (rx + 18 + w < tx + maxW) ajCaps(TXT_G22M, selo, 1.0f, rx + 18, tyc - 11, 0.42f * aT);
       } }
   }
   // 2.0.3: o que falta para a linha valer, na propria linha (ambar).
