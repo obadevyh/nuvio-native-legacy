@@ -29,8 +29,37 @@ internal object ThumbnailSingleLanes {
         Executors.newFixedThreadPool(LANES_OWN) { r -> Thread(r, "thumbnail-range").apply { isDaemon = true } }
     }
 
-    fun lanes(multiRangeOk: Boolean, fastPacing: Boolean, ownSlots: Boolean = false): Int =
-        if (multiRangeOk || !fastPacing) 1 else if (ownSlots) LANES_OWN else LANES
+    fun lanes(multiRangeOk: Boolean, fastPacing: Boolean, ownSlots: Boolean = false, learnedCap: Int? = null): Int =
+        if (multiRangeOk || !fastPacing) 1
+        else if (ownSlots) minOf(LANES_OWN, learnedCap?.coerceAtLeast(MIN_CAP) ?: LANES_OWN)
+        else LANES
+
+    // LEARNED LANE LIMIT (06/11/2026, R2: HTTP 403 once 8 lanes + the player's 4 were open). A 403/429 is read as
+    // "too many connections" only when it cannot be a dead link: >= 3 thumbnail requests in flight AND one to the
+    // same host succeeded within the last 10 s. Then one lane fewer than were in flight, never below MIN_CAP; null
+    // means a real refusal (the title stops, as before).
+    const val MIN_CAP = 2
+    fun capAfterRefusal(inFlight: Int, msSinceLastOk: Long): Int? =
+        if (inFlight >= 3 && msSinceLastOk in 0..10_000) maxOf(MIN_CAP, inFlight - 1) else null
+
+    /** A 403/429 read as a connection limit (see [capAfterRefusal]): retried, not a refusal of the title. */
+    class LaneLimit(code: Int) : IOException("http $code (connection limit)")
+
+        /** In-flight limit for the async look-ahead that can be lowered while requests run. */
+    class Gate(limit: Int) {
+        private var limit = limit
+        private var active = 0
+        @Synchronized fun active() = active
+        @Synchronized fun limit() = limit
+        @Synchronized fun setLimit(n: Int) { limit = maxOf(1, n); (this as Object).notifyAll() }
+        fun <T> run(f: () -> T): T {
+            synchronized(this) {
+                while (active >= limit) (this as Object).wait()
+                active++
+            }
+            try { return f() } finally { synchronized(this) { active--; (this as Object).notifyAll() } }
+        }
+    }
 
     // Keep what fits in the source's RAM cache, so a range is not evicted
     // before the decoder reads it; always at least one.

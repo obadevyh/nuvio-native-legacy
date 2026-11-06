@@ -818,6 +818,8 @@ object MiniaturaMotor {
         // Returns -1 (lazy one-at-a-time reads, as before) when the pacing is not FAST: an unstable buffer gets one
         // request at a time.
         private val laneMu = Any()
+        private val laneGate = ThumbnailSingleLanes.Gate(ThumbnailSingleLanes.LANES_OWN)
+        @Volatile private var ultimoOkMs = -1L shl 40
         private val LIMITE_LANES = 32L shl 20   // located blocks go to disk; look-ahead futures hold up to AHEAD_MAX more
         private val AHEAD_MAX = 16
         // ASYNC LOOK-AHEAD (own slots only, 06/11/2026 R2): the next batch's ranges keep downloading while the C side
@@ -842,9 +844,12 @@ object MiniaturaMotor {
         private var lanesLogged = false
         private fun prefetchFaixasParalelas(tempos: LongArray, proximos: LongArray = longArrayOf()): Int {
             val c = carregarCues() ?: return -1
-            val proprias = MediaHttpBudget.hasOwnLanes(try { URL(alvo).host } catch (_: Exception) { null })
-            val lanes = ThumbnailSingleLanes.lanes(multiOk, speedPolicy() == ThumbnailPacing.FAST, proprias)
+            val hostAtual = try { URL(alvo).host } catch (_: Exception) { null }
+            val proprias = MediaHttpBudget.hasOwnLanes(hostAtual)
+            val lanes = ThumbnailSingleLanes.lanes(multiOk, speedPolicy() == ThumbnailPacing.FAST, proprias,
+                if (proprias) ThumbnailHostMemory.laneCap(hostAtual) else null)
             if (lanes <= 1) return -1
+            if (proprias && laneGate.limit() > lanes) laneGate.setLimit(lanes)
             // With own slots, also the NEXT batch's keyframes (the hints), so the lanes do not idle while this batch
             // decodes; they stay in RAM and the next batch finds them cached. Needs a bigger RAM window.
             if (proprias && limite < LIMITE_LANES) {
@@ -978,7 +983,7 @@ object MiniaturaMotor {
                 val a = r[0]; val b = r[1]
                 if (r[2] == 1L) fimAhead[r[3].toInt()] = b
                 cueDoTrecho[a] = r[3].toInt()
-                emVoo[a] = ThumbnailSingleLanes.submit { pedirUm(a, b) }
+                emVoo[a] = ThumbnailSingleLanes.submit { laneGate.run { pedirUm(a, b) } }
             }
             val precisa = lote.filter { it[2] == 0L }.map { it[0] } + aguardar
             val obtidos = HashMap<Long, ByteArray>()
@@ -1398,7 +1403,15 @@ object MiniaturaMotor {
                     c = ThumbnailHttpRedirects.open(alvo, cab, "bytes=$a-$b", !manter && (perfilBits and 32768) == 0, {}, ::openHttp)
                     val code = c.responseCode
                 val auditHeaders = System.nanoTime()
-                    if (code in listOf(401, 403, 429, 503, 509)) {
+                    val cap = if (proprio && (code == 403 || code == 429))
+                        ThumbnailSingleLanes.capAfterRefusal(laneGate.active(), android.os.SystemClock.elapsedRealtime() - ultimoOkMs) else null
+                    if (cap != null) {
+                        val host = try { URL(alvo).host } catch (_: Exception) { null }
+                        Log.w(TAG, "HTTP $code with ${laneGate.active()} lanes in flight on a working link: connection limit, $cap lanes from now on")
+                        laneGate.setLimit(cap)
+                        ThumbnailHostMemory.recordLaneCap(host, cap)
+                        throw ThumbnailSingleLanes.LaneLimit(code)
+                    } else if (code in listOf(401, 403, 429, 503, 509)) {
                         recusado = true
                         Log.w(TAG, "HTTP $code: stopping thumbnails for this title")
                     }
@@ -1427,13 +1440,18 @@ object MiniaturaMotor {
                     auditFetch("single", auditStart, auditHeaders, timedBody, got, MediaHttpBudget.threadWaitNanos() - permitBase)
                     resultado((android.os.SystemClock.elapsedRealtime() - ini - (MediaHttpBudget.threadWaitNanos() - permitBase) / 1_000_000).coerceAtLeast(0), true, got)
                     MediaHttpBudget.close(c)
+                    if (b > a) ultimoOkMs = android.os.SystemClock.elapsedRealtime()
                     return d
                 } catch (e: IOException) {
                     MediaHttpBudget.close(c)
                     checkHttpCancelled()
-                    speedPacing.failure(android.os.SystemClock.elapsedRealtime())
+                    // A connection limit already lowered the lanes: no FAST block, no slower pace (the retry below
+                    // runs with fewer requests in flight).
+                    if (e !is ThumbnailSingleLanes.LaneLimit) {
+                        speedPacing.failure(android.os.SystemClock.elapsedRealtime())
+                        resultado(0, false)
+                    }
                     ultimo = e
-                    resultado(0, false)
                     if (e is java.net.ConnectException) {
                         recusado = true
                         Log.w(TAG, "connection refused: stopping this title")

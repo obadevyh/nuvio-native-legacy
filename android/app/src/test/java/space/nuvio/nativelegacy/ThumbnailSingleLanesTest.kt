@@ -47,6 +47,40 @@ class ThumbnailSingleLanesTest {
         } finally { exec.shutdownNow() }
     }
 
+    @Test fun learnedCapLowersOwnLanesButNeverRaisesThem() {
+        assertEquals(4, ThumbnailSingleLanes.lanes(false, true, ownSlots = true, learnedCap = 4))
+        assertEquals(ThumbnailSingleLanes.LANES_OWN, ThumbnailSingleLanes.lanes(false, true, ownSlots = true, learnedCap = 50))
+        assertEquals(ThumbnailSingleLanes.MIN_CAP, ThumbnailSingleLanes.lanes(false, true, ownSlots = true, learnedCap = 0))
+        assertEquals(1, ThumbnailSingleLanes.lanes(false, false, ownSlots = true, learnedCap = 4))
+    }
+
+    @Test fun refusalIsALimitOnlyOnABusyWorkingLink() {
+        assertEquals(5, ThumbnailSingleLanes.capAfterRefusal(inFlight = 6, msSinceLastOk = 800))
+        assertEquals(ThumbnailSingleLanes.MIN_CAP, ThumbnailSingleLanes.capAfterRefusal(inFlight = 3, msSinceLastOk = 0))
+        assertEquals(null, ThumbnailSingleLanes.capAfterRefusal(inFlight = 2, msSinceLastOk = 100))     // too few
+        assertEquals(null, ThumbnailSingleLanes.capAfterRefusal(inFlight = 6, msSinceLastOk = 30_000))  // dead link
+        assertEquals(null, ThumbnailSingleLanes.capAfterRefusal(inFlight = 6, msSinceLastOk = -5))
+    }
+
+    @Test fun gateHoldsNewRequestsAfterTheLimitDrops() {
+        val gate = ThumbnailSingleLanes.Gate(4)
+        val exec = Executors.newFixedThreadPool(8)
+        val active = AtomicInteger(); val peakAfter = AtomicInteger()
+        val lowered = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            val first = (0 until 4).map { exec.submit { gate.run { active.incrementAndGet(); Thread.sleep(150); active.decrementAndGet() } } }
+            Thread.sleep(50)
+            gate.setLimit(2); lowered.set(true)
+            val later = (0 until 6).map { exec.submit { gate.run {
+                val n = active.incrementAndGet(); if (lowered.get()) peakAfter.accumulateAndGet(n, ::maxOf)
+                Thread.sleep(30); active.decrementAndGet()
+            } } }
+            (first + later).forEach { it.get(5, TimeUnit.SECONDS) }
+            assertTrue("a new request started while ${peakAfter.get()} ran", peakAfter.get() <= 4)
+            assertEquals(0, gate.active())
+        } finally { exec.shutdownNow() }
+    }
+
     @Test fun capKeepsWhatFitsAndAlwaysOne() {
         val mb = 1L shl 20
         val r = listOf(longArrayOf(0, 2 * mb - 1), longArrayOf(10 * mb, 12 * mb - 1), longArrayOf(20 * mb, 22 * mb - 1))

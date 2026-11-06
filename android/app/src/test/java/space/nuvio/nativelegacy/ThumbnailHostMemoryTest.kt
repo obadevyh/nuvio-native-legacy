@@ -36,6 +36,15 @@ class ThumbnailHostMemoryTest {
         assertFalse(ThumbnailHostMemory(f, retryMs = 10_000).refuses("a.r2.cloudflarestorage.com", 10_001))
     }
 
+    @Test fun laneCapIsStoredWithItsValueAndOldLinesStillLoad() {
+        val f = File(tmp.root, "caps.txt")
+        ThumbnailHostMemory(f, retryMs = 1_000).record("a.r2.cloudflarestorage.com", 0, 4)
+        assertEquals(4, ThumbnailHostMemory(f, retryMs = 1_000).value("b.r2.cloudflarestorage.com", 10))
+        assertEquals(null, ThumbnailHostMemory(f, retryMs = 1_000).value("b.r2.cloudflarestorage.com", 1_000))
+        val old = File(tmp.root, "old.txt"); old.writeText("cloudflarestorage.com\t100\n")
+        assertTrue(ThumbnailHostMemory(old).refuses("x.r2.cloudflarestorage.com", 200))
+    }
+
     @Test fun missingOrCorruptFileIsHarmless() {
         val f = File(tmp.root, "hosts.txt")
         f.writeText("garbage\nno-tab-here\nx.com\tnot-a-number\n")
