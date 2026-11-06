@@ -826,13 +826,30 @@ object MiniaturaMotor {
         // decodes this one (~120 s of 7.7 min had the link idle), and a range still in flight is waited for instead of
         // requested again. Keyed by the range start; harvested into RAM at the next call.
         private val emVoo = java.util.concurrent.ConcurrentHashMap<Long, java.util.concurrent.Future<ByteArray>>()
+        private val fimEmVoo = java.util.concurrent.ConcurrentHashMap<Long, Long>()      // range start -> last byte
+        private val aheadEmVoo: MutableSet<Long> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+        // DECODE AS RANGES LAND (06/11/2026, after Nuvio Arc's ThumbnailFetchLanes): the batch call returns once its
+        // ranges are queued, and a read that needs one still on the wire waits for THAT range here (the extractor via
+        // segmento, the CPU route via blocoChave), instead of the decode waiting for the whole batch, or fetching it
+        // again. Null when no range in flight covers p, or it failed (the caller then reads it itself).
+        private fun esperarEmVoo(p: Long): Pair<Long, ByteArray>? {
+            val a = fimEmVoo.entries.firstOrNull { p >= it.key && p <= it.value }?.key ?: return null
+            val f = emVoo[a] ?: return null
+            val d = try {
+                ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.HEADER).use { ThumbnailSingleLanes.await(f) }
+            } catch (_: Exception) { null } finally { emVoo.remove(a); fimEmVoo.remove(a); aheadEmVoo.remove(a) }
+            if (d == null) return null
+            guardar(a, d)
+            cueDoTrecho.remove(a)?.let { k -> localizarNoTrecho(k, a, d) }
+            return a to d
+        }
         private fun colherProntos(): Int {
             var n = 0
             val it = emVoo.entries.iterator()
             while (it.hasNext()) {
                 val e = it.next()
                 if (!e.value.isDone) continue
-                it.remove()
+                it.remove(); fimEmVoo.remove(e.key); aheadEmVoo.remove(e.key)
                 try {
                     val d = e.value.get()
                     guardar(e.key, d); n++
@@ -843,6 +860,7 @@ object MiniaturaMotor {
         }
         private var lanesLogged = false
         private fun prefetchFaixasParalelas(tempos: LongArray, proximos: LongArray = longArrayOf()): Int {
+            if (recusado) throw IOException("refused earlier")   // seen by a background request: preparar returns -2
             val c = carregarCues() ?: return -1
             val hostAtual = try { URL(alvo).host } catch (_: Exception) { null }
             val proprias = MediaHttpBudget.hasOwnLanes(hostAtual)
@@ -897,7 +915,7 @@ object MiniaturaMotor {
             // 16 hints and a 30 MB batch evicted the previous batch's look-ahead before it was used (1130 requests
             // for 660 thumbnails).
             val atuaisN = faixas.count { it[2] == 0L }
-            val voando = emVoo.size
+            val voando = aheadEmVoo.count { emVoo.containsKey(it) }
             val lote = if (proprias && limite >= LIMITE_LANES) {
                 // This batch within half the RAM window; the look-ahead (held in its futures until the next call)
                 // up to about one batch.
@@ -983,30 +1001,14 @@ object MiniaturaMotor {
                 val a = r[0]; val b = r[1]
                 if (r[2] == 1L) fimAhead[r[3].toInt()] = b
                 cueDoTrecho[a] = r[3].toInt()
+                fimEmVoo[a] = b
+                if (r[2] == 1L) aheadEmVoo.add(a)
                 emVoo[a] = ThumbnailSingleLanes.submit { laneGate.run { pedirUm(a, b) } }
             }
-            val precisa = lote.filter { it[2] == 0L }.map { it[0] } + aguardar
-            val obtidos = HashMap<Long, ByteArray>()
-            try {
-                for (a in precisa) {
-                    val f = emVoo[a] ?: continue
-                    val d = ThumbnailSingleLanes.await(f)
-                    emVoo.remove(a)
-                    guardar(a, d); obtidos[a] = d
-                    cueDoTrecho.remove(a)?.let { k -> localizarNoTrecho(k, a, d) }
-                }
-            } catch (e: Exception) {
-                for (a in precisa) emVoo.remove(a)?.cancel(true)
-                throw e
-            }
-            if (nalTam > 0) for (k in tempos.map { cueParaTempo(it, false) }.distinct()) {
-                val ib = iniBloco[k] ?: continue; val fb = fimBloco[k] ?: continue
-                val e = obtidos.entries.firstOrNull { ib >= it.key && fb <= it.key + it.value.size } ?: continue
-                guardarNoDisco(k, e.value, (ib - e.key).toInt(), (fb - ib).toInt())
-            }
-            Log.i(TAG, "[single-lanes] lanes=$lanes async cachedNow=$jaTinha/$atuaisN harvested=$colhidos waitedInFlight=${aguardar.size} " +
-                "new=${lote.count { it[2] == 0L }} ahead=${lote.count { it[2] == 1L }} inFlightBefore=$voando ranges=${lote.size}/$total " +
-                "bytes=${obtidos.values.sumOf { it.size.toLong() }} batchMs=${android.os.SystemClock.elapsedRealtime() - t0}")
+            // No wait here: the decode reads each keyframe as its range lands (esperarEmVoo).
+            Log.i(TAG, "[single-lanes] lanes=$lanes async cachedNow=$jaTinha/$atuaisN harvested=$colhidos inFlightForThis=${aguardar.size} " +
+                "new=${lote.count { it[2] == 0L }} ahead=${lote.count { it[2] == 1L }} aheadInFlightBefore=$voando ranges=${lote.size}/$total " +
+                "queueMs=${android.os.SystemClock.elapsedRealtime() - t0}")
             return lote.size + aguardar.size
         }
 
@@ -1085,6 +1087,7 @@ object MiniaturaMotor {
             val c = cues ?: return null
             if (nalTam <= 0) return null
             val kk = cueParaTempo(tMs, false)
+            if (fimBloco[kk] == null) esperarEmVoo(c[kk * 3 + 1])
             val a = iniBloco[kk] ?: return null; val fim = fimBloco[kk] ?: return null
             if (fim - a > out.capacity()) return null
             converterDoDisco(kk,out,baseOnly)?.let {return it}
@@ -1369,6 +1372,7 @@ object MiniaturaMotor {
             // check's fine pass, the gap fills): 1 MB at a time then, not a keyframe-sized window. Measured 23/10:
             // with ~190 KB windows, exact frames needed ~25 requests each, queued behind the batches, and timed out.
             // A keyframe that overflows its prefetched window only needs the rest of itself: one window, not 1 MB.
+            esperarEmVoo(p)?.let { r -> if (p < r.first + r.second.size) return r }
             val seguido = fase == F_EXATO && segs.any { it.first + it.second.size == p }
             val n = if (seguido && manter) maxOf(janela, 1 shl 20) else janelaFalta(p, lendoLen)
             diagFalta(p, lendoPos, lendoLen)
@@ -1519,7 +1523,7 @@ object MiniaturaMotor {
         override fun close() {
             closed = true
             for (f in emVoo.values) f.cancel(true)
-            emVoo.clear()
+            emVoo.clear(); fimEmVoo.clear(); aheadEmVoo.clear()
             abortHttp()
             synchronized(this) { /* Wait for a cancelled prefetch before deleting its files. */ }
             rangeAudit?.dump(auditDurationMs, tamanho, cues, iniBloco, fimBloco, mp4Index?.sizes)
