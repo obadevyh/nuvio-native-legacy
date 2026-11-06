@@ -2284,7 +2284,9 @@ static int trabalharDireto(Job *j, long long *hA) {
   int completo = etapaMax >= 4 && diretoCoverageComplete(j) && !parou(j);
   pthread_mutex_unlock(&mu);
   salvar(j, completo);                             // sparse coverage is saved as NOT complete
-  if (completo) avisoPronto = j->g;
+  // "Thumbnails generated" when the pass FINISHED, not only when every 10 s slot got one (06/11/2026: 142/143, or a
+  // keyframe only every 30 s, 45/138, never showed it). A pass stopped by a refusal or a decode failure still does not.
+  if (completo || (!motivo[0] && !parou(j))) avisoPronto = j->g;
   printf("[miniatura] direct: %s, %d unique images%s%s\n", completo ? "done" : "partial", j->feitos, motivo[0] ? ", stopped: " : "", motivo); fflush(stdout);
   diretoCoberturaRelatorio(j);
   j->resumido = 0;
@@ -2826,7 +2828,9 @@ int miniatura_status_agora(void) {
   pthread_mutex_lock(&mu);
   Job *j = job;
   int covered = j && j->direto ? mini_coverage_covered_count(&j->coverage) : j ? j->feitos : 0;
-  int half = j && j->n > 1 && covered * 2 >= (j->direto ? j->n : j->n - 1);
+  // 50 % of the slots that CAN get a thumbnail: a slot with no keyframe near it never counts against it.
+  int possible = j ? (j->direto ? j->n - mini_coverage_unavailable_count(&j->coverage) : j->n - 1) : 0;
+  int half = j && j->n > 1 && possible > 0 && covered * 2 >= possible;
   int result = mini_progress(&progresso, j ? j->g : 0, j && j->cacheChecado, half,
                              j && j->avisoCompleto, j ? j->cacheTipo : 0, SDL_GetTicks());
   pthread_mutex_unlock(&mu);

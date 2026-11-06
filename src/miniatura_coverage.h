@@ -80,6 +80,14 @@ static inline int mini_coverage_covered_count(const MiniCoverage *c) {
   return covered;
 }
 
+/* Slots with no keyframe near them at all: no thumbnail can ever cover them. */
+static inline int mini_coverage_unavailable_count(const MiniCoverage *c) {
+  if (!c || !c->state) return 0;
+  int n = 0;
+  for (int slot = 0; slot < c->count; slot++) n += c->state[slot] == MINI_COVER_UNAVAILABLE;
+  return n;
+}
+
 /* Terminal failures/unavailable cues and attempted flags do not prove coverage. */
 static inline int mini_coverage_complete(const MiniCoverage *c) {
   return c && c->count > 0 && mini_coverage_covered_count(c) == c->count;
