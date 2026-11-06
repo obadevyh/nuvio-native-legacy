@@ -159,6 +159,13 @@ static void carregarFundo(void) {
 }
 
 int login_fundo_desenhar(float alfa) {
+  const char *quest = getenv("NUVIO_QUEST_CINEMA");
+  if (quest && !strcmp(quest, "1")) {
+    // In a cinema, the sign-in surface should blend with the spatial chrome.
+    gfx_cor((GfxRect){ 0, 0, NV_TELA_W, NV_TELA_H }, 0.0f,
+            17.0f/255.0f, 20.0f/255.0f, 30.0f/255.0f, alfa);
+    return 1;
+  }
   if (!tentouFundo) carregarFundo();
   if (!texFundo) return 0;
   gfx_tex_aspect_atual = 0.0f;

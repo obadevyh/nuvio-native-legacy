@@ -18,7 +18,7 @@ prefix = r'''
 #include <unistd.h>
 typedef struct { int parar, cpuFeitos; long cpuMs, cpuDecMs; } Job;
 typedef struct { int unused; } MiniMotor;
-typedef struct { unsigned totalMs, decodMs; long bytesPacote; } MiniQuadro;
+typedef struct { unsigned totalMs, decodMs, resizeMs, colourMs, jpegMs; long bytesPacote; } MiniQuadro;
 #define PISO_KB (300L * 1024)
 #define CPU_AMOSTRAS 20
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
@@ -27,6 +27,7 @@ static int reading, proceed, decodes;
 static int parou(Job *j) { return j->parar; }
 static long memDisponivelKB(void) { return 1024L * 1024; }
 static size_t mini_motor_memoria(MiniMotor *m, int threads) { (void)m; (void)threads; return 1; }
+static void mini_dovi_gpu_close(void) {}
 static int mPacoteCpu(long long h, long k, long *p, unsigned char **pk, int *n) {
   (void)h; (void)k; *p = 42000;
   pthread_mutex_lock(&gate);

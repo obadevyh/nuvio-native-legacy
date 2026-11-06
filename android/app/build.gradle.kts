@@ -1,3 +1,9 @@
+import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
+import java.util.zip.ZipEntry
+import java.io.ByteArrayOutputStream
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -6,6 +12,8 @@ plugins {
 // Tudo que vem de fora do projeto entra por propriedade (-P) que o
 // tools/android.sh passa; os padroes servem para abrir no Android Studio.
 val lite = (findProperty("nuvio.apkLite") as String?) == "1"
+val quest = (findProperty("nuvio.quest") as String?) == "1"
+if (quest) layout.buildDirectory.set(file("build-quest"))
 if (lite) layout.buildDirectory.set(file("build-lite"))
 val raiz = rootProject.projectDir.parentFile                         // raiz do repo
 val cache = file(System.getProperty("user.home") + "/.cache/nuvio-android")
@@ -28,11 +36,14 @@ android {
 
     defaultConfig {
         applicationId = "space.nuvio.nativelegacy"
+        if (quest) applicationId = "space.nuvio.nativelegacy.quest"
         minSdk = 24
+        if (quest) minSdk = 34
         targetSdk = 35
         versionCode = vx * 10000 + vy * 100 + vz
         versionName = versao
         ndk { if (!lite) abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+        if (quest) ndk { abiFilters.clear(); abiFilters += "arm64-v8a" }
         externalNativeBuild {
             cmake {
                 arguments += listOf(
@@ -67,6 +78,7 @@ android {
             path = file("src/main/cpp/CMakeLists.txt")
             version = "3.22.1"
             if (lite) buildStagingDirectory = file(".cxx-lite")
+            if (quest) buildStagingDirectory = file(".cxx-quest")
         }
     }
 
@@ -103,7 +115,7 @@ android {
         create("sharing") {
             initWith(getByName("release"))
             applicationIdSuffix = ".sharing"
-            versionNameSuffix = "-sharing"
+            versionNameSuffix = if (quest) "-quest-alpha2" else "-sharing"
             matchingFallbacks += "release"
             signingConfig = signingConfigs.findByName("sharing")
         }
@@ -116,6 +128,12 @@ android {
     androidResources { noCompress += listOf("png", "jpg", "webp", "ttf", "json") }
 
     sourceSets["main"].apply {
+        if (quest) {
+            java.srcDir("../quest/src/main/java")
+            res.srcDir("../quest/src/main/res")
+            assets.srcDir("../quest/src/main/assets")
+            manifest.srcFile("../quest/src/main/AndroidManifest.xml")
+        }
         java.srcDir("build/sdl-java")                 // classes org.libsdl.app copiadas do SDL
         assets.srcDir("$estagio/assets")              // art/ e fonts/ (tools/android.sh)
         jniLibs.srcDir("$estagio/jnilibs")            // libcurl.so/libjpeg.so, se existirem
@@ -125,6 +143,9 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    if ((findProperty("nuvio.audioTrace") as String?) == "1")
+        sourceSets["sharing"].manifest.srcFile("../diagnostics/AndroidManifest.xml")
+    if (quest) sourceSets["test"].java.srcDir("../quest/src/test/java")
     testOptions { unitTests.isReturnDefaultValues = true }
 }
 
@@ -148,11 +169,59 @@ val copiaSdlJava = tasks.register<Copy>("copiaSdlJava") {
 }
 tasks.named("preBuild") { dependsOn(copiaSdlJava) }
 
+// Version-locked HLS source overlay. Remove only HlsChunkSource and its nested
+// classes from the upstream AAR; the Apache-licensed replacement in src/main/java
+// backports upstream's empty-segment-list fix without changing decoder ABI.
+val hlsOriginal by configurations.creating
+val patchedHls = layout.buildDirectory.file("patched-hls/media3-exoplayer-hls-1.8.0.aar")
+val patchHls by tasks.registering {
+    inputs.files(hlsOriginal)
+    outputs.file(patchedHls)
+    doLast {
+        val original = hlsOriginal.singleFile
+        val output = patchedHls.get().asFile
+        output.parentFile.mkdirs()
+        ZipFile(original).use { aar ->
+            ZipOutputStream(output.outputStream()).use { out ->
+                for (entry in aar.entries()) {
+                    out.putNextEntry(ZipEntry(entry.name))
+                    if (entry.name == "classes.jar") {
+                        val bytes = ByteArrayOutputStream()
+                        ZipInputStream(aar.getInputStream(entry)).use { jar ->
+                            ZipOutputStream(bytes).use { patched ->
+                                var item = jar.nextEntry
+                                while (item != null) {
+                                    val name = item!!.name
+                                    if (!name.matches(Regex("androidx/media3/exoplayer/hls/HlsChunkSource(\\$.*)?\\.class"))) {
+                                        patched.putNextEntry(ZipEntry(name))
+                                        jar.copyTo(patched)
+                                        patched.closeEntry()
+                                    }
+                                    item = jar.nextEntry
+                                }
+                            }
+                        }
+                        out.write(bytes.toByteArray())
+                    } else aar.getInputStream(entry).use { it.copyTo(out) }
+                    out.closeEntry()
+                }
+            }
+        }
+    }
+}
+
 dependencies {
+    if (quest) {
+        implementation("com.meta.spatial:meta-spatial-sdk:0.14.0")
+        implementation("com.meta.spatial:meta-spatial-sdk-toolkit:0.14.0")
+        implementation("com.meta.spatial:meta-spatial-sdk-vr:0.14.0")
+    }
+    compileOnly("org.checkerframework:checker-qual:3.33.0")
+    hlsOriginal("androidx.media3:media3-exoplayer-hls:1.8.0@aar") { isTransitive = false }
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // Video (NvPlayer.kt, de outro agente): Media3 ExoPlayer.
     implementation("androidx.media3:media3-exoplayer:1.8.0")
-    implementation("androidx.media3:media3-exoplayer-hls:1.8.0")
+    implementation(files(patchedHls).builtBy(patchHls))
     implementation("androidx.media3:media3-exoplayer-dash:1.8.0")
     // Decodificador de AUDIO por FFmpeg (DTS, DTS-HD, TrueHD, E-AC-3...) para
     // quando a TV nao tem o decodificador nem passa o bitstream adiante: sem
