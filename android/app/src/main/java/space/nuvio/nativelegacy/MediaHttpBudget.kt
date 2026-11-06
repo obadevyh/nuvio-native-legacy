@@ -28,7 +28,21 @@ internal object MediaHttpBudget {
         if (extraHosts.add(host.lowercase())) Log.i("nuvio-http-budget", "[http-budget] own thumbnail slots for ${host.lowercase()}: +$EXTRA")
     }
     internal fun hasOwnLanes(host: String?) = host != null && host.lowercase() in extraHosts
-    private data class Lease(val host: String, val owner: String, val onRelease: ()->Unit, val sem: Semaphore)
+    // BORROWED PLAYER SLOTS (06/11/2026, to bring R2 Dune from ~4 to ~3 min): with a 4K file's buffer at its byte
+    // cap the player stops loading and its 4 shared slots sit idle. An own-lane thumbnail request may borrow one when
+    // nobody is queued for them, at least one would stay free, and fewer than BORROW_MAX are out: at most
+    // EXTRA + BORROW_MAX = 9 thumbnail connections and never more than 10 in all (R2 refused at 12, 10 never did).
+    // A borrowed slot comes back after one ~1 s request; the player's ~11 s buffer covers the wait.
+    const val BORROW_MAX = 3
+    private val borrowed = AtomicInteger()
+    private fun tryBorrow(): Boolean {
+        if (permits.hasQueuedThreads() || permits.availablePermits() < 2) return false
+        if (borrowed.incrementAndGet() > BORROW_MAX) { borrowed.decrementAndGet(); return false }
+        if (permits.tryAcquire()) return true
+        borrowed.decrementAndGet(); return false
+    }
+    private data class Lease(val host: String, val owner: String, val onRelease: ()->Unit, val sem: Semaphore,
+                             val isBorrowed: Boolean = false)
     private val leases = ConcurrentHashMap<HttpURLConnection, Lease>()
     private val current = AtomicInteger()
     private val peak = AtomicInteger()
@@ -44,10 +58,16 @@ internal object MediaHttpBudget {
              checkCancelled: () -> Unit, onRelease: ()->Unit): HttpURLConnection {
         val start = System.nanoTime()
         val timelinePermit = if (owner.startsWith("thumbnail")) ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.PERMIT) else null
-        val sem = if (owner.startsWith("thumbnail") && url.host.lowercase() in extraHosts) extra else permits
+        val own = owner.startsWith("thumbnail") && url.host.lowercase() in extraHosts
+        var sem = if (own) extra else permits
+        var isBorrowed = false
         try {
             while (true) {
                 checkCancelled()
+                if (own) {
+                    if (extra.tryAcquire()) { sem = extra; break }
+                    if (tryBorrow()) { sem = permits; isBorrowed = true; break }
+                }
                 if (sem.tryAcquire(100, TimeUnit.MILLISECONDS)) break
                 if (System.nanoTime() - start > TimeUnit.SECONDS.toNanos(45))
                     throw IOException("media HTTP budget wait exceeded 45 seconds")
@@ -66,15 +86,15 @@ internal object MediaHttpBudget {
             connection = factory(url)
             checkCancelled()
             val host = url.host.lowercase()
-            check(leases.putIfAbsent(connection, Lease(host, owner, onRelease, sem)) == null) { "HTTP connection already owns a lease" }
+            check(leases.putIfAbsent(connection, Lease(host, owner, onRelease, sem, isBorrowed)) == null) { "HTTP connection already owns a lease" }
             val n = current.incrementAndGet()
             peak.accumulateAndGet(n, ::maxOf)
             opens.incrementAndGet()
             byHost.compute(host) { _, value -> (value ?: AtomicInteger()).also { it.incrementAndGet() } }
-            Log.i("nuvio-http-budget", "[http-budget] owner=$owner host=$host active=$n cap=${if (sem === extra) "$LIMIT+$EXTRA" else "$LIMIT"} waitMs=${waited / 1_000_000}")
+            Log.i("nuvio-http-budget", "[http-budget] owner=$owner host=$host active=$n cap=${if (own) "$LIMIT+$EXTRA" else "$LIMIT"}${if (isBorrowed) " borrowed=${borrowed.get()}" else ""} waitMs=${waited / 1_000_000}")
             return connection
         } catch (e: Throwable) {
-            try { connection?.disconnect() } finally { sem.release(); onRelease() }
+            try { connection?.disconnect() } finally { sem.release(); if (isBorrowed) borrowed.decrementAndGet(); onRelease() }
             throw e
         }
     }
@@ -88,6 +108,7 @@ internal object MediaHttpBudget {
                 byHost.computeIfPresent(lease.host) { _, value -> if (value.decrementAndGet() == 0) null else value }
                 current.decrementAndGet()
                 lease.sem.release()
+                if (lease.isBorrowed) borrowed.decrementAndGet()
                 lease.onRelease()
             }
         }

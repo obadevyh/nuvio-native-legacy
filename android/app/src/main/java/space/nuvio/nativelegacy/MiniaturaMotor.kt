@@ -1067,7 +1067,9 @@ object MiniaturaMotor {
             val policy = speedPolicy()
             lastDirectStart = inicio; lastDirectBytes = bytes
             val byBytes = bytes * 1000 / policy.bytesPerSecond
-            val spacing = maxOf(policy.intervalMs, byBytes)
+            // Own lanes under FAST: 80 ms between starts (125 ms capped 9 lanes at 8 starts/s against a ~1 s answer).
+            val proprio = policy == ThumbnailPacing.FAST && !multiOk && MediaHttpBudget.hasOwnLanes(try { URL(alvo).host } catch (_: Exception) { null })
+            val spacing = maxOf(if (proprio) minOf(policy.intervalMs, 80L) else policy.intervalMs, byBytes)
             proximaDireta = inicio + spacing
             Log.i(TAG, "[fetch-plan] source=${System.identityHashCode(this)} bytes=$bytes binding=${if (byBytes > policy.intervalMs) "byte-cap" else "request-interval"} spacingMs=$spacing remainingWaitMs=${(proximaDireta - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0)}")
         }

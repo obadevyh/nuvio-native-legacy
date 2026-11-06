@@ -23,7 +23,9 @@ internal object ThumbnailSingleLanes {
     // With its own slots (MediaHttpBudget.EXTRA) the storage host's ~865 ms wait is hidden by more requests in
     // flight: ~6 x 1.4 MB per ~1.05 s is ~65 Mbit/s next to the player, and FAST pacing drops this to 1 the
     // moment the playback buffer stops being stable.
-    const val LANES_OWN = 6   // 06/11 R2: 8 (12 connections with the player) got HTTP 403 within 20 s; 6 (<= 10) never did
+    // 06/11 R2: 8 own slots (12 connections with the player) got HTTP 403 within 20 s; 6 (<= 10) never did. 9 = the
+    // 6 own slots + up to 3 borrowed idle player slots (MediaHttpBudget.BORROW_MAX): still <= 10 connections in all.
+    const val LANES_OWN = 9
 
     private val pool: ExecutorService by lazy {
         Executors.newFixedThreadPool(LANES_OWN) { r -> Thread(r, "thumbnail-range").apply { isDaemon = true } }
