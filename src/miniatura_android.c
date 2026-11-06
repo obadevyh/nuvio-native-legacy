@@ -2646,6 +2646,10 @@ static GLuint texDe(Job *j, int k) {
   return t;
 }
 
+// What the seek bar may show. A copy's OPTIMISTIC tile (made at offset 0 while the screen check runs) stays hidden
+// until the check accepts the copy: a wrong film or cut must never reach the screen, even for a few seconds
+// (06/11/2026). Acceptance clears .prov (relabelled) or the tile is discarded.
+#define TILE_VISIVEL(j, s) ((j)->tiles[s].jpg && !(j)->tiles[s].prov)
 static int pQuadros(double posSeg, int n, GLuint *out, double *cueSeg) {
   int achou = 0;
   for (int i = 0; i < n; i++) { out[i] = 0; if (cueSeg) cueSeg[i] = -1.0; }
@@ -2659,18 +2663,18 @@ static int pQuadros(double posSeg, int n, GLuint *out, double *cueSeg) {
     int atual = -1;
     if (j->direto) {
       int alias = j->slotFrame[k];
-      if (alias >= 0 && alias < j->n && j->tiles[alias].jpg &&
+      if (alias >= 0 && alias < j->n && TILE_VISIVEL(j, alias) &&
           mini_coverage_valid(&j->coverage, k, j->tiles[alias].pts)) atual = alias;
       if (atual < 0) for (int s = 0; s < j->n; s++) {
-        if (!j->tiles[s].jpg || labs(j->tiles[s].pts - k * GRADE_MS) > VIZINHO_SLOTS * GRADE_MS) continue;
+        if (!TILE_VISIVEL(j, s) || labs(j->tiles[s].pts - k * GRADE_MS) > VIZINHO_SLOTS * GRADE_MS) continue;
         if (atual < 0 || labs(j->tiles[s].pts - k * GRADE_MS) < labs(j->tiles[atual].pts - k * GRADE_MS)) atual = s;
       }
       velho = atual >= 0 && !mini_coverage_valid(&j->coverage, k, j->tiles[atual].pts);
-    } else if (j->tiles[k].jpg) atual = k;
+    } else if (TILE_VISIVEL(j, k)) atual = k;
     else {
       for (int d = 1; d <= VIZINHO_SLOTS && atual < 0; d++) {
-        if (k - d >= 0 && j->tiles[k - d].jpg) atual = k - d;
-        else if (k + d < j->n && j->tiles[k + d].jpg) atual = k + d;
+        if (k - d >= 0 && TILE_VISIVEL(j, k - d)) atual = k - d;
+        else if (k + d < j->n && TILE_VISIVEL(j, k + d)) atual = k + d;
       }
       // a neighbour within 8 s IS this slot's thumbnail (no "still loading" ring); further away it stands in
       velho = atual >= 0 && labs(j->tiles[atual].pts - k * GRADE_MS) > TOL_COPIA_MS;
@@ -2681,7 +2685,7 @@ static int pQuadros(double posSeg, int n, GLuint *out, double *cueSeg) {
     if (n > 1 && atual >= 0) {
       long pts = j->tiles[atual].pts;
       for (int s = 0; s < j->n; s++) {
-        if (!j->tiles[s].jpg || labs(j->tiles[s].pts - pts) > VIZINHO_SLOTS * GRADE_MS) continue;
+        if (!TILE_VISIVEL(j, s) || labs(j->tiles[s].pts - pts) > VIZINHO_SLOTS * GRADE_MS) continue;
         if (j->tiles[s].pts < pts && (alvos[0] < 0 || j->tiles[s].pts > j->tiles[alvos[0]].pts)) alvos[0] = s;
         if (j->tiles[s].pts > pts && (alvos[2] < 0 || j->tiles[s].pts < j->tiles[alvos[2]].pts)) alvos[2] = s;
       }
@@ -2689,7 +2693,7 @@ static int pQuadros(double posSeg, int n, GLuint *out, double *cueSeg) {
     for (int pass = 0; pass < n; pass++) {
       int i = n == 3 ? (pass == 0 ? 1 : pass == 1 ? 0 : 2) : pass;  // centre queues first
       int s = alvos[base + i];
-      if (s < 0 || s >= j->n || !j->tiles[s].jpg) continue;
+      if (s < 0 || s >= j->n || !TILE_VISIVEL(j, s)) continue;
       out[i] = texDe(j, s);
       if (cueSeg && out[i]) cueSeg[i] = j->tiles[s].pts / 1000.0;
     }
