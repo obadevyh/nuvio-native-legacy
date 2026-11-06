@@ -2669,7 +2669,10 @@ static int pQuadros(double posSeg, int n, GLuint *out, double *cueSeg) {
         if (!TILE_VISIVEL(j, s) || labs(j->tiles[s].pts - k * GRADE_MS) > VIZINHO_SLOTS * GRADE_MS) continue;
         if (atual < 0 || labs(j->tiles[s].pts - k * GRADE_MS) < labs(j->tiles[atual].pts - k * GRADE_MS)) atual = s;
       }
-      velho = atual >= 0 && !mini_coverage_valid(&j->coverage, k, j->tiles[atual].pts);
+      // The ring means "a closer thumbnail is still coming". Once the job has ended nothing more will come: the
+      // nearest thumbnail stands in plainly (06/11/2026, a 1080p episode with a keyframe only every ~30 s: 45 of 138
+      // slots, the rest showed a loading ring forever).
+      velho = j->vivo && atual >= 0 && !mini_coverage_valid(&j->coverage, k, j->tiles[atual].pts);
     } else if (TILE_VISIVEL(j, k)) atual = k;
     else {
       for (int d = 1; d <= VIZINHO_SLOTS && atual < 0; d++) {
@@ -2677,7 +2680,7 @@ static int pQuadros(double posSeg, int n, GLuint *out, double *cueSeg) {
         else if (k + d < j->n && TILE_VISIVEL(j, k + d)) atual = k + d;
       }
       // a neighbour within 8 s IS this slot's thumbnail (no "still loading" ring); further away it stands in
-      velho = atual >= 0 && labs(j->tiles[atual].pts - k * GRADE_MS) > TOL_COPIA_MS;
+      velho = j->vivo && atual >= 0 && labs(j->tiles[atual].pts - k * GRADE_MS) > TOL_COPIA_MS;
     }
     // Slots can be empty after cue deduplication or during the sparse pass.
     // The strip follows actual picture times, not adjacent grid positions.
