@@ -300,6 +300,32 @@ object MiniaturaMotor {
             return -1
         }
 
+        private var mapaFp: ByteArray? = null
+        private var mapaCarregado = 0
+        private val mapaBlocos: MutableSet<Int> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+        @Volatile private var mapaFalhas = 0
+        @Volatile private var mapaOk = 0
+        // A block from the map that does not convert is a wrong map (should not happen: the fingerprint holds the
+        // file's SegmentUID). Two failures before a success drop every map-located block and delete the map; the
+        // engine then locates blocks as it would without one.
+        private fun conferirMapa(k: Int, ok: Boolean) {
+            if (k !in mapaBlocos) return
+            if (ok) { mapaOk++; return }
+            if (++mapaFalhas >= 2 && mapaOk == 0) {
+                for (b in mapaBlocos) { iniBloco.remove(b); fimBloco.remove(b) }
+                mapaBlocos.clear()
+                mapaFp?.let { ThumbnailMap.delete(it) }
+                Log.w(TAG, "[thumb-map] blocks did not match this file: map dropped")
+            }
+        }
+        private fun salvarMapa() {
+            val fp = mapaFp ?: return
+            val c = cues ?: return
+            if (mp4Index != null || nalTam <= 0 || fimBloco.size <= mapaCarregado) return
+            val blocks = HashMap<Int, LongArray>()
+            for ((k, fim) in fimBloco) { val ini = iniBloco[k] ?: continue; if (fim > ini) blocks[k] = longArrayOf(ini, fim) }
+            ThumbnailMap.save(fp, ThumbnailMap.Data(tamanho, trilhaV, nalTam, cuesIni, cuesFim, c, blocks))
+        }
         private fun carregarCues(): LongArray? {
             if (cuesTentado) return cues
             cuesTentado = true
@@ -313,6 +339,16 @@ object MiniaturaMotor {
                         Log.i(TAG, "[packet-index] container=mp4 syncSamples=${index.sizes.size} nalLength=$nalTam timestamps=edited-presentation")
                     }
                     if (index == null) Log.w(TAG, "[packet-index] MP4 packet fallback unavailable: unsupported or invalid sample tables; no downloaded samples claimed")
+                    return cues
+                }
+                // THUMBNAIL MAP: the same file played before -> its index and located blocks, no index read.
+                val fp = ThumbnailMap.fingerprint(tamanho, h).also { mapaFp = it }
+                ThumbnailMap.load(fp)?.takeIf { it.size == tamanho && it.cues.size >= 90 }?.let { m ->
+                    trilhaV = m.trackV; nalTam = m.nalLength; cuesIni = m.cuesIni; cuesFim = m.cuesFim
+                    for ((k, b) in m.blocks) { iniBloco[k] = b[0]; fimBloco[k] = b[1]; mapaBlocos.add(k) }
+                    mapaCarregado = m.blocks.size
+                    cues = m.cues
+                    Log.i(TAG, "[thumb-map] loaded: ${m.cues.size / 3} cues, ${m.blocks.size} located blocks, NAL length $nalTam: index read skipped")
                     return cues
                 }
                 val (_, l0) = vint(h, 0, true) ?: return null
@@ -839,8 +875,14 @@ object MiniaturaMotor {
                 ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.HEADER).use { ThumbnailSingleLanes.await(f) }
             } catch (_: Exception) { null } finally { emVoo.remove(a); fimEmVoo.remove(a); aheadEmVoo.remove(a) }
             if (d == null) return null
+            val k = cueDoTrecho.remove(a)
+            if (d.isEmpty()) {   // parked on disk: back to RAM only for this read
+                val r = k?.let { lerBlocoDoDisco(it) } ?: return null
+                guardar(r.first, r.second)
+                return r
+            }
             guardar(a, d)
-            cueDoTrecho.remove(a)?.let { k -> localizarNoTrecho(k, a, d) }
+            k?.let { localizarNoTrecho(it, a, d) }
             return a to d
         }
         private fun colherProntos(): Int {
@@ -852,8 +894,9 @@ object MiniaturaMotor {
                 it.remove(); fimEmVoo.remove(e.key); aheadEmVoo.remove(e.key)
                 try {
                     val d = e.value.get()
-                    guardar(e.key, d); n++
-                    cueDoTrecho.remove(e.key)?.let { k -> localizarNoTrecho(k, e.key, d) }
+                    val k = cueDoTrecho.remove(e.key)
+                    if (d.isNotEmpty()) { guardar(e.key, d); k?.let { localizarNoTrecho(it, e.key, d) } }   // empty: on disk
+                    n++
                 } catch (_: Exception) { /* fetched again if needed */ }
             }
             return n
@@ -864,10 +907,16 @@ object MiniaturaMotor {
             val c = carregarCues() ?: return -1
             val hostAtual = try { URL(alvo).host } catch (_: Exception) { null }
             val proprias = MediaHttpBudget.hasOwnLanes(hostAtual)
+            // Own-lane hosts keep ONE lane while FAST is off instead of handing the batch to lazy reads (06/11/2026:
+            // a 6 s add-on redirect timed out at startup, FAST was blocked 60 s, every batch returned -1 at once and
+            // all 1002 targets were queued with no data and no located block; with no hardware decoder yet the CPU
+            // route had nothing to decode and the run sat still until a pause).
             val lanes = ThumbnailSingleLanes.lanes(multiOk, speedPolicy() == ThumbnailPacing.FAST, proprias,
-                if (proprias) ThumbnailHostMemory.laneCap(hostAtual) else null)
-            if (lanes <= 1) return -1
-            if (proprias && laneGate.limit() > lanes) laneGate.setLimit(lanes)
+                if (proprias) ThumbnailHostMemory.laneCap(hostAtual) else null).let { if (proprias) maxOf(1, it) else it }
+            if (lanes <= 1 && !proprias) return -1
+            // lanes already holds the learned cap (ThumbnailHostMemory): the gate follows it both ways, so 1 lane
+            // while FAST is off goes back to the full count once it returns.
+            if (proprias && laneGate.limit() != lanes) laneGate.setLimit(lanes)
             // With own slots, also the NEXT batch's keyframes (the hints), so the lanes do not idle while this batch
             // decodes; they stay in RAM and the next batch finds them cached. Needs a bigger RAM window.
             if (proprias && limite < LIMITE_LANES) {
@@ -988,6 +1037,34 @@ object MiniaturaMotor {
             } catch (_: Exception) { }
         }
         private var diagLotes = 0
+        // One look-ahead/batch range on a lane. (1) The lane count is re-checked here, not only when a batch is
+        // planned: with batches returning at once the C side may plan EVERY batch while FAST is still warming up,
+        // and the gate then stayed at 1 lane for the whole run (06/11/2026, map replay: 167 requests in 3 min).
+        // (2) A fetched keyframe block goes straight to the disk cache and its bytes leave RAM: with the CPU route
+        // decoding ~2.5/s against ~8/s fetched, finished ranges otherwise pile up in memory (the earlier full heap).
+        private val VAZIO = ByteArray(0)
+        private fun pedirNaLane(a: Long, b: Long): ByteArray {
+            val alvoLanes = ThumbnailSingleLanes.lanes(multiOk, speedPolicy() == ThumbnailPacing.FAST, true,
+                ThumbnailHostMemory.laneCap(try { URL(alvo).host } catch (_: Exception) { null })).coerceAtLeast(1)
+            if (laneGate.limit() != alvoLanes) laneGate.setLimit(alvoLanes)
+            val d = laneGate.run { pedirUm(a, b) }
+            val k = cueDoTrecho[a] ?: return d
+            if (nalTam <= 0 || mp4Index != null) return d
+            val ib = iniBloco[k]; val fb = fimBloco[k]
+            if (ib != null && fb != null) {
+                if (ib >= a && fb <= a + d.size) guardarNoDisco(k, d, (ib - a).toInt(), (fb - ib).toInt())
+            } else localizarNoTrecho(k, a, d)
+            return if (synchronized(discoMu) { k in noDisco }) VAZIO else d
+        }
+        // The bytes of a block parked on disk, back in RAM for a read that needs them there (the extractor's path).
+        private fun lerBlocoDoDisco(k: Int): Pair<Long, ByteArray>? {
+            val ib = iniBloco[k] ?: return null
+            return synchronized(discoMu) {
+                val e = noDisco[k] ?: return@synchronized null
+                try { val f = disco ?: return@synchronized null; val b = ByteArray(e[1].toInt()); f.seek(e[0]); f.readFully(b); ib to b }
+                catch (_: Exception) { null }
+            }
+        }
         private fun lanesAssincronas(tempos: LongArray, lote: List<LongArray>, aguardar: List<Long>, lanes: Int,
                                      jaTinha: Int, atuaisN: Int, colhidos: Int, voando: Int, total: Int, t0: Long): Int {
             // Look-ahead audit, first 40 batches: which cues this batch had to fetch vs what the last look-ahead took.
@@ -1003,7 +1080,7 @@ object MiniaturaMotor {
                 cueDoTrecho[a] = r[3].toInt()
                 fimEmVoo[a] = b
                 if (r[2] == 1L) aheadEmVoo.add(a)
-                emVoo[a] = ThumbnailSingleLanes.submit { laneGate.run { pedirUm(a, b) } }
+                emVoo[a] = ThumbnailSingleLanes.submit { pedirNaLane(a, b) }
             }
             // No wait here: the decode reads each keyframe as its range lands (esperarEmVoo).
             Log.i(TAG, "[single-lanes] lanes=$lanes async cachedNow=$jaTinha/$atuaisN harvested=$colhidos inFlightForThis=${aguardar.size} " +
@@ -1090,6 +1167,13 @@ object MiniaturaMotor {
             if (nalTam <= 0) return null
             val kk = cueParaTempo(tMs, false)
             if (fimBloco[kk] == null) esperarEmVoo(c[kk * 3 + 1])
+            // Still unknown (nothing fetched it): fetch the cluster up to the keyframe's window and locate the block
+            // here, so the CPU route never depends on another path having located it.
+            if (fimBloco[kk] == null && direto && !multiOk && mp4Index == null && !recusado) {
+                val ini = c[kk * 3 + 1]
+                val d = try { pedir(ini, minOf(tamanho - 1, ini + c[kk * 3 + 2] + janela - 1)) } catch (e: IOException) { null }
+                if (d != null) { guardar(ini, d); localizarNoTrecho(kk, ini, d) }
+            }
             val a = iniBloco[kk] ?: return null; val fim = fimBloco[kk] ?: return null
             if (fim - a > out.capacity()) return null
             converterDoDisco(kk,out,baseOnly)?.let {return it}
@@ -1097,7 +1181,7 @@ object MiniaturaMotor {
             return if (mp4Index != null) {
                 out.clear()
                 if (!writePacket(b, out, 0, b.size, baseOnly)) null else c[kk * 3] / 1000 to out.position()
-            } else converterBloco(b, c[kk * 3] / 1000, out, baseOnly)
+            } else converterBloco(b, c[kk * 3] / 1000, out, baseOnly).also { conferirMapa(kk, it != null) }
         }
         private fun converterBloco(b: ByteArray, ptsUs: Long, out: ByteBuffer, baseOnly: Boolean, length: Int=b.size): Pair<Long, Int>? {
             val (id, l0) = vint(b, 0, true,length) ?: return null
@@ -1453,7 +1537,9 @@ object MiniaturaMotor {
                     checkHttpCancelled()
                     // A connection limit already lowered the lanes: no FAST block, no slower pace (the retry below
                     // runs with fewer requests in flight).
-                    if (e !is ThumbnailSingleLanes.LaneLimit) {
+                    // The 0-0 size probe at open goes through the add-on's redirect (pengu.uk took 6-10 s, 06/11/2026):
+                    // its timeout says nothing about playback health, so it does not block FAST for 60 s.
+                    if (e !is ThumbnailSingleLanes.LaneLimit && b > a) {
                         speedPacing.failure(android.os.SystemClock.elapsedRealtime())
                         resultado(0, false)
                     }
@@ -1523,6 +1609,7 @@ object MiniaturaMotor {
             }
         }
         override fun close() {
+            try { salvarMapa() } catch (_: Exception) { }
             closed = true
             for (f in emVoo.values) f.cancel(true)
             emVoo.clear(); fimEmVoo.clear(); aheadEmVoo.clear()
