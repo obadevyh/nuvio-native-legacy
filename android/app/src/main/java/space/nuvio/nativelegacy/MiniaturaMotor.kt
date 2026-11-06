@@ -1268,7 +1268,7 @@ object MiniaturaMotor {
                     multiOk = false   // whole file: never again for this file (and read nothing more)
                     // Remembered per host: the probe rounds restore multiOk after a refusal, and each new source of the
                     // same title started over (05/11/2026, R2: 7 refused multi-range requests in one title).
-                    try { URL(alvo).host?.let { semMultiRange.add(it.lowercase()); MediaHttpBudget.allowThumbnailLanes(it) } } catch (_: Exception) {}
+                    try { URL(alvo).host?.let { semMultiRange.add(it.lowercase()); MediaHttpBudget.allowThumbnailLanes(it); ThumbnailHostMemory.recordRefusal(it) } } catch (_: Exception) {}
                     Log.w(TAG, "multi-range not served here (http $code, $tipo): single ranges from now on")
                     MediaHttpBudget.close(c)
                     return null
@@ -1478,8 +1478,17 @@ object MiniaturaMotor {
         // Initialize all request/error state before constructor I/O can fail.
         fun lanesProprias(): Boolean = direto && !multiOk && mp4Index == null &&
             MediaHttpBudget.hasOwnLanes(try { URL(alvo).host } catch (_: Exception) { null })
-        fun hostSemMultiRange(): Boolean =
-            try { URL(alvo).host?.lowercase()?.let { it in semMultiRange } == true } catch (_: Exception) { false }
+        // This session's refusals, then the ones remembered across sessions (ThumbnailHostMemory): a remembered host
+        // also gets its own thumbnail slots at once.
+        fun hostSemMultiRange(): Boolean = try {
+            val h = URL(alvo).host?.lowercase()
+            when {
+                h == null -> false
+                h in semMultiRange -> true
+                ThumbnailHostMemory.refuses(h) -> { semMultiRange.add(h); MediaHttpBudget.allowThumbnailLanes(h); true }
+                else -> false
+            }
+        } catch (_: Exception) { false }
         init {
             pedir(0, 0)
             if (tamanho > (8L shl 30)) { janela = 2 shl 20; limite = 12L shl 20 }
