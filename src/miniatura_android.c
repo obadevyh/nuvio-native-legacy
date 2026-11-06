@@ -130,6 +130,12 @@ typedef struct {
   double folgaTopo; Uint32 folgaTopoEm;    // never carry another title's buffer ceiling
   int appendPronto;                       // direct tiles are immutable: subsequent checkpoints append only new ones
   int cpuFeitos; long cpuMs, cpuDecMs;     // CPU route: thumbnails made, average total / decode ms
+  // COPY-FIRST (06/11/2026): the direct engine run on a smaller copy that passed the check. Its keyframes are asked for
+  // at copy time = dA x play time + dB and every thumbnail is stored at play time; dUrl/dCab name the copy.
+  int dCopia; double dA, dB; char dUrl[4096], dCab[512]; int dAltura;
+  // Optimistic copy-first: thumbnails start at offset 0 while the screen check runs on its own thread.
+  // dCheck 0 none, 1 running, 2 accepted (tiles relabelled to the measured offset), 3 rejected (all discarded).
+  volatile int dCheck; pthread_t dCheckT; int dCheckRodando;
   volatile int parar;
   int vivo;
 } Job;
@@ -155,6 +161,10 @@ static MiniProgress progresso;
 static int motivoSem;            // M_FALHOU because: 0 the video would not open, 1 no smaller copy usable
    // generation whose set just completed (pPedir shows the notice)
 
+// Copy-first mapping (identity when the direct engine reads the playing file itself).
+static long dParaCopia(const Job *j, long t) { return j->dCopia ? (long)(j->dA * t + j->dB) : t; }
+static long dParaPlay(const Job *j, long p) { return j->dCopia ? (long)((p - j->dB) / j->dA) : p; }
+static void dMapear(const Job *j, long *t, int n) { if (j->dCopia) for (int i = 0; i < n; i++) t[i] = dParaCopia(j, t[i]); }
 // Called with mu held. Direct image ownership is independent of nominal grid positions.
 static int diretoCoverageComplete(const Job *j) { return j->direto && mini_coverage_complete(&j->coverage); }
 static void diretoRebuildCoverage(Job *j) {
@@ -806,7 +816,12 @@ static int escolherCopias(const Stream *play, Copia *out, long durMs, char *moti
   for (int i = 0; i < stream_n(); i++) {
     const Stream *c = stream_item(i);
     if (!c || i == stream_atual() || c->naoVideo || !c->url[0] || !strcmp(c->url, play->url)) continue;
-    if (!(c->emCache || c->cacheNativo)) { rej[R_CACHE]++; continue; }   // never start a download for thumbnails
+    // Never start a download for thumbnails: a link known not cached, or a debrid RESOLVE link not declared cached
+    // (opening it can make the service fetch the torrent). A plain file link (PenguPlay/R2, any direct HTTP host)
+    // has no cache state and is read like the playing one (06/11/2026: all 70 PenguPlay copies were "not-cached").
+    int resolve = strstr(c->url, "/resolve/") || strstr(c->url, "/playback/") || strstr(c->url, "streaming_provider") ||
+                  strstr(c->url, "/debrid/") || !c->url[0];
+    if (c->foraCache || (resolve && !(c->emCache || c->cacheNativo))) { rej[R_CACHE]++; continue; }
     unsigned long long tc = tamanho(c);
     int resOk = c->altura >= 480 && c->altura <= 1080 &&
                 (play->altura <= 0 || c->altura < play->altura ||
@@ -1809,16 +1824,33 @@ static void guardarTileDireto(Job *j, long p, unsigned char *jpg, int nj, int *f
 // was empty at the first scrub and downloads waited behind the CPU). Oldest first (the queue follows the coverage
 // stages); paused while the hardware decoder exists or the player is paused/scrubbing/buffering; full speed, slower
 // for a minute after contention. Fonte's entry points are synchronised on the Kotlin side.
-typedef struct {
+typedef struct CpuFaixa {
   Job *j; long long h; MiniMotor *cpu; long *pend; int *nPend; pthread_mutex_t *mp;
   _Atomic int pausa, fim, desligar, recusou, cuidado;
   long soma, decSoma, limite; int falhas, feitosAqui, semBloco, threads;
+  struct CpuFaixa *pai;      // a sibling worker (copy-first): its parent's flags rule it
+  MiniMotor *cpu2;           // the sibling's own decoder, opened with the parent's (closed by the parent)
 } CpuFaixa;
 static void *cpuTrabalho(void *u) {
   CpuFaixa *cf = u;
   Job *j = cf->j;
-  while (!cf->fim && !parou(j)) {
-    if (cf->pausa || cf->desligar) { usleep(200000); continue; }
+  CpuFaixa *ctl = cf->pai ? cf->pai : cf;   // a sibling follows its parent's pause/stop flags
+  // COPY-FIRST: a copy's whole grid goes through the CPU, so a second decoder thread takes from the same queue
+  // (06/11/2026: one thread at ~60 ms per 720p keyframe left decode on the critical path for 30 of 107 s)
+  CpuFaixa *irmao = NULL; pthread_t irmaoT; int irmaoRodando = 0;
+  if (!cf->pai && j->dCopia) {
+    irmao = malloc(sizeof *irmao);
+    if (irmao) {
+      memset(irmao, 0, sizeof *irmao);
+      irmao->j = j; irmao->h = cf->h; irmao->pend = cf->pend; irmao->nPend = cf->nPend; irmao->mp = cf->mp;
+      irmao->limite = cf->limite; irmao->threads = 1; irmao->pai = cf;
+      irmao->cpu = cf->cpu2;
+      if (irmao->cpu) irmaoRodando = pthread_create(&irmaoT, NULL, cpuTrabalho, irmao) == 0;
+      if (!irmaoRodando) { free(irmao); irmao = NULL; }
+    }
+  }
+  while (!ctl->fim && !parou(j)) {
+    if (ctl->pausa || ctl->desligar) { usleep(200000); continue; }
     long disp = memDisponivelKB(), precisaKB = (long)(mini_motor_memoria(cf->cpu, cf->threads) / 1024);
     if (disp >= 0 && disp - precisaKB < PISO_KB) { usleep(1000000); continue; }
     pthread_mutex_lock(cf->mp);
@@ -1831,7 +1863,7 @@ static void *cpuTrabalho(void *u) {
     if (!mPacoteCpu(cf->h, kf, &p, &pk, &npk)) {
       // no block to hand over (a layout the block reader does not take, measured 23/10 on a 1080p episode): the
       // hardware path reads it through the extractor at a confirmed pause. Not a CPU failure.
-      if (mFalhaRede(cf->h) == 2) cf->recusou = 1;
+      if (mFalhaRede(cf->h) == 2) ctl->recusou = 1;
       pthread_mutex_lock(cf->mp);
       cf->pend[(*cf->nPend)++] = kf;
       int soEsses = ++cf->semBloco >= *cf->nPend;
@@ -1842,7 +1874,7 @@ static void *cpuTrabalho(void *u) {
     cf->semBloco = 0;
     // A packet read may have blocked across a pause/handover. Do not begin a
     // fresh decode after admission was revoked; preserve the queued keyframe.
-    if (cf->fim || cf->pausa || parou(j)) {
+    if (ctl->fim || ctl->pausa || parou(j)) {
       free(pk);
       pthread_mutex_lock(cf->mp);
       cf->pend[(*cf->nPend)++] = kf;
@@ -1857,20 +1889,20 @@ static void *cpuTrabalho(void *u) {
       pthread_mutex_lock(cf->mp);
       cf->pend[(*cf->nPend)++] = kf;              // the hardware burst takes it later
       pthread_mutex_unlock(cf->mp);
-      if (++cf->falhas >= 5 && !cf->desligar) { cf->desligar = 1; printf("[miniatura] cpu route: 5 failures (%s), off for this title\n", e); fflush(stdout); }
+      if (++cf->falhas >= 5 && !ctl->desligar) { ctl->desligar = 1; printf("[miniatura] cpu route: 5 failures (%s), off for this title\n", e); fflush(stdout); }
       usleep(200000);
       continue;
     }
-    j->cpuFeitos++; cf->soma += q.totalMs; cf->decSoma += q.decodMs;
-    j->cpuMs = cf->soma / j->cpuFeitos; j->cpuDecMs = cf->decSoma / j->cpuFeitos;
+    __atomic_add_fetch(&j->cpuFeitos, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&ctl->soma, (long)q.totalMs, __ATOMIC_RELAXED); __atomic_add_fetch(&ctl->decSoma, (long)q.decodMs, __ATOMIC_RELAXED);
+    j->cpuMs = ctl->soma / j->cpuFeitos; j->cpuDecMs = ctl->decSoma / j->cpuFeitos;
     if (j->cpuFeitos <= 3 || j->cpuFeitos % 50 == 0) {
       printf("[miniatura] cpu route: %ld s in %u ms (decode %u ms, resize %u ms, colour+pack %u ms, JPEG %u ms, keyframe %ld KB), %d made\n", p / 1000, q.totalMs,
              q.decodMs, q.resizeMs, q.colourMs, q.jpegMs, q.bytesPacote / 1024, j->cpuFeitos);
       fflush(stdout);
     }
-    guardarTileDireto(j, p, jpg, nj, &cf->feitosAqui);
+    guardarTileDireto(j, dParaPlay(j, p), jpg, nj, &cf->feitosAqui);
     if (j->cpuFeitos == CPU_AMOSTRAS && j->cpuMs > cf->limite) {
-      cf->desligar = 1;
+      ctl->desligar = 1;
       printf("[miniatura] cpu route: %ld ms per thumbnail on this device (> %ld): off, hardware burst at a confirmed pause\n",
              j->cpuMs, cf->limite);
       fflush(stdout);
@@ -1878,8 +1910,11 @@ static void *cpuTrabalho(void *u) {
     // Full speed (30 ms between tiles, as Namer03's engine runs on TVs): no measured strain ever came from CPU
     // decoding (23/10 runs: 0 underruns, 0 dropped frames; the hitches were hardware-decoder creation and GC). Half
     // the frame's time as a rest only for a minute after real contention (dropped frames / audio underrun).
-    usleep(cf->cuidado ? (useconds_t)q.totalMs * 500 : 30000);
+    usleep(ctl->cuidado ? (useconds_t)q.totalMs * 500 : 30000);
   }
+  if (irmaoRodando) { pthread_join(irmaoT, NULL); j->cpuFeitos += 0; }
+  if (irmao) free(irmao);
+  if (!cf->pai && cf->cpu2) { mini_motor_fechar(cf->cpu2); cf->cpu2 = NULL; }
   mini_dovi_gpu_close(); // release on the GL-owning CPU worker before it exits
   return NULL;
 }
@@ -1954,13 +1989,24 @@ static long long adotarPre(Job *j, int *dec) {
 static int trabalharDireto(Job *j, long long *hA) {
   char motivo[96] = "";
   int decPre = 0;
-  if (!*hA) *hA = adotarPre(j, &decPre);
+  if (!*hA && !j->dCopia) *hA = adotarPre(j, &decPre);
   if (*hA) { printf("[miniatura] direct: using the pre-warmed session (decoder %s)\n", decPre ? "ready" : "not created"); fflush(stdout); }
-  if (!*hA) *hA = mAbrirDireto(j->urlA, j->cabA);
-  if (!*hA) { printf("[miniatura] direct: the playing file cannot be used (see the engine log): trying the copies\n"); fflush(stdout); return 0; }
-  snprintf(origem, sizeof origem, "playing %dp (direct)", j->alturaA);
+  if (!*hA) *hA = j->dCopia ? mAbrirDireto(j->dUrl, j->dCab) : mAbrirDireto(j->urlA, j->cabA);
+  if (!*hA) {
+    printf("[miniatura] direct: the %s cannot be used (see the engine log)%s\n", j->dCopia ? "checked copy" : "playing file",
+           j->dCopia ? "" : ": trying the copies");
+    fflush(stdout);
+    return 0;
+  }
   pthread_mutex_lock(&mu); j->direto = 1; pthread_mutex_unlock(&mu);
-  snprintf(j->escolhida, sizeof j->escolhida, "playing file %dp (direct, GPU)", j->alturaA);
+  if (j->dCopia) {
+    snprintf(origem, sizeof origem, "%dp copy (fast)", j->dAltura);
+    printf("[miniatura] copy-first: direct engine on the %dp copy, t_copy = %.4f x t_play %+.2fs\n", j->dAltura, j->dA, j->dB / 1000);
+    fflush(stdout);
+  } else {
+    snprintf(origem, sizeof origem, "playing %dp (direct)", j->alturaA);
+    snprintf(j->escolhida, sizeof j->escolhida, "playing file %dp (direct, GPU)", j->alturaA);
+  }
   snprintf(j->arq, sizeof j->arq, "%s", j->arqDireto);
   if (carregarInformado(j)) { avisoPronto = j->g; return 1; }
   falhasSeguidas = 0; decodSeguidas = 0;
@@ -2005,6 +2051,7 @@ static int trabalharDireto(Job *j, long long *hA) {
   long fila[LOTE];
   printf("[miniatura] direct: thumbnails from the playing file, stages scrub > playhead > 60 s > 30 s > 10 s\n"); fflush(stdout);
   while (!parou(j)) {
+    if (j->dCopia && j->dCheck == 3) { snprintf(motivo, sizeof motivo, "copy rejected by the screen check"); break; }
     if (evErro != erros0) {                       // the player failed while we were decoding: never risk it again
       snprintf(motivo, sizeof motivo, "player error during direct mode");
       break;
@@ -2102,7 +2149,7 @@ static int trabalharDireto(Job *j, long long *hA) {
     int liberado = decodificou;
     if (liberado && nPend > 0) {
       // the queued keyframe nearest to where the user is (scrub target, else the playhead) first
-      long onde = scrubbing ? posMs : playheadMs, melhor = -1;
+      long onde = dParaCopia(j, scrubbing ? posMs : playheadMs), melhor = -1;   // pend holds copy-time keyframes
       int iM = -1;
       pthread_mutex_lock(&mp);
       if (nPend <= 0) { pthread_mutex_unlock(&mp); continue; }
@@ -2115,6 +2162,7 @@ static int trabalharDireto(Job *j, long long *hA) {
       pthread_mutex_unlock(&mp);
       long p; unsigned char *jpg = NULL; int nj = 0;
       int ok = mQuadroDireto(*hA, kf, &p, &jpg, &nj);
+      if (ok) p = dParaPlay(j, p);
       decodificou = mDecoderPronto(*hA);
       if (!ok || !jpg) {
         pthread_mutex_lock(&mu);
@@ -2141,7 +2189,7 @@ static int trabalharDireto(Job *j, long long *hA) {
                covered, j->n, j->feitos, nPend, lotes, folgaSeg(j), mPerdidos() - j->perdidos0, mHeapLivre(), mRitmo());
         fflush(stdout);
       }
-      if (feitosAqui && feitosAqui % 50 == 0) salvar(j, 0);
+      if (feitosAqui && feitosAqui % 50 == 0 && j->dCheck != 1 && j->dCheck != 3) salvar(j, 0);   // never an unverified copy
       if (j->cob30 && !j->resumido) resumo(j, j->t0);
       continue;
     }
@@ -2160,6 +2208,11 @@ static int trabalharDireto(Job *j, long long *hA) {
           MiniConfig config; mini_motor_config_padrao(&config);
           config.larguraSaida = j->larguraSaida;
           mini_motor_config(cf.cpu, &config);
+          if (j->dCopia && !classe) {           // copy-first: a second decoder for the sibling worker
+            char e2[96] = "";
+            cf.cpu2 = mini_motor_abrir_pacotes(cpuCod != 2, (int)inf[1], (int)inf[2], cpuCod == 3 ? 2 : inf[3] != 0, e2, sizeof e2);
+            if (cf.cpu2) mini_motor_config(cf.cpu2, &config);
+          }
           cf.j = j; cf.h = *hA; cf.pend = pend; cf.nPend = &nPend; cf.mp = &mp; cf.limite = cpuLimite;
           // 2 slice/WPP threads for pictures above 1080p (Shield: one A57 core took ~400 ms per 4K keyframe; x265
           // streams are WPP-coded, so rows decode in parallel), 1 below (~95 ms already)
@@ -2188,9 +2241,9 @@ static int trabalharDireto(Job *j, long long *hA) {
       j->tentado[k] = 1; // claim only; a completed image binding proves coverage
       mini_coverage_mark(&j->coverage, k, MINI_COVER_PENDING);
       pthread_mutex_unlock(&mu);
-      long kf = mSlotKeyframe(*hA, (long)mini_coverage_target_ms(&j->coverage, k));
+      long kf = mSlotKeyframe(*hA, dParaCopia(j, (long)mini_coverage_target_ms(&j->coverage, k)));
       pthread_mutex_lock(&mu);
-      if (kf == -2 && k > 0) kf = k * GRADE_MS; // retain non-indexed extractor fallback
+      if (kf == -2 && k > 0) kf = dParaCopia(j, k * GRADE_MS); // retain non-indexed extractor fallback
       j->slotKey[k] = kf;
       if (kf < 0) { mini_coverage_mark(&j->coverage, k, MINI_COVER_UNAVAILABLE); continue; }
       if (j->slotState[k] == MINI_COVER_COVERED) continue;
@@ -2250,6 +2303,7 @@ static int trabalharDireto(Job *j, long long *hA) {
       int nHeaders = 0;
       for (int i = 16; i < count; i++) headers[nHeaders++] = future[i];
       if (bridge) nHeaders += sondasDensas(j, headers + nHeaders, 64 - nHeaders);
+      dMapear(j, future, count); dMapear(j, headers, nHeaders);   // play-time slots -> copy time
       int payloadCount = resolverSondas(*hA, future, count < 16 ? count : 16);
       nHeaders = resolverSondas(*hA, headers, nHeaders);
       int r = mPrepararSondas(*hA, fila, nf, future, payloadCount, headers, nHeaders);
@@ -2278,6 +2332,16 @@ static int trabalharDireto(Job *j, long long *hA) {
   }
 #endif
   mSoltar(*hA);
+  if (j->dCheckRodando) {                          // the copy is only kept once the check said so
+    if (j->dCheck == 1) { printf("[miniatura] copy-first: engine done, waiting for the screen check\n"); fflush(stdout); }
+    pthread_join(j->dCheckT, NULL);
+    j->dCheckRodando = 0;
+  }
+  if (j->dCopia && j->dCheck == 3) {
+    printf("[miniatura] direct: copy pass stopped (%d images discarded)\n", j->feitos); fflush(stdout);
+    j->resumido = 0;
+    return 1;
+  }
   pthread_mutex_lock(&mu);
   if (!nPend) for (int k = 0; k < j->n; k++) if (j->slotState[k] == MINI_COVER_PENDING)
     mini_coverage_mark(&j->coverage, k, MINI_COVER_FAILED); // no decode remains to supply this binding
@@ -2291,6 +2355,131 @@ static int trabalharDireto(Job *j, long long *hA) {
   diretoCoberturaRelatorio(j);
   j->resumido = 0;
   return 1;
+}
+
+// Copy-first: the first copy (smallest first, escolherCopias) whose header is usable and whose runtime is within
+// TELA_DUR_IGUAL_MS passes the screen check (what the player shows against the copy's exact frames: no 4K decode).
+// 1 = j->dCopia/dA/dB/dUrl set to it. The check's own session is closed; the engine opens the RESOLVED link (alvo), so
+// no second debrid link is minted.
+// The screen check on its own thread while the engine already makes thumbnails at offset 0. Accepted: every tile is
+// relabelled to the measured offset (exact: a tile's copy time is its play time + the old offset). Rejected: the
+// engine stops and trabalhar() discards the copy's tiles.
+typedef struct { Job *j; long long hB; long durB; } CheckCopia;
+static void *checarCopia(void *u) {
+  CheckCopia *c = u;
+  Job *j = c->j;
+  Uint32 c0 = SDL_GetTicks();
+  Mapa m = {1.0, 0.0, 0.0, 0};
+  int r = conferirTela(j, c->hB, c->durB, &m);
+  mFechar(c->hB);
+  pthread_mutex_lock(&mu);
+  if (r == 1) {
+    double antigo = j->dB;
+    int n = 0;
+    for (int k = 0; k < j->n; k++) {
+      Tile *t = &j->tiles[k];
+      if (!t->jpg) continue;
+      t->pts = (long)(t->pts + antigo - m.b); t->revision++; t->salvo = 0; n++;
+    }
+    j->dB = m.b; j->offset = m.b; j->appendPronto = 0;
+    diretoRebuildCoverage(j);
+    j->dCheck = 2;
+    printf("[miniatura] copy-first: check ACCEPTED in %.1f s while generating: %d thumbnails relabelled by %+.2fs\n",
+           (SDL_GetTicks() - c0) / 1000.0, n, -(m.b - antigo) / 1000);
+  } else {
+    j->dCheck = 3;
+    printf("[miniatura] copy-first: check %s after %.1f s: the copy's thumbnails are discarded\n",
+           r == 0 ? "REJECTED" : "found no screen frames", (SDL_GetTicks() - c0) / 1000.0);
+  }
+  size_t o = strlen(j->motivos);
+  snprintf(j->motivos + o, sizeof j->motivos - o, " | check:%s", r == 1 ? "ACCEPTED" : r == 0 ? "rejected" : "no-screen");
+  pthread_mutex_unlock(&mu);
+  fflush(stdout);
+  free(c);
+  return NULL;
+}
+// Everything the direct engine made, gone (a copy the check rejected): the playing file starts from nothing.
+static void limparDireto(Job *j) {
+  pthread_mutex_lock(&mu);
+  for (int k = 0; k < j->n; k++) {
+    free(j->tiles[k].jpg); j->tiles[k].jpg = NULL; j->tiles[k].n = 0; j->tiles[k].pts = 0;
+    j->tiles[k].prov = 0; j->tiles[k].salvo = 0; j->tiles[k].revision++;
+    j->tentado[k] = 0; j->slotKey[k] = -1; j->framePts[k] = -1;
+  }
+  j->feitos = 0; j->primeiro = 0; j->cob60 = j->cob30 = 0; j->appendPronto = 0;
+  mini_coverage_init(&j->coverage, j->n, j->dur, j->slotFrame, j->slotState);
+  pthread_mutex_unlock(&mu);
+  if (j->arq[0]) remove(j->arq);
+}
+
+static int escolherCopiaRapida(Job *j) {
+  printf("[miniatura] copy-first: playing %dp %.1f min, %d smaller cop%s (%s)\n", j->alturaA, j->dur / 60000.0, j->nCopias,
+         j->nCopias == 1 ? "y" : "ies", j->motivos);
+  fflush(stdout);
+  esperarPlayer(j);
+  for (int c = 0; c < j->nCopias && !parou(j); c++) {
+    Uint32 c0 = SDL_GetTicks();
+    long long hB = mAbrir(j->copias[c].url, j->copias[c].cab, 1);
+    size_t o = strlen(j->motivos);
+    if (!hB) {
+      printf("[miniatura] copy-first: copy %d (%dp) would not open\n", c + 1, j->copias[c].altura); fflush(stdout);
+      snprintf(j->motivos + o, sizeof j->motivos - o, " | c%d:no-open", c + 1);
+      continue;
+    }
+    long long ib[6];
+    char alvo[4096];
+    mInfo(hB, ib);
+    mAlvo(hB, j->copias[c].url, alvo, sizeof alvo);
+    printf("[miniatura] copy-first: checking copy %d: %lldx%lld %.1f min, %.0f MB\n", c + 1, ib[1], ib[2], ib[0] / 60000.0,
+           j->copias[c].tamanho / 1048576.0);
+    fflush(stdout);
+    const char *por = NULL;
+    Mapa mapa = {1.0, 0.0, 0.0, 0};
+    if (!ib[5]) por = "codec";
+    else if (ib[0] <= 0) por = "no-duration";
+    else if (labs((long)ib[0] - j->dur) > TELA_DUR_IGUAL_MS) por = "runtime";
+    else if (labs((long)ib[0] - j->dur) <= OTIMISTA_DUR_MS) {
+      // (nearly) the same length: start NOW at offset 0, the check runs alongside (06/11/2026: the blocking check left
+      // the bar empty for the first 46 s on TorBox Dune)
+      CheckCopia *cc = malloc(sizeof *cc);
+      if (cc) {
+        cc->j = j; cc->hB = hB; cc->durB = (long)ib[0];
+        j->dCheck = 1;
+        j->dCheckRodando = pthread_create(&j->dCheckT, NULL, checarCopia, cc) == 0;
+        if (!j->dCheckRodando) { free(cc); j->dCheck = 0; }
+      }
+      if (j->dCheckRodando) {
+        j->dCopia = 1; j->dA = 1.0; j->dB = 0.0; j->dAltura = j->copias[c].altura;
+        snprintf(j->dUrl, sizeof j->dUrl, "%s", alvo[0] ? alvo : j->copias[c].url);
+        snprintf(j->dCab, sizeof j->dCab, "%s", j->copias[c].cab);
+        snprintf(j->escolhida, sizeof j->escolhida, "%dp %.0f MB %s (copy-first, optimistic)", j->copias[c].altura,
+                 j->copias[c].tamanho / 1048576.0, j->copias[c].nome);
+        printf("[miniatura] copy-first: copy %d same length (%+.1f s): thumbnails start now, screen check alongside (%.1f s in)\n",
+               c + 1, (ib[0] - j->dur) / 1000.0, (SDL_GetTicks() - c0) / 1000.0);
+        fflush(stdout);
+        return 1;
+      }
+      int tela = conferirTela(j, hB, (long)ib[0], &mapa);
+      if (tela != 1) por = tela == 0 ? "screen-rejected" : "no-screen-frames";
+    } else {
+      int tela = conferirTela(j, hB, (long)ib[0], &mapa);
+      if (tela != 1) por = tela == 0 ? "screen-rejected" : "no-screen-frames";
+    }
+    mFechar(hB);
+    printf("[miniatura] copy-first: copy %d %s in %.1f s\n", c + 1, por ? por : "ACCEPTED", (SDL_GetTicks() - c0) / 1000.0);
+    fflush(stdout);
+    snprintf(j->motivos + o, sizeof j->motivos - o, " | c%d:%s", c + 1, por ? por : "ACCEPTED");
+    if (por) continue;
+    j->dCopia = 1; j->dA = mapa.a; j->dB = mapa.b; j->dAltura = j->copias[c].altura;
+    snprintf(j->dUrl, sizeof j->dUrl, "%s", alvo[0] ? alvo : j->copias[c].url);
+    snprintf(j->dCab, sizeof j->dCab, "%s", j->copias[c].cab);
+    j->offset = mapa.b;
+    snprintf(j->escolhida, sizeof j->escolhida, "%dp %.0f MB %s (copy-first, screen %+.2fs)", j->copias[c].altura,
+             j->copias[c].tamanho / 1048576.0, j->copias[c].nome, mapa.b / 1000);
+    return 1;
+  }
+  printf("[miniatura] copy-first: no copy passed: direct mode on the playing file\n"); fflush(stdout);
+  return 0;
 }
 
 static void *trabalhar(void *u) {
@@ -2320,7 +2509,42 @@ static void *trabalhar(void *u) {
   // used directly (Dolby Vision profile 5, a codec other than H.264/HEVC). The 22/10 failure next to a 1080p remux
   // (player decoder 4003) came from a burst of short-lived decoders; direct mode keeps ONE, created at a pause/scrub.
   int diretoOk = !(bits & 8), diretoTentado = 0;
-  if (diretoOk) {
+  // COPY-FIRST (06/11/2026, after reading Nuvio Arc): a 4K title's thumbnails from a smaller copy in the source list
+  // once the screen check confirms it, made by the SAME fast direct engine (lanes, multi-range, look-ahead, map) at
+  // copy time = a x play time + b. A 1080p keyframe is ~5x fewer bytes and decodes on the CPU in ~1/4 of the time.
+  // No copy, or none passing: direct mode on the playing file as before. Bit 1048576 turns copy-first off.
+  if (j->alturaA > 1080 && (j->nCopias == 0 || (bits & 1048576))) {
+    printf("[miniatura] copy-first: not used (%s; %s)\n", (bits & 1048576) ? "off by debug bit" : "no smaller copy", j->motivos);
+    fflush(stdout);
+  }
+  if (diretoOk && !(bits & 1048576) && j->alturaA > 1080 && j->nCopias > 0 && !parou(j)) {
+    pthread_mutex_lock(&mu); j->direto = 1; pthread_mutex_unlock(&mu);
+    snprintf(j->arq, sizeof j->arq, "%s", j->arqDireto);
+    if (carregarInformado(j)) { avisoPronto = j->g; goto fim; }   // a complete saved set: no network at all
+    pthread_mutex_lock(&mu); j->direto = 0; pthread_mutex_unlock(&mu);
+    { int d = 0; long long pre = adotarPre(j, &d); if (pre) mFechar(pre); }   // the 4K pre-warm is not needed
+    if (escolherCopiaRapida(j)) {
+      diretoTentado = 1;
+      int r = trabalharDireto(j, &hA);
+      if (r && j->dCheck == 3 && !parou(j)) {      // optimistic copy rejected: its tiles go, the playing file starts
+        if (hA) { mFechar(hA); hA = 0; }
+        limparDireto(j);
+        j->dCopia = 0; j->dCheck = 0;
+        pthread_mutex_lock(&mu); j->direto = 0; pthread_mutex_unlock(&mu);
+        printf("[miniatura] copy-first: rejected copy discarded: direct mode on the playing file\n"); fflush(stdout);
+        trabalharDireto(j, &hA);
+        goto fim;
+      }
+      if (r) goto fim;
+      printf("[miniatura] copy-first: the copy would not open in the direct engine: direct mode on the playing file\n");
+      fflush(stdout);
+      if (hA) { mFechar(hA); hA = 0; }
+      j->dCopia = 0;
+      pthread_mutex_lock(&mu); j->direto = 0; pthread_mutex_unlock(&mu);
+      diretoTentado = 0;
+    }
+  }
+  if (diretoOk && !diretoTentado) {
     diretoTentado = 1;                           // no esperarPlayer: the decoder goes in during the opening load
     if (trabalharDireto(j, &hA)) goto fim;
     if (hA) { mFechar(hA); hA = 0; }
@@ -2560,6 +2784,7 @@ static void *trabalhar(void *u) {
     mFechar(f1.h); mFechar(f2.h);
   }
 fim:
+  if (j->dCheckRodando) { pthread_join(j->dCheckT, NULL); j->dCheckRodando = 0; }   // never outlives the job
   (*timelineEnv)->CallStaticVoidMethod(timelineEnv, cls, jPipelineStop);
   if ((*timelineEnv)->ExceptionCheck(timelineEnv)) (*timelineEnv)->ExceptionClear(timelineEnv);
   mFechar(hB);

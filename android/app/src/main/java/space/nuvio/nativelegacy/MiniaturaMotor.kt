@@ -122,7 +122,9 @@ object MiniaturaMotor {
         // keyframes per multi-range request: as many as ~4 MB of windows (4-32)
         // direct mode with exact block ranges: ~6 MB of keyframes per request (round trips were the limit once only the
         // keyframes were fetched: 2.8 keyframes per request, measured 23/10)
-        fun loteIdeal(): Int = if (direto && nalTam > 0 && media > 0) ((8 shl 20) / media).coerceIn(4, 16)
+        // up to 32 (06/11/2026 copy-first): a 720p copy's ~80 KB keyframes filled only 1.3 MB per 16, so ~0.6 s round
+        // trips set the pace (~12/s); 4K keyframes (~700 KB) stay at ~11 per request by the byte budget
+        fun loteIdeal(): Int = if (direto && nalTam > 0 && media > 0) ((8 shl 20) / media).coerceIn(4, 32)
             else if (direto) ((4 shl 20) / janela).coerceIn(2, 5) else ((4 shl 20) / janela).coerceIn(4, 32)
 
         // METADATA IS NEVER EVICTED: the header read when the file opens and the Cues (the keyframe index, usually at
@@ -347,6 +349,10 @@ object MiniaturaMotor {
                     trilhaV = m.trackV; nalTam = m.nalLength; cuesIni = m.cuesIni; cuesFim = m.cuesFim
                     for ((k, b) in m.blocks) { iniBloco[k] = b[0]; fimBloco[k] = b[1]; mapaBlocos.add(k) }
                     mapaCarregado = m.blocks.size
+                    // the typical keyframe from the map: with every block known no keyframe is ever measured, and a
+                    // zero mean dropped batches to 4 keyframes (06/11/2026: 110 of 152 requests on a 720p copy)
+                    if (media == 0 && m.blocks.isNotEmpty())
+                        media = (m.blocks.values.sumOf { it[1] - it[0] } / m.blocks.size).coerceIn(16L * 1024, 8L shl 20).toInt()
                     cues = m.cues
                     Log.i(TAG, "[thumb-map] loaded: ${m.cues.size / 3} cues, ${m.blocks.size} located blocks, NAL length $nalTam: index read skipped")
                     return cues
