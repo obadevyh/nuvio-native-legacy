@@ -677,6 +677,14 @@ static long long mRitmo(void) {
   return r;
 }
 
+static long rssKB(void) {                        // this process's resident memory, for the decoder-closure log
+  long total = 0, rss = 0;
+  FILE *f = fopen("/proc/self/statm", "r");
+  if (!f) return -1024;
+  int n = fscanf(f, "%ld %ld", &total, &rss);
+  fclose(f);
+  return n == 2 ? rss * 4 : -1024;               // 4 KB pages
+}
 static long memDisponivelKB(void) {
   FILE *f = fopen("/proc/meminfo", "r");
   char l[128]; long v = -1;
@@ -1897,16 +1905,19 @@ static void *cpuTrabalho(void *u) {
   // rebuffers, same download, ~70 MB more). It is expendable: see the give-way check below.
   CpuFaixa *irmao = NULL; pthread_t irmaoT; int irmaoRodando = 0, decidido = cf->pai != NULL;
   while (!ctl->fim && !parou(j)) {
-    if (ctl->pausa || ctl->desligar) { usleep(200000); continue; }
     long disp = memDisponivelKB(), precisaKB = (long)(mini_motor_memoria(cf->cpu, cf->threads) / 1024);
     // Gives way when memory runs short or playback is in trouble, finishing nothing new: the decoder's memory goes back
-    // now and it stays off for this title (the first decoder carries on).
-    if (cf->pai && (ctl->cuidado || (disp >= 0 && disp < SEGUNDO_SOLTA_KB) || ctl->segundoOff)) {
+    // now and it stays off for this title (the first decoder carries on). Checked BEFORE the pause wait: a pause is
+    // often the trouble itself (buffering, the contention cooldown), and the main loop's memory floor is not reached
+    // while the player buffers.
+    if (cf->pai && (ctl->cuidado || ctl->desligar || (disp >= 0 && disp < SEGUNDO_SOLTA_KB) || ctl->segundoOff)) {
+      const char *porque = ctl->segundoOff || ctl->cuidado ? ", playback contention" : ctl->desligar ? ", CPU route off" : "";
       ctl->segundoOff = 1;
-      printf("[miniatura] cpu route: second decoder gives way (%ld MB free%s)\n", disp / 1024, ctl->cuidado ? ", playback contention" : "");
+      printf("[miniatura] cpu route: second decoder gives way (%ld MB free%s)\n", disp / 1024, porque);
       fflush(stdout);
       break;
     }
+    if (ctl->pausa || ctl->desligar) { usleep(200000); continue; }
     if (disp >= 0 && disp - precisaKB < PISO_KB) { usleep(1000000); continue; }
     pthread_mutex_lock(cf->mp);
     if (*cf->nPend <= 0) { pthread_mutex_unlock(cf->mp); usleep(200000); continue; }
@@ -1991,7 +2002,13 @@ static void *cpuTrabalho(void *u) {
   }
   if (irmaoRodando) pthread_join(irmaoT, NULL);
   free(irmao);
-  if (cf->pai) { mini_motor_fechar(cf->cpu); ctl->cpu2 = NULL; }   // the sibling's decoder goes back as it ends
+  if (cf->pai) {                                 // the sibling's decoder goes back as it ends
+    long livre0 = memDisponivelKB(), rss0 = rssKB();
+    mini_motor_fechar(cf->cpu); ctl->cpu2 = NULL;
+    printf("[miniatura] cpu route: second decoder closed (free %ld -> %ld MB, process %ld -> %ld MB)\n",
+           livre0 / 1024, memDisponivelKB() / 1024, rss0 / 1024, rssKB() / 1024);
+    fflush(stdout);
+  }
   else if (cf->cpu2) { mini_motor_fechar(cf->cpu2); cf->cpu2 = NULL; }
   mini_dovi_gpu_close(); // release on the GL-owning CPU worker before it exits
   return NULL;
@@ -2125,7 +2142,7 @@ static int trabalharDireto(Job *j, long long *hA) {
   long *pend = malloc(sizeof(long) * (size_t)j->n);
   if (!pend) { printf("[miniatura] direct: out of memory\n"); fflush(stdout); return 1; }
   // Account for zero too: use an early positive sync frame or record an explicit gap.
-  int etapaMax = 3, lotes = 0, feitosAqui = 0, erros0 = evErro;
+  int etapaMax = 3, lotes = 0, feitosAqui = 0, erros0 = evErro, avisouBuffer = 0;
   long fila[LOTE];
   printf("[miniatura] direct: thumbnails from the playing file, stages scrub > playhead > 60 s > 30 s > 10 s\n"); fflush(stdout);
   while (!parou(j)) {
@@ -2145,14 +2162,27 @@ static int trabalharDireto(Job *j, long long *hA) {
 #endif
     int pausaAdmitida = mini_pause_admit(&admissao, SDL_GetTicks(), video_pausa_confirmada(), scrubbing, bufferando);
     if (video_reconectando() || video_falhou()) { mSoltar(*hA); decodificou = 0; esperarPlayer(j); continue; }
-    if (bufferando || folgaBaixa(j)) { esperarPlayer(j); continue; }
     long disp = memDisponivelKB();
     if (disp >= 0 && (j->memMin < 0 || disp < j->memMin)) j->memMin = disp;
+    // While the player buffers, wake every second so the memory floor below still applies (a long buffer used to keep
+    // this loop inside esperarPlayer, with the CPU decoder holding its memory below the floor).
+    if ((bufferando || folgaBaixa(j)) && !(disp >= 0 && disp < PISO_KB)) {
+      if (!avisouBuffer) { printf("[miniatura] waiting: the player is buffering/reconnecting\n"); fflush(stdout); avisouBuffer = 1; }
+      dormirGate(j, 1000);
+      continue;
+    }
+    avisouBuffer = 0;
     if (disp >= 0 && disp < PISO_KB) {
 #ifdef NV_MINI_FFMPEG
       cf.pausa = 1;
       if (cpuRodando) { cf.fim = 1; pthread_join(cpuT, NULL); cpuRodando = 0; }
-      if (cf.cpu) { mini_motor_fechar(cf.cpu); cf.cpu = NULL; }
+      if (cf.cpu) {
+        long livre0 = memDisponivelKB(), rss0 = rssKB();
+        mini_motor_fechar(cf.cpu); cf.cpu = NULL;
+        printf("[miniatura] cpu route: memory floor: decoder closed (free %ld -> %ld MB, process %ld -> %ld MB)\n",
+               livre0 / 1024, memDisponivelKB() / 1024, rss0 / 1024, rssKB() / 1024);
+        fflush(stdout);
+      }
       cf.fim = 0;
 #endif
       if (mDecoderPronto(*hA)) printf("[miniatura] direct: memory floor: releasing hardware, no automatic recreation\n");
@@ -2168,6 +2198,9 @@ static int trabalharDireto(Job *j, long long *hA) {
     if (mAudioFalhas() != audioAntes) {
       audioAntes = mAudioFalhas();
       j->contencoes++; ultimaContencao = SDL_GetTicks();
+#ifdef NV_MINI_FFMPEG
+      cf.segundoOff = 1;                          // the second decoder goes now, not after the cooldown
+#endif
       printf("[miniatura] direct: player audio underrun while decoding: releasing the decoder, pause 20 s (%d/%d)\n",
              j->contencoes, DIR_CONTENCOES_MAX);
       fflush(stdout);
@@ -2192,6 +2225,9 @@ static int trabalharDireto(Job *j, long long *hA) {
       if (caindo && d < DIR_CONTENCAO_QUADROS && !scrubbing) printf("[miniatura] direct: player buffer dipped to %.1f s (not counted)\n", f);
       if (d >= DIR_CONTENCAO_QUADROS && !scrubbing && !mSeekRecente()) {
         j->contencoes++; ultimaContencao = SDL_GetTicks();
+#ifdef NV_MINI_FFMPEG
+      cf.segundoOff = 1;                          // the second decoder goes now, not after the cooldown
+#endif
         printf("[miniatura] direct: %s while decoding: releasing the decoder, pause 20 s (%d/%d)\n",
                caindo ? "player buffer draining" : "player dropping frames", j->contencoes, DIR_CONTENCOES_MAX);
         printf("[miniatura] direct: dropped %lld frames in 10 s, buffer %.1f s\n", d, f);
