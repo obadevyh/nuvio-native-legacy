@@ -2161,12 +2161,13 @@ static int trabalharDireto(Job *j, long long *hA) {
                video_reconectando() || video_falhou() || folgaBaixa(j);
 #endif
     int pausaAdmitida = mini_pause_admit(&admissao, SDL_GetTicks(), video_pausa_confirmada(), scrubbing, bufferando);
-    if (video_reconectando() || video_falhou()) { mSoltar(*hA); decodificou = 0; esperarPlayer(j); continue; }
     long disp = memDisponivelKB();
     if (disp >= 0 && (j->memMin < 0 || disp < j->memMin)) j->memMin = disp;
-    // While the player buffers, wake every second so the memory floor below still applies (a long buffer used to keep
-    // this loop inside esperarPlayer, with the CPU decoder holding its memory below the floor).
-    if ((bufferando || folgaBaixa(j)) && !(disp >= 0 && disp < PISO_KB)) {
+    int reconectando = video_reconectando() || video_falhou();
+    if (reconectando) { mSoltar(*hA); decodificou = 0; }
+    // While the player buffers or reconnects, wake every second so the memory floor below still applies (a long wait
+    // used to keep this loop inside esperarPlayer, with the CPU decoder holding its memory below the floor).
+    if ((reconectando || bufferando || folgaBaixa(j)) && !(disp >= 0 && disp < PISO_KB)) {
       if (!avisouBuffer) { printf("[miniatura] waiting: the player is buffering/reconnecting\n"); fflush(stdout); avisouBuffer = 1; }
       dormirGate(j, 1000);
       continue;
