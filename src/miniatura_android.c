@@ -132,6 +132,7 @@ typedef struct {
   double folgaTopo; Uint32 folgaTopoEm;    // never carry another title's buffer ceiling
   int appendPronto;                       // direct tiles are immutable: subsequent checkpoints append only new ones
   int cpuFeitos; long cpuMs, cpuDecMs;     // CPU route: thumbnails made, average total / decode ms
+  int cpuDoisDecoders;                     // a second decoder ran on this title
   // COPY-FIRST (06/11/2026): the direct engine run on a smaller copy that passed the check. Its keyframes are asked for
   // at copy time = dA x play time + dB and every thumbnail is stored at play time; dUrl/dCab name the copy.
   int dCopia; double dA, dB; char dUrl[4096], dCab[512]; int dAltura;
@@ -1796,6 +1797,8 @@ static int restamNaEtapa(const Job *j, int passo) {
 #define CPU_MAX_MS_HD 1200
 #define CPU_MAX_MS_4K 2500
 #define CPU_AMOSTRAS 3                   // thumbnails before a title's own measurement decides
+#define SEGUNDO_SOLTA_KB (400L * 1024)    // below this MemAvailable the second decoder gives way (the floor is 300 MB)
+#define SEGUNDO_4K_MIN_KB (500L * 1024)   // MemAvailable needed for a second 4K decoder (the 300 MB floor + a margin; each costs ~70 MB)
 typedef struct { double ms[2]; int n[2]; } PerfilCpu;
 static void perfilCaminho(char *out, size_t n) {
   char dir[512];
@@ -1843,30 +1846,67 @@ typedef struct CpuFaixa {
   Job *j; long long h; MiniMotor *cpu; long *pend; int *nPend; pthread_mutex_t *mp;
   _Atomic int pausa, fim, desligar, recusou, cuidado;
   long soma, decSoma, limite; int falhas, feitosAqui, semBloco, threads;
-  struct CpuFaixa *pai;      // a sibling worker (copy-first): its parent's flags rule it
-  MiniMotor *cpu2;           // the sibling's own decoder, opened with the parent's (closed by the parent)
+  struct CpuFaixa *pai;      // a sibling worker: its parent's flags rule it
+  MiniMotor *cpu2;           // the sibling's own decoder, opened at the first keyframe; closed when the sibling ends
+  // A second decoder on different keyframes (see cpuSegundo). Decided from the first keyframe of each worker start.
+  int querSegundo, semWpp, abrirHevc, abrirW, abrirH, abrirFlag, classe;
+  MiniConfig abrirCfg;
+  _Atomic int segundoOff;    // gave way (memory, playback contention): stays off for this title
 } CpuFaixa;
+// 1 when an Annex B HEVC access unit's PPS uses WPP (entropy_coding_sync_enabled_flag), 0 when none does, -1 when no
+// PPS could be read. Slice threads already use WPP, so those files keep one decoder with two threads.
+static int hevcUsaWpp(const unsigned char *d, int n) {
+  int visto = 0;
+  for (int i = 0; i + 5 < n; i++) {
+    if (d[i] || d[i + 1] || d[i + 2] != 1 || ((d[i + 3] >> 1) & 0x3f) != 34) continue;
+    unsigned char r[64];                         // the first bytes of the PPS, emulation prevention removed
+    int m = 0, zeros = 0;
+    for (int k = i + 5; k < n && m < (int)sizeof r; k++) {
+      if (zeros >= 2 && d[k] == 3) { zeros = 0; continue; }
+      if (zeros >= 2 && d[k] <= 1) break;        // the next start code
+      r[m++] = d[k];
+      zeros = d[k] ? 0 : zeros + 1;
+    }
+    int pos = 0, total = m * 8, bad = 0;
+#define PPS_BIT() (pos < total ? (pos++, (r[(pos - 1) >> 3] >> (7 - ((pos - 1) & 7))) & 1) : (bad = 1, 0))
+#define PPS_UE() do { int z = 0; while (!PPS_BIT() && z < 32 && !bad) z++; for (int b = 0; b < z; b++) (void)PPS_BIT(); } while (0)
+    PPS_UE(); PPS_UE();                          // pps id, sps id
+    for (int b = 0; b < 7; b++) (void)PPS_BIT(); // dependent, output flag, 3 extra bits, sign hiding, cabac init
+    PPS_UE(); PPS_UE(); PPS_UE();                // l0, l1, init_qp (se has the same length)
+    (void)PPS_BIT(); (void)PPS_BIT();            // constrained intra, transform skip
+    if (PPS_BIT()) PPS_UE();                     // cu_qp_delta
+    PPS_UE(); PPS_UE();                          // cb, cr qp offsets
+    for (int b = 0; b < 4; b++) (void)PPS_BIT(); // slice chroma, weighted x2, transquant bypass
+    (void)PPS_BIT();                             // tiles
+    int sync = PPS_BIT();
+#undef PPS_UE
+#undef PPS_BIT
+    if (bad) return -1;
+    if (sync) return 1;
+    visto = 1;
+  }
+  return visto ? 0 : -1;
+}
 static void *cpuTrabalho(void *u) {
   CpuFaixa *cf = u;
   Job *j = cf->j;
   CpuFaixa *ctl = cf->pai ? cf->pai : cf;   // a sibling follows its parent's pause/stop flags
-  // COPY-FIRST: a copy's whole grid goes through the CPU, so a second decoder thread takes from the same queue
-  // (06/11/2026: one thread at ~60 ms per 720p keyframe left decode on the critical path for 30 of 107 s)
-  CpuFaixa *irmao = NULL; pthread_t irmaoT; int irmaoRodando = 0;
-  if (!cf->pai && j->dCopia) {
-    irmao = malloc(sizeof *irmao);
-    if (irmao) {
-      memset(irmao, 0, sizeof *irmao);
-      irmao->j = j; irmao->h = cf->h; irmao->pend = cf->pend; irmao->nPend = cf->nPend; irmao->mp = cf->mp;
-      irmao->limite = cf->limite; irmao->threads = 1; irmao->pai = cf;
-      irmao->cpu = cf->cpu2;
-      if (irmao->cpu) irmaoRodando = pthread_create(&irmaoT, NULL, cpuTrabalho, irmao) == 0;
-      if (!irmaoRodando) { free(irmao); irmao = NULL; }
-    }
-  }
+  // A SECOND DECODER on different keyframes from the same queue: a copy's whole grid goes through the CPU (06/11/2026:
+  // one thread left decode on the critical path for 30 of 107 s), and a 4K file without WPP gains nothing from slice
+  // threads but nearly doubles with a second decoder (08/11/2026, Shield, Dune 4K, CPU route: 428 s -> 236 s, 0
+  // rebuffers, same download, ~70 MB more). It is expendable: see the give-way check below.
+  CpuFaixa *irmao = NULL; pthread_t irmaoT; int irmaoRodando = 0, decidido = cf->pai != NULL;
   while (!ctl->fim && !parou(j)) {
     if (ctl->pausa || ctl->desligar) { usleep(200000); continue; }
     long disp = memDisponivelKB(), precisaKB = (long)(mini_motor_memoria(cf->cpu, cf->threads) / 1024);
+    // Gives way when memory runs short or playback is in trouble, finishing nothing new: the decoder's memory goes back
+    // now and it stays off for this title (the first decoder carries on).
+    if (cf->pai && (ctl->cuidado || (disp >= 0 && disp < SEGUNDO_SOLTA_KB) || ctl->segundoOff)) {
+      ctl->segundoOff = 1;
+      printf("[miniatura] cpu route: second decoder gives way (%ld MB free%s)\n", disp / 1024, ctl->cuidado ? ", playback contention" : "");
+      fflush(stdout);
+      break;
+    }
     if (disp >= 0 && disp - precisaKB < PISO_KB) { usleep(1000000); continue; }
     pthread_mutex_lock(cf->mp);
     if (*cf->nPend <= 0) { pthread_mutex_unlock(cf->mp); usleep(200000); continue; }
@@ -1887,6 +1927,28 @@ static void *cpuTrabalho(void *u) {
       continue;
     }
     cf->semBloco = 0;
+    if (!decidido) {                            // the first keyframe tells whether a second decoder can help
+      decidido = 1;
+      int wpp = cf->semWpp ? hevcUsaWpp(pk, npk) : 0;
+      long livre = memDisponivelKB();
+      const char *por = !cf->querSegundo ? "not this codec or title" : ctl->segundoOff ? "gave way earlier" : wpp != 0 ? (wpp > 0 ? "this file uses WPP" : "no parameter set found")
+                        : cf->classe && livre < (long)SEGUNDO_4K_MIN_KB ? "memory" : NULL;
+      if (!por) {
+        char e2[96] = "";
+        cf->cpu2 = mini_motor_abrir_pacotes(cf->abrirHevc, cf->abrirW, cf->abrirH, cf->abrirFlag, e2, sizeof e2);
+        irmao = cf->cpu2 ? calloc(1, sizeof *irmao) : NULL;
+        if (irmao) {
+          mini_motor_config(cf->cpu2, &cf->abrirCfg);
+          irmao->j = j; irmao->h = cf->h; irmao->pend = cf->pend; irmao->nPend = cf->nPend; irmao->mp = cf->mp;
+          irmao->limite = cf->limite; irmao->threads = 1; irmao->pai = cf; irmao->cpu = cf->cpu2;
+          irmaoRodando = pthread_create(&irmaoT, NULL, cpuTrabalho, irmao) == 0;
+        }
+        if (irmaoRodando) { cf->threads = 1; j->cpuDoisDecoders = 1; }
+        else { free(irmao); irmao = NULL; if (cf->cpu2) { mini_motor_fechar(cf->cpu2); cf->cpu2 = NULL; } por = "could not start"; }
+      }
+      printf("[miniatura] cpu route: %s (%ld MB free, %d thread%s on the first)\n", irmaoRodando ? "two decoders" : por, livre / 1024, cf->threads, cf->threads == 1 ? "" : "s");
+      fflush(stdout);
+    }
     // A packet read may have blocked across a pause/handover. Do not begin a
     // fresh decode after admission was revoked; preserve the queued keyframe.
     if (ctl->fim || ctl->pausa || parou(j)) {
@@ -1927,9 +1989,10 @@ static void *cpuTrabalho(void *u) {
     // the frame's time as a rest only for a minute after real contention (dropped frames / audio underrun).
     usleep(ctl->cuidado ? (useconds_t)q.totalMs * 500 : 30000);
   }
-  if (irmaoRodando) { pthread_join(irmaoT, NULL); j->cpuFeitos += 0; }
-  if (irmao) free(irmao);
-  if (!cf->pai && cf->cpu2) { mini_motor_fechar(cf->cpu2); cf->cpu2 = NULL; }
+  if (irmaoRodando) pthread_join(irmaoT, NULL);
+  free(irmao);
+  if (cf->pai) { mini_motor_fechar(cf->cpu); ctl->cpu2 = NULL; }   // the sibling's decoder goes back as it ends
+  else if (cf->cpu2) { mini_motor_fechar(cf->cpu2); cf->cpu2 = NULL; }
   mini_dovi_gpu_close(); // release on the GL-owning CPU worker before it exits
   return NULL;
 }
@@ -2223,11 +2286,12 @@ static int trabalharDireto(Job *j, long long *hA) {
           MiniConfig config; mini_motor_config_padrao(&config);
           config.larguraSaida = j->larguraSaida;
           mini_motor_config(cf.cpu, &config);
-          if (j->dCopia && !classe) {           // copy-first: a second decoder for the sibling worker
-            char e2[96] = "";
-            cf.cpu2 = mini_motor_abrir_pacotes(cpuCod != 2, (int)inf[1], (int)inf[2], cpuCod == 3 ? 2 : inf[3] != 0, e2, sizeof e2);
-            if (cf.cpu2) mini_motor_config(cf.cpu2, &config);
-          }
+          // A second decoder is decided at the first keyframe (cpuTrabalho). Above 1080p never for Dolby Vision (cpuCod 3:
+          // its GPU colour step has one owner).
+          cf.querSegundo = !classe ? j->dCopia : cpuCod != 3;
+          cf.semWpp = classe && cpuCod != 2;   // cpuCod 2 is H.264, which has no WPP
+          cf.classe = classe; cf.abrirCfg = config;
+          cf.abrirHevc = cpuCod != 2; cf.abrirW = (int)inf[1]; cf.abrirH = (int)inf[2]; cf.abrirFlag = cpuCod == 3 ? 2 : inf[3] != 0;
           cf.j = j; cf.h = *hA; cf.pend = pend; cf.nPend = &nPend; cf.mp = &mp; cf.limite = cpuLimite;
           // 2 slice/WPP threads for pictures above 1080p (Shield: one A57 core took ~400 ms per 4K keyframe; x265
           // streams are WPP-coded, so rows decode in parallel), 1 below (~95 ms already)
@@ -2336,7 +2400,12 @@ static int trabalharDireto(Job *j, long long *hA) {
 #endif
   free(pend);
 #ifdef NV_MINI_FFMPEG
-  if (j->cpuFeitos >= CPU_AMOSTRAS) {
+  // The profile is one decoder's time per thumbnail: with two at work each runs ~10% slower while twice as many finish,
+  // and that must not make the device look slower (it decides whether the CPU route and failing copy sources are used).
+  if (j->cpuFeitos >= CPU_AMOSTRAS && j->cpuDoisDecoders) {
+    printf("[miniatura] cpu route: %d thumbnails, %ld ms each on two decoders (decode %ld ms); device profile unchanged\n", j->cpuFeitos, j->cpuMs, j->cpuDecMs);
+    fflush(stdout);
+  } else if (j->cpuFeitos >= CPU_AMOSTRAS) {
     int n = pf.n[classe] > 200 ? 200 : pf.n[classe];
     pf.ms[classe] = (pf.ms[classe] * n + (double)j->cpuMs * j->cpuFeitos) / (n + j->cpuFeitos);
     pf.n[classe] = n + j->cpuFeitos;
