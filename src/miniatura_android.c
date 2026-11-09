@@ -91,6 +91,7 @@ typedef struct {
   unsigned long long tamanho;
   char nome[160];
   char fonte[FONTEFALHA_CHAVE];   // the add-on it came from (copy failures are remembered per source)
+  int espelho;                    // same size or filename as an earlier candidate: tried only if that one would not open
 } Copia;
 
 typedef struct {
@@ -139,6 +140,8 @@ typedef struct {
   // Optimistic copy-first: thumbnails start at offset 0 while the screen check runs on its own thread.
   // dCheck 0 none, 1 running, 2 accepted (tiles relabelled to the measured offset), 3 rejected (all discarded).
   volatile int dCheck; pthread_t dCheckT; int dCheckRodando;
+  // The copy hunt across attempts: the next candidate, time lost on copies that would not open, rejected copies.
+  int huntProx, huntRejeitadas; long huntMs; unsigned char huntSemAbrir[TENTATIVAS];
   char dFonte[FONTEFALHA_CHAVE];           // the chosen copy's source (its verdict is remembered)
   volatile int parar;
   int vivo;
@@ -216,7 +219,7 @@ static void diretoCoberturaRelatorio(Job *j) {
 static jclass cls;
 static jmethodID jDolbyGpu,jDolbyGpuClose;
 static jmethodID jLanesProprias;   // optional: storage host with its own thumbnail slots (MediaHttpBudget.EXTRA)
-static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo, jLote,
+static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jSemFila, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo, jLote,
                  jDiag, jConfig, jPerdidos, jAbrirDireto, jQuadroDireto, jKeyframe, jDiagDireto, jHeap, jAudio, jCodecCpu, jPacoteCpu, jPrepDec,
                  jPixelsDireto, jPixelsDimensoes, jDecPronto, jPrepararFuturo, jPrepararSondas, jPipelineStart, jPipelineSummary, jPipelineState, jPipelineStop, jHeadroom, jSlotKeyframe, jSeekRecente;
 static void prepararPixelsDireto(Job *j, long long h, int k, long pts);
@@ -243,6 +246,7 @@ static int jniPreparar(void) {
     jExato = (*env)->GetStaticMethodID(env, c, "quadroExato", "(JJZ)[B");
     jSoltar = (*env)->GetStaticMethodID(env, c, "soltarDecoder", "(J)V");
     jFechar = (*env)->GetStaticMethodID(env, c, "fechar", "(J)V");
+    jSemFila = (*env)->GetStaticMethodID(env, c, "semFila", "(J)V");
     jLidos = (*env)->GetStaticMethodID(env, c, "lidos", "(J)J");
     jRitmo = (*env)->GetStaticMethodID(env, c, "ritmo", "()J");
     jFalhaRede = (*env)->GetStaticMethodID(env, c, "falhaRede", "(J)I");
@@ -278,7 +282,7 @@ static int jniPreparar(void) {
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);   // earlier lookups failed: the check below still sees the NULLs
     jLanesProprias = (*env)->GetStaticMethodID(env, c, "lanesProprias", "(J)I");
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); jLanesProprias = NULL; }
-    if (!jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jPrepararFuturo || !jPrepararSondas || !jCont || !jAlvo || !jLote ||
+    if (!jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jSemFila || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jPrepararFuturo || !jPrepararSondas || !jCont || !jAlvo || !jLote ||
         !jDiag || !jConfig || !jPipelineStart || !jPipelineStop || !jPipelineSummary || !jPipelineState || !jHeadroom || !jPerdidos || !jSeekRecente || !jAbrirDireto || !jQuadroDireto || !jKeyframe || !jSlotKeyframe || !jDiagDireto || !jHeap || !jAudio || !jCodecCpu || !jPacoteCpu || !jPrepDec || !jDecPronto || !jPixelsDireto || !jPixelsDimensoes) {
       (*env)->ExceptionClear(env);
     } else {
@@ -402,6 +406,11 @@ static void mSoltar(long long h) {
 static void mFechar(long long h) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   if (h) (*env)->CallStaticVoidMethod(env, cls, jFechar, (jlong)h);
+  if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+}
+static void mSemFila(long long h) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  if (h) (*env)->CallStaticVoidMethod(env, cls, jSemFila, (jlong)h);
   if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
 }
 static long long mLidos(long long h) {
@@ -821,10 +830,10 @@ static int escolherCopias(const Stream *play, Copia *out, long durMs, char *moti
   enum { R_CACHE, R_RES, R_EDICAO, R_AMOSTRA, R_REPETIDA, R_BITRATE, R_1080, R_PESADA, R_N };
   static const char *NOMES[R_N] = { "not-cached", "resolution", "edition", "sample", "duplicate", "bitrate", "1080-rule", "heavy" };
   int rej[R_N] = {0}, nv = 0, cap = stream_n() > 0 ? stream_n() : 1;
-  int *v = malloc(sizeof(int) * (size_t)cap);
+  int *v = malloc(sizeof(int) * (size_t)cap), *esp = malloc(sizeof(int) * (size_t)cap), ne = 0;
   unsigned edA = edicoes(play);
   unsigned long long tamA = tamanho(play);
-  if (!v) return 0;
+  if (!v || !esp) { free(v); free(esp); return 0; }
   for (int i = 0; i < stream_n(); i++) {
     const Stream *c = stream_item(i);
     if (!c || i == stream_atual() || c->naoVideo || !c->url[0] || !strcmp(c->url, play->url)) continue;
@@ -848,12 +857,17 @@ static int escolherCopias(const Stream *play, Copia *out, long durMs, char *moti
       double piso = c->altura >= 1080 ? PISO_MBPS_1080 : c->altura >= 720 ? PISO_MBPS_720 : PISO_MBPS_SD;
       if (mbps < piso) { rej[R_BITRATE]++; continue; }
     }
-    int repetida = 0;                   // the same file from another add-on: checking it twice is pure waste
-    for (int k = 0; k < nv && !repetida; k++) {
+    // The same file from another add-on: checking it twice is pure waste, but its other link may be alive when this one
+    // is dead, so it is kept as a mirror (tried only if the first would not open). The very same link is dropped.
+    int repetida = 0, mesmoLink = 0;
+    for (int k = 0; k < nv && !mesmoLink; k++) {
       const Stream *o = stream_item(v[k]);
-      repetida = (tc && tc == tamanho(o)) || (c->arquivo[0] && !strcmp(c->arquivo, o->arquivo));
+      if ((tc && tc == tamanho(o)) || (c->arquivo[0] && !strcmp(c->arquivo, o->arquivo))) repetida = 1;
+      if (!strcmp(c->url, o->url)) mesmoLink = 1;
     }
-    if (repetida) { rej[R_REPETIDA]++; continue; }
+    for (int k = 0; k < ne && !mesmoLink; k++) mesmoLink = !strcmp(c->url, stream_item(esp[k])->url);
+    if (mesmoLink) { rej[R_REPETIDA]++; continue; }
+    if (repetida) { rej[R_REPETIDA]++; esp[ne++] = i; continue; }
     v[nv++] = i;
   }
   unsigned long long min720 = 0;
@@ -887,19 +901,43 @@ static int escolherCopias(const Stream *play, Copia *out, long durMs, char *moti
       w[y] = cur;
     }
   }
-  for (int k = 0; k < nr; k++) v[nv++] = reserva[k];
-  free(reserva);
-  int n = nv < TENTATIVAS ? nv : TENTATIVAS;
-  for (int k = 0; k < n; k++) {
-    const Stream *c = stream_item(v[k]);
-    snprintf(out[k].url, sizeof out[k].url, "%s", c->url);
-    snprintf(out[k].cab, sizeof out[k].cab, "%s", c->cabecalhos);
-    out[k].altura = c->altura;
-    out[k].tamanho = tamanho(c);
-    snprintf(out[k].nome, sizeof out[k].nome, "%s", c->arquivo[0] ? c->arquivo : c->rotulo);
-    snprintf(out[k].fonte, sizeof out[k].fonte, "%s", c->addonChave[0] ? c->addonChave : "?");
+  // The order: smallest first with a 1080p backup after every third (07/11/2026: dead 720p links used up the list before
+  // any 1080p was tried), then mirrors at the end, which cost nothing unless their original would not open.
+  int principais = nv, n = 0, ib = 0, im = 0, usados = 0;
+  int *ord = malloc(sizeof(int) * (size_t)(principais + nr + ne + 1));
+  if (!ord) { free(reserva); free(v); free(esp); return 0; }
+  int no = 0;
+  for (int k = 0; k < principais; k++) {
+    ord[no++] = v[k];
+    if ((k + 1) % 3 == 0 && ib < nr) ord[no++] = reserva[ib++];
   }
-  size_t o = (size_t)snprintf(motivos, nmot, "eligible %d (trying %d, %d of them 1080p backups), rejected:", nv, n, nr);
+  while (ib < nr) ord[no++] = reserva[ib++];
+  int semEspelhos = no;
+  // Mirrors keep up to 3 of the 12 slots when there are enough others to fill the rest.
+  int cortar = semEspelhos < TENTATIVAS - (ne < 3 ? ne : 3) ? semEspelhos : TENTATIVAS - (ne < 3 ? ne : 3);
+  for (int k = 0; k < cortar; k++, n++) {
+    const Stream *c = stream_item(ord[k]);
+    snprintf(out[n].url, sizeof out[n].url, "%s", c->url);
+    snprintf(out[n].cab, sizeof out[n].cab, "%s", c->cabecalhos);
+    out[n].altura = c->altura;
+    out[n].tamanho = tamanho(c);
+    snprintf(out[n].nome, sizeof out[n].nome, "%s", c->arquivo[0] ? c->arquivo : c->rotulo);
+    snprintf(out[n].fonte, sizeof out[n].fonte, "%s", c->addonChave[0] ? c->addonChave : "?");
+    out[n].espelho = 0;
+  }
+  for (im = 0; im < ne && n < TENTATIVAS; im++, n++, usados++) {
+    const Stream *c = stream_item(esp[im]);
+    snprintf(out[n].url, sizeof out[n].url, "%s", c->url);
+    snprintf(out[n].cab, sizeof out[n].cab, "%s", c->cabecalhos);
+    out[n].altura = c->altura;
+    out[n].tamanho = tamanho(c);
+    snprintf(out[n].nome, sizeof out[n].nome, "%s", c->arquivo[0] ? c->arquivo : c->rotulo);
+    snprintf(out[n].fonte, sizeof out[n].fonte, "%s", c->addonChave[0] ? c->addonChave : "?");
+    out[n].espelho = 1;
+  }
+  nv = semEspelhos + ne;
+  free(ord); free(reserva); free(esp);
+  size_t o = (size_t)snprintf(motivos, nmot, "eligible %d (trying %d: %d 1080p backups, %d mirrors), rejected:", nv, n, nr, usados);
   for (int r = 0; r < R_N && o < nmot; r++) if (rej[r] && r != R_1080) o += (size_t)snprintf(motivos + o, nmot - o, " %s %d", NOMES[r], rej[r]);
   free(v);
   return n;
@@ -1011,6 +1049,7 @@ static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int n
 #define TELA_ESPACO_MS 4000L
 #define TELA_ACORDO_MS 3000.0      // measured 22/10: real matches spread 1.7-1.9 s (screen timing + 1 s exact steps)
 #define TELA_PRAZO_MS 120000u
+#define TELA_PRAZO_BOM_MS 300000u   // while matches outnumber misses: a slow host is not a wrong copy (09/11/2026)
 #define TELA_DUR_IGUAL_MS 30000L    // copies up to 30 s longer/shorter go to the screen check, which measures the offset
                                     // (22/10: a Bond film's only same-codec copy was 12 s off: logo/intro variants)
 #define OTIMISTA_DUR_MS 4000L       // the optimistic start only for (nearly) the same length
@@ -1068,7 +1107,8 @@ static int conferirTela(Job *j, long long hB, long durB, Mapa *mapa) {
   double b = 0;
   float sa[SIG_N], sb[SIG_N];
   Uint32 ini = SDL_GetTicks();
-  while (nm < TELA_ANCORAS && !parou(j) && SDL_GetTicks() - ini < TELA_PRAZO_MS && provas < TELA_ANCORAS * 3) {
+  while (nm < TELA_ANCORAS && !parou(j) && provas < TELA_ANCORAS * 3 &&
+         SDL_GetTicks() - ini < (nm > provas - nm ? TELA_PRAZO_BOM_MS : TELA_PRAZO_MS)) {
     esperarPlayer(j);
     if (scrubbing) { dormir(j, 500); continue; }
     long pA; int ok;
@@ -2492,6 +2532,7 @@ static void *checarCopia(void *u) {
   Job *j = c->j;
   Uint32 c0 = SDL_GetTicks();
   Mapa m = {1.0, 0.0, 0.0, 0};
+  mSemFila(c->hB);                     // the engine runs alongside: its batches must not starve the check
   int r = conferirTela(j, c->hB, c->durB, &m);
   mFechar(c->hB);
   pthread_mutex_lock(&mu);
@@ -2596,8 +2637,18 @@ static int aparelhoRapido(void) {
   return pf.n[1] >= CPU_AMOSTRAS && pf.ms[1] <= RAPIDO_MS;
 }
 
+// How long failed opens may hold up the first thumbnail: on a fast device the 4K file is quick anyway; a slow one gains
+// minutes from any working copy. Rejected copies: a fast device goes straight to the 4K file (a check takes 30-160 s),
+// a slow one tries the next, up to HUNT_REJEITADAS.
+#define HUNT_RAPIDO_MS 30000L
+#define HUNT_LENTO_MS 90000L
+#define HUNT_REJEITADAS 2
+static int mesmaCopia(const Copia *a, const Copia *b) {
+  return (a->tamanho && a->tamanho == b->tamanho) || (a->nome[0] && !strcmp(a->nome, b->nome));
+}
 static int escolherCopiaRapida(Job *j) {
   int rapido = aparelhoRapido();
+  long limite = rapido ? HUNT_RAPIDO_MS : HUNT_LENTO_MS;
   printf("[miniatura] copy-first: playing %dp %.1f min, %d smaller cop%s (%s); %s device\n", j->alturaA, j->dur / 60000.0, j->nCopias,
          j->nCopias == 1 ? "y" : "ies", j->motivos, rapido ? "fast (failing sources skipped)" : "slow (every copy tried)");
   fflush(stdout);
@@ -2607,8 +2658,21 @@ static int escolherCopiaRapida(Job *j) {
   // marker) tries everything.
   int anteriores[TENTATIVAS];
   for (int c = 0; c < j->nCopias; c++) anteriores[c] = j->auditarRede ? 0 : fonteTentativas(j->copias[c].fonte);
-  for (int c = 0; c < j->nCopias && !parou(j); c++) {
+  for (int c = j->huntProx; c < j->nCopias && !parou(j); c++) {
     size_t o = strlen(j->motivos);
+    j->huntProx = c + 1;
+    if (j->huntMs >= limite) {
+      printf("[miniatura] copy-first: stopped after %ld s of failed opens (limit %ld s)\n", j->huntMs / 1000, limite / 1000);
+      fflush(stdout);
+      snprintf(j->motivos + o, sizeof j->motivos - o, " | hunt-limit");
+      break;
+    }
+    if (j->copias[c].espelho) {               // only worth trying if the same file would not open elsewhere
+      int vale = 0;
+      for (int k = 0; k < c && !vale; k++) vale = j->huntSemAbrir[k] && mesmaCopia(&j->copias[k], &j->copias[c]);
+      if (!vale) continue;
+      printf("[miniatura] copy-first: copy %d is a mirror of one that would not open\n", c + 1); fflush(stdout);
+    }
     int falhas = anteriores[c];
     if (rapido && falhas >= FONTE_TENTATIVAS) {
       printf("[miniatura] copy-first: copy %d (%dp) skipped: %d copies from its source tried in the last %d days, none usable\n",
@@ -2620,7 +2684,10 @@ static int escolherCopiaRapida(Job *j) {
     Uint32 c0 = SDL_GetTicks();
     long long hB = mAbrir(j->copias[c].url, j->copias[c].cab, 1);
     if (!hB) {
-      printf("[miniatura] copy-first: copy %d (%dp) would not open\n", c + 1, j->copias[c].altura); fflush(stdout);
+      long perdeu = (long)(SDL_GetTicks() - c0);
+      j->huntMs += perdeu;
+      j->huntSemAbrir[c] = 1;
+      printf("[miniatura] copy-first: copy %d (%dp) would not open (%.1f s, %ld s lost so far)\n", c + 1, j->copias[c].altura, perdeu / 1000.0, j->huntMs / 1000); fflush(stdout);
       snprintf(j->motivos + o, sizeof j->motivos - o, " | c%d:no-open", c + 1);
       fonteAnotar(j->copias[c].fonte, 0);
       continue;
@@ -2726,14 +2793,16 @@ static void *trabalhar(void *u) {
     // The 4K pre-warm (file open + hardware decoder made during the opening load) is kept until a copy is CHOSEN:
     // when every copy fails, direct mode adopts it as before. 06/11/2026 (2.0.21): closed up front, an R2 title whose
     // four PenguPlay copies were dead or ignored Range fell back to the CPU route, 458 s instead of ~190 s.
-    if (escolherCopiaRapida(j)) {
-      // A copy accepted before any thumbnail: the 4K session goes now. One still being checked (the optimistic start)
-      // keeps it until the check decides (07/11/2026, Avengers: the copy failed the check AFTER the session was
-      // closed, and the playing file's pass ran on the CPU at ~2-3 thumbnails a second).
-      long long preGuardado = 0;
-      int decGuardado = 0;
-      if (j->dCheck == 1) preGuardado = adotarPre(j, &decGuardado);
-      else { int d = 0; long long pre = adotarPre(j, &d); if (pre) mFechar(pre); }
+    // A copy accepted before any thumbnail: the 4K session goes now. One still being checked (the optimistic start)
+    // keeps it until the check decides (07/11/2026, Avengers: the copy failed the check AFTER the session was
+    // closed, and the playing file's pass ran on the CPU at ~2-3 thumbnails a second).
+    long long preGuardado = 0;
+    int decGuardado = 0;
+    while (escolherCopiaRapida(j)) {
+      if (!preGuardado) {
+        if (j->dCheck == 1) preGuardado = adotarPre(j, &decGuardado);
+        else { int d = 0; long long pre = adotarPre(j, &d); if (pre) mFechar(pre); }
+      }
       if (preGuardado) { printf("[miniatura] copy-first: 4K session kept until the check decides (decoder %s)\n", decGuardado ? "ready" : "not created"); fflush(stdout); }
       diretoTentado = 1;
       int r = trabalharDireto(j, &hA);
@@ -2742,6 +2811,11 @@ static void *trabalhar(void *u) {
         limparDireto(j);
         j->dCopia = 0; j->dCheck = 0;
         pthread_mutex_lock(&mu); j->direto = 0; pthread_mutex_unlock(&mu);
+        j->huntRejeitadas++;
+        if (!aparelhoRapido() && j->huntRejeitadas < HUNT_REJEITADAS && j->huntProx < j->nCopias) {
+          printf("[miniatura] copy-first: slow device: trying the next copy after a rejection\n"); fflush(stdout);
+          continue;                                // keeps the 4K session for a later fallback
+        }
         hA = preGuardado; preGuardado = 0;         // the kept 4K session, hardware decoder included
         printf("[miniatura] copy-first: rejected copy discarded: direct mode on the playing file%s\n",
                hA ? " with the kept 4K session" : ""); fflush(stdout);
@@ -2757,7 +2831,10 @@ static void *trabalhar(void *u) {
       j->dCopia = 0;
       pthread_mutex_lock(&mu); j->direto = 0; pthread_mutex_unlock(&mu);
       diretoTentado = 0;
+      break;
     }
+    diretoTentado = 0;                             // no copy in the end (rejections included): the playing file's turn
+    if (preGuardado && !hA) { hA = preGuardado; preGuardado = 0; }   // a kept session: direct mode adopts it
   }
   if (diretoOk && !diretoTentado) {
     diretoTentado = 1;                           // no esperarPlayer: the decoder goes in during the opening load

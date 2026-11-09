@@ -28,6 +28,8 @@ import kotlin.math.pow
 // the player; the Shield allows it), Android's software decoder otherwise.
 //
 // Called from ONE C worker thread per title, through JNI; handles are ids.
+private class HttpDefinitivo(code: Int) : IOException("http $code")
+
 object MiniaturaMotor {
     private const val TAG = "nuvio-miniatura"
     private const val BLK = 256 * 1024
@@ -1479,7 +1481,9 @@ object MiniaturaMotor {
         // reuses the socket). A refused or silent connection is never retried: the title stops (see recusado).
         // Every session (both lanes, the check's readers) waits for this: ONE request in flight for the whole engine,
         // so the lanes share one pooled socket per host and one lane decodes while the other's request is on the wire.
-        private fun pedir(a: Long, b: Long): ByteArray = synchronized(VOO) { pedirUm(a, b) }
+        // semFila: the screen check's short reads do not queue behind the engine's batches (09/11/2026: each read waited
+        // out a whole batch, 3 s or a 20 s host stall, so one anchor took 2 min). comVaga still caps the host's connections.
+        private fun pedir(a: Long, b: Long): ByteArray = if (semFila) pedirUm(a, b) else synchronized(VOO) { pedirUm(a, b) }
 
         private fun pedirUm(a: Long, b: Long): ByteArray = retryTimeout { comVaga { pedirUm0(a, b) } }
         private fun pedirUm0(a: Long, b: Long): ByteArray {
@@ -1511,6 +1515,9 @@ object MiniaturaMotor {
                         recusado = true
                         Log.w(TAG, "HTTP $code: stopping thumbnails for this title")
                     }
+                    // Gone, missing, or a server that ignores ranges: asking again in 2 s cannot help (06/11/2026: every dead
+                    // PenguPlay copy cost a retry and a sleep before the next copy was tried). A 502 may pass, so it retries.
+                    if (code == 200 || code == 404 || code == 410) throw HttpDefinitivo(code)
                     if (code != 206) throw IOException("http $code")
                     alvo = c.url.toString()   // after debrid/add-on redirects: later reads go straight to the CDN
                     c.getHeaderField("Content-Range")?.substringAfter('/')?.trim()?.toLongOrNull()?.let { tamanho = it }
@@ -1550,6 +1557,7 @@ object MiniaturaMotor {
                         resultado(0, false)
                     }
                     ultimo = e
+                    if (e is HttpDefinitivo) break
                     if (e is java.net.ConnectException) {
                         recusado = true
                         Log.w(TAG, "connection refused: stopping this title")
@@ -1589,6 +1597,7 @@ object MiniaturaMotor {
             }
         }
         @Volatile var erroRede = false
+        @Volatile var semFila = false
 
         override fun getSize() = tamanho
         // Initialize all request/error state before constructor I/O can fail.
@@ -2524,6 +2533,9 @@ object MiniaturaMotor {
     // The frame on screen (NvPlayer.assinaturaTela), in the reply format of quadro() without a JPEG. Luma from RGB
     // (Rec. 709 weights), the same crop and 32x18 grid as montar(); the C side removes the mean and normalises, so
     // the RGB-vs-Y range difference does not matter.
+    @JvmStatic
+    fun semFila(h: Long) { sessoes[h]?.fonte?.semFila = true }
+
     @JvmStatic
     fun tela(): ByteArray? = NvPlayer.assinaturaTela()
 
