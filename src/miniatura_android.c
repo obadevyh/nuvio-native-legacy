@@ -219,7 +219,7 @@ static void diretoCoberturaRelatorio(Job *j) {
 static jclass cls;
 static jmethodID jDolbyGpu,jDolbyGpuClose;
 static jmethodID jLanesProprias;   // optional: storage host with its own thumbnail slots (MediaHttpBudget.EXTRA)
-static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jSemFila, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo, jLote,
+static jmethodID jAbrir, jInfo, jQuadro, jExato, jSoltar, jFechar, jSemFila, jAbrirCandidata, jLidos, jRitmo, jFalhaRede, jTela, jPreparar, jCont, jAlvo, jLote,
                  jDiag, jConfig, jPerdidos, jAbrirDireto, jQuadroDireto, jKeyframe, jDiagDireto, jHeap, jAudio, jCodecCpu, jPacoteCpu, jPrepDec,
                  jPixelsDireto, jPixelsDimensoes, jDecPronto, jPrepararFuturo, jPrepararSondas, jPipelineStart, jPipelineSummary, jPipelineState, jPipelineStop, jHeadroom, jSlotKeyframe, jSeekRecente;
 static void prepararPixelsDireto(Job *j, long long h, int k, long pts);
@@ -241,6 +241,7 @@ static int jniPreparar(void) {
     jDolbyGpu=(*env)->GetStaticMethodID(env,c,"converterDolbyGpu","(IILjava/nio/ByteBuffer;Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)I");
     jDolbyGpuClose=(*env)->GetStaticMethodID(env,c,"fecharDolbyGpu","()V");
     jAbrir = (*env)->GetStaticMethodID(env, c, "abrir", "(Ljava/lang/String;Ljava/lang/String;Z)J");
+    jAbrirCandidata = (*env)->GetStaticMethodID(env, c, "abrirCandidata", "(Ljava/lang/String;Ljava/lang/String;)J");
     jInfo = (*env)->GetStaticMethodID(env, c, "info", "(J)[J");
     jQuadro = (*env)->GetStaticMethodID(env, c, "quadro", "(JJZZ)[B");
     jExato = (*env)->GetStaticMethodID(env, c, "quadroExato", "(JJZ)[B");
@@ -282,7 +283,7 @@ static int jniPreparar(void) {
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);   // earlier lookups failed: the check below still sees the NULLs
     jLanesProprias = (*env)->GetStaticMethodID(env, c, "lanesProprias", "(J)I");
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); jLanesProprias = NULL; }
-    if (!jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jSemFila || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jPrepararFuturo || !jPrepararSondas || !jCont || !jAlvo || !jLote ||
+    if (!jAbrir || !jInfo || !jQuadro || !jExato || !jSoltar || !jFechar || !jSemFila || !jAbrirCandidata || !jLidos || !jRitmo || !jFalhaRede || !jTela || !jPreparar || !jPrepararFuturo || !jPrepararSondas || !jCont || !jAlvo || !jLote ||
         !jDiag || !jConfig || !jPipelineStart || !jPipelineStop || !jPipelineSummary || !jPipelineState || !jHeadroom || !jPerdidos || !jSeekRecente || !jAbrirDireto || !jQuadroDireto || !jKeyframe || !jSlotKeyframe || !jDiagDireto || !jHeap || !jAudio || !jCodecCpu || !jPacoteCpu || !jPrepDec || !jDecPronto || !jPixelsDireto || !jPixelsDimensoes) {
       (*env)->ExceptionClear(env);
     } else {
@@ -323,6 +324,16 @@ static long long mAbrir(const char *url, const char *cab, int manter) {
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jstring u = (*env)->NewStringUTF(env, url), c = (*env)->NewStringUTF(env, cab ? cab : "");
   jlong h = (*env)->CallStaticLongMethod(env, cls, jAbrir, u, c, manter ? JNI_TRUE : JNI_FALSE);
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); h = 0; }
+  (*env)->DeleteLocalRef(env, u); (*env)->DeleteLocalRef(env, c);
+  return h;
+}
+// A copy being tried for the first time: an unanswered open fails at once, so the hunt moves on (the next copy costs less
+// than a second try at a server that did not answer). The engine's opens keep their retry.
+static long long mAbrirCandidata(const char *url, const char *cab) {
+  JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+  jstring u = (*env)->NewStringUTF(env, url), c = (*env)->NewStringUTF(env, cab ? cab : "");
+  jlong h = (*env)->CallStaticLongMethod(env, cls, jAbrirCandidata, u, c);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); h = 0; }
   (*env)->DeleteLocalRef(env, u); (*env)->DeleteLocalRef(env, c);
   return h;
@@ -1049,7 +1060,8 @@ static int refinar(Job *j, long long hB, const Ancora *anc, const Par *in, int n
 #define TELA_ESPACO_MS 4000L
 #define TELA_ACORDO_MS 3000.0      // measured 22/10: real matches spread 1.7-1.9 s (screen timing + 1 s exact steps)
 #define TELA_PRAZO_MS 120000u
-#define TELA_PRAZO_BOM_MS 300000u   // while matches outnumber misses: a slow host is not a wrong copy (09/11/2026)
+#define TELA_PRAZO_BOM_MS 300000u   // once two votes agree: a slow host is not a wrong copy (09/11/2026)
+#define TELA_PROVAS (TELA_ANCORAS * 4)
 #define TELA_DUR_IGUAL_MS 30000L    // copies up to 30 s longer/shorter go to the screen check, which measures the offset
                                     // (22/10: a Bond film's only same-codec copy was 12 s off: logo/intro variants)
 #define OTIMISTA_DUR_MS 4000L       // the optimistic start only for (nearly) the same length
@@ -1061,67 +1073,80 @@ static int mTela(long *pts, float sig[SIG_N], int *temSig) {
   return desempacotar(env, a, pts, sig, temSig, NULL, NULL);
 }
 
-// Similarity peak of the copy's exact frames at centro + DES[i]; *t = interpolated copy time. 0 = no frame/weak.
-static int picoExato(Job *j, long long hB, const float *sa, double centro, const long *des, int nd, double minCorr,
-                     double *t, double *rMelhor) {
-  double cs[8], ps[8]; int nc = 0;
+// One exact copy frame against the screen capture. -1 = the network failed; a frame that did not come only skips the sample.
+static int amostraExata(Job *j, long long hB, const float *sa, long alvo, double *cs, double *ps, int *nc, int max) {
+  long p; int ok;
   float sb[SIG_N];
-  for (int d = 0; d < nd && !parou(j); d++) {
-    long alvo = (long)(centro + des[d]), p; int ok;
-    if (alvo < 0) alvo = 0;
-    esperarPlayer(j);
-    int lido = mExato(hB, alvo, &p, sb, &ok, NULL, NULL);
-    // A check frame that did not come (a slow forward decode) only skips this probe; a READ failure still backs
-    // off, and a refused connection still ends the title (23/10: three exact-frame time-outs ended a good copy).
-    if (!lido && mFalhaRede(hB) && falhou(j, lido, hB)) return -1;
-    if (lido) falhou(j, lido, hB);
-    if (!lido || !ok) continue;
-    double c = 0;
-    for (int k = 0; k < SIG_N; k++) c += sa[k] * sb[k];
-    cs[nc] = c; ps[nc] = p; nc++;
-  }
-  if (nc < 2) return 0;
-  int m = 0;
-  for (int k = 1; k < nc; k++) if (cs[k] > cs[m]) m = k;
-  *rMelhor = cs[m];
-  if (cs[m] < minCorr) return 0;
-  *t = ps[m];
-  if (m > 0 && m < nc - 1 && ps[m + 1] > ps[m - 1]) {
-    double den = cs[m - 1] - 2 * cs[m] + cs[m + 1];
-    if (den < -1e-9) {
-      double s = 0.5 * (cs[m - 1] - cs[m + 1]) / den;
-      if (s > 1) s = 1;
-      if (s < -1) s = -1;
-      *t = ps[m] + s * (fabs(ps[m + 1] - ps[m]) + fabs(ps[m] - ps[m - 1])) / 2;
-    }
-  }
-  return 1;
+  if (alvo < 0) alvo = 0;
+  esperarPlayer(j);
+  int lido = mExato(hB, alvo, &p, sb, &ok, NULL, NULL);
+  // A check frame that did not come (a slow forward decode) only skips this probe; a READ failure still backs
+  // off, and a refused connection still ends the title (23/10: three exact-frame time-outs ended a good copy).
+  if (!lido && mFalhaRede(hB) && falhou(j, lido, hB)) return -1;
+  if (lido) falhou(j, lido, hB);
+  if (!lido || !ok) return 0;
+  double c = 0;
+  for (int k = 0; k < SIG_N; k++) c += sa[k] * sb[k];
+  *nc = mini_pico_inserir(cs, ps, *nc, max, c, p);
+  return 0;
 }
 
-// 1 accepted (mapa filled), 0 rejected, -1 the screen gave no frames (the caller falls back to the 4K anchors).
+// Similarity peak of the copy's exact frames at centro + DES[i], ascending. 1 = a bracketed peak (*t = interpolated copy
+// time), 0 = no match, 2 = ambiguous (still shot, or the best sample stayed on the edge), -1 = network failure.
+// An edge is followed one sample further on the same capture; it is never a vote by itself.
+static int picoExato(Job *j, long long hB, const float *sa, double centro, const long *des, int nd, double minCorr,
+                     double *t, double *rMelhor) {
+  double cs[8], ps[8]; int nc = 0, m = 0;
+  long baixo = (long)(centro + des[0]), alto = (long)(centro + des[nd - 1]);
+  for (int d = 0; d < nd && !parou(j); d++)
+    if (amostraExata(j, hB, sa, (long)(centro + des[d]), cs, ps, &nc, 8) < 0) return -1;
+  int st = mini_pico_avaliar(cs, nc, minCorr, &m);
+  if ((st == MINI_PICO_BORDA_ANTES || st == MINI_PICO_BORDA_DEPOIS) && !parou(j)) {
+    long alvo = st == MINI_PICO_BORDA_ANTES ? baixo - 1000 : alto + 1000;
+    if (alvo >= 0 && amostraExata(j, hB, sa, alvo, cs, ps, &nc, 8) < 0) return -1;
+    st = mini_pico_avaliar(cs, nc, minCorr, &m);
+    if (st == MINI_PICO_BORDA_ANTES || st == MINI_PICO_BORDA_DEPOIS) st = MINI_PICO_AMBIGUO;
+  }
+  if (nc > 0) *rMelhor = cs[m];
+  char linha[160];
+  size_t o = 0;
+  linha[0] = 0;
+  for (int k = 0; k < nc && o < sizeof linha - 24; k++) o += (size_t)snprintf(linha + o, sizeof linha - o, " %.2fs=%.2f", ps[k] / 1000, cs[k]);
+  printf("[miniatura] screen check samples around %.2fs:%s (%s)\n", centro / 1000, linha,
+         st == MINI_PICO_OK ? "peak" : st == MINI_PICO_FRACO ? "weak" : "ambiguous");
+  fflush(stdout);
+  if (st == MINI_PICO_OK) { *t = mini_pico_tempo(cs, ps, m); return 1; }
+  return st == MINI_PICO_FRACO ? 0 : 2;
+}
+
+// MINI_TELA_*: accepted (mapa filled), rejected (shown to be wrong), no screen frames (the caller falls back to the 4K
+// anchors), or inconclusive (left, timed out, network, too little evidence: says nothing about the copy).
 static int conferirTela(Job *j, long long hB, long durB, Mapa *mapa) {
   static const long LARGO[] = { -2000, -1000, 0, 1000, 2000 }, ESTREITO[] = { -1000, 0, 1000 };
-  Par m[TELA_ANCORAS];
-  int nm = 0, telas = 0, falhasTela = 0, provas = 0;
+  Par m[TELA_PROVAS];
+  double offs[TELA_PROVAS];
+  int nm = 0, consenso = 0, telas = 0, falhasTela = 0, provas = 0, largasVazias = 0, semVoto = 2;   // the first anchor is wide
   long ultimo = -1000000;
-  double b = 0;
+  double b = 0, lo = 0, hi = 0;
   float sa[SIG_N], sb[SIG_N];
   Uint32 ini = SDL_GetTicks();
-  while (nm < TELA_ANCORAS && !parou(j) && provas < TELA_ANCORAS * 3 &&
-         SDL_GetTicks() - ini < (nm > provas - nm ? TELA_PRAZO_BOM_MS : TELA_PRAZO_MS)) {
+  while (consenso < TELA_ANCORAS && !parou(j) && provas < TELA_PROVAS &&
+         SDL_GetTicks() - ini < (consenso >= 2 ? TELA_PRAZO_BOM_MS : TELA_PRAZO_MS) &&
+         !(largasVazias >= MINI_LARGAS_REJEITA && consenso < 2)) {
     esperarPlayer(j);
     if (scrubbing) { dormir(j, 500); continue; }
     long pA; int ok;
-    if (!mTela(&pA, sa, &ok)) { if (++falhasTela >= 10 && !telas) return -1; dormir(j, 1000); continue; }
+    if (!mTela(&pA, sa, &ok)) { if (++falhasTela >= 10 && !telas) return MINI_TELA_SEM_QUADROS; dormir(j, 1000); continue; }
     telas++;
     if (!ok || labs(pA - ultimo) < TELA_ESPACO_MS || pA < 5000) { dormir(j, 1000); continue; }   // flat, too close
     ultimo = pA; provas++;
-    double t, r = -2;
-    int achou;
-    if (nm == 0) {
-      // first anchor: the copy's KEYFRAMES +-30 s around the same time (an intro, logo or title sequence of another
+    double t = 0, r = -2;
+    int achou, largo = semVoto >= 2;
+    if (largo) {
+      // the copy's KEYFRAMES +-30 s around the same time (an intro, logo or title sequence of another
       // length shifts what follows; 22/10 a Bond copy 12 s shorter was -4.8 s at the opening and further off later,
-      // so a check started mid-film missed it at +-8 s), fetched in ONE multi-range batch, then the exact frames
+      // so a check started mid-film missed it at +-8 s), fetched in ONE multi-range batch, then the exact frames.
+      // Also after two anchors without a vote: the narrow window may be following a wrong start.
       double melhor = -2, pMelhor = pA;
       long ultimoKf = -1, ts[31];
       int nt = 0;
@@ -1131,65 +1156,84 @@ static int conferirTela(Job *j, long long hB, long durB, Mapa *mapa) {
         long alvo = ts[i], p; int okB;
         esperarPlayer(j);
         int lido = mQuadro(hB, alvo, 1, 0, &p, sb, &okB, NULL, NULL);
-        if (falhou(j, lido, hB)) return 0;
+        if (falhou(j, lido, hB)) return MINI_TELA_INCONCLUSIVA;
         if (!lido || !okB || p == ultimoKf) continue;
         ultimoKf = p;
         double c = 0;
         for (int k = 0; k < SIG_N; k++) c += sa[k] * sb[k];
         if (c > melhor) { melhor = c; pMelhor = p; }
       }
+      if (parou(j)) break;
       if (melhor < TELA_MIN_CORR - 0.15) {
         printf("[miniatura] screen check at %lds: no similar copy frame nearby (best r=%.2f)\n", pA / 1000, melhor); fflush(stdout);
+        largasVazias++; semVoto++;
         continue;
       }
       achou = picoExato(j, hB, sa, pMelhor, LARGO, 5, TELA_MIN_CORR, &t, &r);
     } else {
       achou = picoExato(j, hB, sa, pA + b, ESTREITO, 3, TELA_MIN_CORR, &t, &r);
     }
-    if (achou < 0) return 0;
-    printf("[miniatura] screen check at %lds: r=%.2f %s (offset %+.2fs)\n", pA / 1000, r, achou ? "match" : "no",
-           achou ? (t - pA) / 1000.0 : 0.0);
+    if (achou < 0) return MINI_TELA_INCONCLUSIVA;
+    printf("[miniatura] screen check at %lds: r=%.2f %s (offset %+.2fs) [%s]\n", pA / 1000, r,
+           achou == 1 ? "match" : achou == 2 ? "ambiguous" : "no", achou == 1 ? (t - pA) / 1000.0 : 0.0, largo ? "wide" : "narrow");
     fflush(stdout);
-    if (!achou) continue;
-    m[nm].pa = pA; m[nm].pb = t; nm++;
-    double soma = 0;
-    for (int k = 0; k < nm; k++) soma += m[k].pb - m[k].pa;
-    b = soma / nm;
+    if (achou != 1) {
+      if (largo && achou == 0) largasVazias++;
+      semVoto++;
+      continue;
+    }
+    semVoto = 0;
+    m[nm].pa = pA; m[nm].pb = t; offs[nm] = t - pA; nm++;
+    consenso = mini_votos_consenso(offs, nm, TELA_ACORDO_MS, &lo, &hi);
+    double grupo[TELA_PROVAS];
+    int ng = 0;
+    for (int k = 0; k < nm; k++) if (offs[k] >= lo && offs[k] <= hi) grupo[ng++] = offs[k];
+    b = mediana(grupo, ng);
+    if (largo && (t - pA < lo || t - pA > hi)) b = t - pA;   // a fresh wide vote outside the group gets its own look
   }
-  if (!telas) return -1;
-  if (nm < 4) { printf("[miniatura] screen check: rejected (%d of %d agree)\n", nm, provas); fflush(stdout); return 0; }
-  // the median offset; the one anchor farthest from it is dropped when 5+ agreed (a static scene can peak wrong)
-  double offs[TELA_ANCORAS];
-  for (int k = 0; k < nm; k++) offs[k] = m[k].pb - m[k].pa;
-  b = mediana(offs, nm);
+  if (consenso < 4) {
+    int res = mini_tela_sem_consenso(parou(j), telas, nm, consenso, largasVazias);
+    printf("[miniatura] screen check: %s (%d of %d votes agree over %d anchors, %d empty wide searches, %.1f s)\n",
+           res == MINI_TELA_REJEITADA ? "rejected" : res == MINI_TELA_SEM_QUADROS ? "no screen frames" : "inconclusive",
+           consenso, nm, provas, largasVazias, (SDL_GetTicks() - ini) / 1000.0);
+    fflush(stdout);
+    return res;
+  }
+  // only the agreeing group counts; the one anchor farthest from its median is dropped when 5+ agreed (a static scene can peak wrong)
+  int ng = 0;
+  for (int k = 0; k < nm; k++) if (offs[k] >= lo && offs[k] <= hi) { m[ng] = m[k]; offs[ng] = offs[k]; ng++; }
+  nm = ng;
+  double grupo[TELA_PROVAS];
+  memcpy(grupo, offs, (size_t)nm * sizeof offs[0]);
+  b = mediana(grupo, nm);
   if (nm >= 5) {
     int pior = 0;
     for (int k = 1; k < nm; k++) if (fabs(m[k].pb - m[k].pa - b) > fabs(m[pior].pb - m[pior].pa - b)) pior = k;
     m[pior] = m[--nm];
-    for (int k = 0; k < nm; k++) offs[k] = m[k].pb - m[k].pa;
-    b = mediana(offs, nm);
+    for (int k = 0; k < nm; k++) grupo[k] = m[k].pb - m[k].pa;
+    b = mediana(grupo, nm);
   }
-  double lo = 1e18, hi = -1e18, s2 = 0, aMin = 1e18, aMax = -1e18;
+  double s2 = 0, aMin = 1e18, aMax = -1e18, oMin = 1e18, oMax = -1e18;
   for (int k = 0; k < nm; k++) {
     double o = m[k].pb - m[k].pa;
-    if (o < lo) lo = o;
-    if (o > hi) hi = o;
     s2 += (o - b) * (o - b);
+    if (o < oMin) oMin = o;
+    if (o > oMax) oMax = o;
     if (m[k].pa < aMin) aMin = m[k].pa;
     if (m[k].pa > aMax) aMax = m[k].pa;
   }
-  if (hi - lo > TELA_ACORDO_MS || aMax - aMin < 10000) {
-    printf("[miniatura] screen check: rejected (offsets spread %.1fs over %.0fs of playback)\n", (hi - lo) / 1000, (aMax - aMin) / 1000);
+  if (aMax - aMin < 10000) {
+    printf("[miniatura] screen check: inconclusive (%d votes over only %.0fs of playback)\n", nm, (aMax - aMin) / 1000);
     fflush(stdout);
-    return 0;
+    return MINI_TELA_INCONCLUSIVA;
   }
   double erro = 3 * sqrt(s2 / nm) / sqrt(nm) + 500.0;
   mapa->a = 1.0; mapa->b = b; mapa->erro = erro; mapa->inliers = nm;
   j->ultimoBom = (long)aMax;           // the latest playback time this copy was seen to match
-  printf("[miniatura] screen check: ACCEPTED t_copy = t_play %+.2fs (%d anchors over %.0fs, +-%.1fs) in %.1f s, no 4K read\n",
-         b / 1000, nm, (aMax - aMin) / 1000, erro / 1000, (SDL_GetTicks() - ini) / 1000.0);
+  printf("[miniatura] screen check: ACCEPTED t_copy = t_play %+.2fs (%d anchors over %.0fs, +-%.1fs, spread %.2fs, %d probes) in %.1f s, no 4K read\n",
+         b / 1000, nm, (aMax - aMin) / 1000, erro / 1000, (oMax - oMin) / 1000, provas, (SDL_GetTicks() - ini) / 1000.0);
   fflush(stdout);
-  return 1;
+  return MINI_TELA_ACEITA;
 }
 
 // One re-check: the frame on screen against the copy's exact frames at the mapped time (-1, 0, +1 s). 1 = matches,
@@ -2552,13 +2596,14 @@ static void *checarCopia(void *u) {
   } else {
     j->dCheck = 3;
     printf("[miniatura] copy-first: check %s after %.1f s: the copy's thumbnails are discarded\n",
-           r == 0 ? "REJECTED" : "found no screen frames", (SDL_GetTicks() - c0) / 1000.0);
+           r == MINI_TELA_REJEITADA ? "REJECTED" : r == MINI_TELA_SEM_QUADROS ? "found no screen frames" : "INCONCLUSIVE",
+           (SDL_GetTicks() - c0) / 1000.0);
   }
   size_t o = strlen(j->motivos);
-  snprintf(j->motivos + o, sizeof j->motivos - o, " | check:%s", r == 1 ? "ACCEPTED" : r == 0 ? "rejected" : "no-screen");
+  snprintf(j->motivos + o, sizeof j->motivos - o, " | check:%s", r == MINI_TELA_ACEITA ? "ACCEPTED" : r == MINI_TELA_REJEITADA ? "rejected" : r == MINI_TELA_SEM_QUADROS ? "no-screen" : "inconclusive");
   pthread_mutex_unlock(&mu);
   fflush(stdout);
-  if (r != -1 || !parou(j)) fonteAnotar(j->dFonte, r == 1);   // a check cut short by the title ending decides nothing
+  if (mini_tela_anota(r)) fonteAnotar(j->dFonte, r == MINI_TELA_ACEITA);   // only a real verdict counts against an add-on
   free(c);
   return NULL;
 }
@@ -2682,7 +2727,7 @@ static int escolherCopiaRapida(Job *j) {
       continue;
     }
     Uint32 c0 = SDL_GetTicks();
-    long long hB = mAbrir(j->copias[c].url, j->copias[c].cab, 1);
+    long long hB = mAbrirCandidata(j->copias[c].url, j->copias[c].cab);
     if (!hB) {
       long perdeu = (long)(SDL_GetTicks() - c0);
       j->huntMs += perdeu;
@@ -2700,6 +2745,7 @@ static int escolherCopiaRapida(Job *j) {
            j->copias[c].tamanho / 1048576.0);
     fflush(stdout);
     const char *por = NULL;
+    int anotar = 1;
     Mapa mapa = {1.0, 0.0, 0.0, 0};
     if (!ib[5]) por = "codec";
     else if (ib[0] <= 0) por = "no-duration";
@@ -2727,16 +2773,18 @@ static int escolherCopiaRapida(Job *j) {
         return 1;
       }
       int tela = conferirTela(j, hB, (long)ib[0], &mapa);
-      if (tela != 1) por = tela == 0 ? "screen-rejected" : "no-screen-frames";
+      anotar = mini_tela_anota(tela);
+      if (tela != MINI_TELA_ACEITA) por = tela == MINI_TELA_REJEITADA ? "screen-rejected" : tela == MINI_TELA_SEM_QUADROS ? "no-screen-frames" : "screen-inconclusive";
     } else {
       int tela = conferirTela(j, hB, (long)ib[0], &mapa);
-      if (tela != 1) por = tela == 0 ? "screen-rejected" : "no-screen-frames";
+      anotar = mini_tela_anota(tela);
+      if (tela != MINI_TELA_ACEITA) por = tela == MINI_TELA_REJEITADA ? "screen-rejected" : tela == MINI_TELA_SEM_QUADROS ? "no-screen-frames" : "screen-inconclusive";
     }
     mFechar(hB);
     printf("[miniatura] copy-first: copy %d %s in %.1f s\n", c + 1, por ? por : "ACCEPTED", (SDL_GetTicks() - c0) / 1000.0);
     fflush(stdout);
     snprintf(j->motivos + o, sizeof j->motivos - o, " | c%d:%s", c + 1, por ? por : "ACCEPTED");
-    fonteAnotar(j->copias[c].fonte, !por);
+    if (anotar) fonteAnotar(j->copias[c].fonte, !por);
     if (por) continue;
     j->dCopia = 1; j->dA = mapa.a; j->dB = mapa.b; j->dAltura = j->copias[c].altura;
     snprintf(j->dUrl, sizeof j->dUrl, "%s", alvo[0] ? alvo : j->copias[c].url);
@@ -2868,7 +2916,7 @@ static void *trabalhar(void *u) {
   int roda1 = 0, roda2 = 0;
   char alvoB[4096];
   for (int c = 0; c < j->nCopias && !usaB && !parou(j); c++) {
-    hB = mAbrir(j->copias[c].url, j->copias[c].cab, 1);
+    hB = mAbrirCandidata(j->copias[c].url, j->copias[c].cab);
     if (!hB) {
       printf("[miniatura] copy %d (%dp) would not open\n", c + 1, j->copias[c].altura);
       snprintf(j->motivos + strlen(j->motivos), sizeof j->motivos - strlen(j->motivos), " | c%d:no-open", c + 1);
@@ -2961,7 +3009,7 @@ static void *trabalhar(void *u) {
       }
       mFechar(hB); hB = 0;
       snprintf(j->motivos + o, sizeof j->motivos - o, " | c%d:%s", c + 1,
-               ib[0] <= 0 ? "no-duration" : !igual && j->alturaA <= 1080 ? "runtime" : tela == 0 ? "screen-rejected" : "rejected");
+               ib[0] <= 0 ? "no-duration" : !igual && j->alturaA <= 1080 ? "runtime" : tela == MINI_TELA_REJEITADA ? "screen-rejected" : tela == MINI_TELA_INCONCLUSIVA ? "screen-inconclusive" : "rejected");
     }
     printf("[miniatura] check took %.1f s, read play %.1f MB + copy %.1f MB\n", (SDL_GetTicks() - c0) / 1000.0,
            (mLidos(hA) - lA0) / 1048576.0, lidosB / 1048576.0);

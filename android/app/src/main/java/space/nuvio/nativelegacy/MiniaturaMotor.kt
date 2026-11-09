@@ -43,7 +43,8 @@ object MiniaturaMotor {
     // only for the check: each of its requests closes its socket, so no idle connection to the player's own link
     // stays open next to the player's (debrid CDNs limit connections per user; measured 22/10 on TorBox: past the
     // limit, the player's reconnects are refused and playback stops).
-    private class Fonte(url: String, cabecalhos: String, val manter: Boolean) : MediaDataSource() {
+    private class Fonte(url: String, cabecalhos: String, val manter: Boolean, candidata: Boolean) : MediaDataSource() {
+        constructor(url: String, cabecalhos: String, manter: Boolean) : this(url, cabecalhos, manter, false)
         private val rangeAudit = ThumbnailRangeAudit.create()
         var auditDurationMs = 0L
         var alvo = url
@@ -59,7 +60,8 @@ object MiniaturaMotor {
             while (direto && playbackGate.shouldWait(NvPlayer.miniaturaPodeCriar(),
                     NvPlayer.thumbnailState, NvPlayer.thumbnailBufferMs,
                     android.os.SystemClock.elapsedRealtime() - NvPlayer.thumbnailHealthAtMs,
-                    NvPlayer.thumbnailBufferStable)) {
+                    NvPlayer.thumbnailBufferStable,
+                    ThumbnailPlaybackGate.isFull(NvPlayer.thumbnailAllocatedBytes, NvPlayer.thumbnailTargetBytes))) {
                 checkHttpCancelled()
                 if (!logged) { Log.i(TAG, "[playback-gate] holding HTTP bufferMs=${NvPlayer.thumbnailBufferMs} state=${NvPlayer.thumbnailState}"); logged = true }
                 ThumbnailPipelineTimeline.enter(ThumbnailTimeline.State.PLAYBACK_GATE).use { Thread.sleep(100) }
@@ -1251,7 +1253,7 @@ object MiniaturaMotor {
             var retried = false
             while (true) {
                 try { return request() } catch (e: java.net.SocketTimeoutException) {
-                    if (retried || recusado) {
+                    if (retried || recusado || sondaCandidata) {
                         recusado = true
                         Log.w(TAG, "[fetch-audit] timeout retry exhausted: stopping thumbnails for this title")
                         throw e
@@ -1598,6 +1600,8 @@ object MiniaturaMotor {
         }
         @Volatile var erroRede = false
         @Volatile var semFila = false
+        // The opening probe of a copy being tried: no retry on an unanswered request (6 + 2 + 6 s per dead link, 09/11/2026).
+        private var sondaCandidata = candidata
 
         override fun getSize() = tamanho
         // Initialize all request/error state before constructor I/O can fail.
@@ -1616,6 +1620,7 @@ object MiniaturaMotor {
         } catch (_: Exception) { false }
         init {
             pedir(0, 0)
+            sondaCandidata = false
             if (tamanho > (8L shl 30)) { janela = 2 shl 20; limite = 12L shl 20 }
             // pedir(0, 0) followed the add-on's redirects: alvo is the storage host now.
             if (hostSemMultiRange()) {
@@ -1846,8 +1851,13 @@ object MiniaturaMotor {
     }
 
     @JvmStatic
-    fun abrir(url: String, cabecalhos: String, manter: Boolean): Long = try {
-        val f = Fonte(url, cabecalhos, manter)
+    fun abrir(url: String, cabecalhos: String, manter: Boolean): Long = abrir0(url, cabecalhos, manter, false)
+
+    @JvmStatic
+    fun abrirCandidata(url: String, cabecalhos: String): Long = abrir0(url, cabecalhos, true, true)
+
+    private fun abrir0(url: String, cabecalhos: String, manter: Boolean, candidata: Boolean): Long = try {
+        val f = Fonte(url, cabecalhos, manter, candidata)
         val ex = MediaExtractor()
         ex.setDataSource(f)
         var s: Sessao? = null

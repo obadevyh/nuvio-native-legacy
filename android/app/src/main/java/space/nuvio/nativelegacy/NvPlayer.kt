@@ -285,8 +285,11 @@ object NvPlayer {
             val b = try { Bitmap.createBitmap(160, (160 * videoH / videoW).coerceIn(16, 160), Bitmap.Config.ARGB_8888) }
                     catch (_: OutOfMemoryError) { pronto.countDown(); return@post }
             val pos = p.currentPosition
+            val inicioCopia = SystemClock.elapsedRealtime()
             try {
                 PixelCopy.request(sv, b, { r ->
+                    // The frame label is the position BEFORE the copy; log how far the player moved while it ran.
+                    Log.i("nuvio-miniatura", "[screen-capture] posBefore=$pos posAfter=${player?.currentPosition ?: -1} copyMs=${SystemClock.elapsedRealtime() - inicioCopia} result=$r")
                     if (r == PixelCopy.SUCCESS) saida = MiniaturaMotor.assinaturaDe(b, pos)
                     b.recycle(); pronto.countDown()
                 }, principal)
