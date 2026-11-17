@@ -30,6 +30,26 @@ internal object MediaHttpBudget {
     // 45+ min (the PC on the same network timed out too, while servers we used with <= 5 still answered).
     private val PER_USER_LIMIT = Regex("""(^|\.)(tb-cdn\.st|torbox\.app|real-debrid\.com|rdeb\.io|alldebrid\.com|debrid\.it|premiumize\.me|debrid-link\.(com|fr)|offcloud\.com|easydebrid\.com)$""")
     internal fun limitsPerUser(host: String) = PER_USER_LIMIT.containsMatchIn(host.lowercase())
+    // REQUEST RATE ON DEBRID SERVERS (17/11/2026, Quest 3, TorBox): every TorBox server that saw >= ~250 requests in
+    // a minute from this IP (250-334) stopped answering it for ~1 h; the ones below (241, 142) never did. Thumbnail
+    // requests to a debrid host take a slot at least THUMB_GAP_MS apart, per host, before the permit: at most
+    // 120/min from thumbnails. A burst guard only: with multi-range working (~10 keyframes per request) thumbnails
+    // need under 1 request/s and are not slowed.
+    const val THUMB_GAP_MS = 500L
+    private val proximoSlot = ConcurrentHashMap<String, Long>()
+    internal fun ritmoDebrid(host: String, owner: String, checkCancelled: () -> Unit) {
+        if (!owner.startsWith("thumbnail") || !limitsPerUser(host)) return
+        val h = host.lowercase()
+        val agora = System.nanoTime() / 1_000_000
+        var meu = 0L
+        proximoSlot.compute(h) { _, v -> meu = maxOf(agora, v ?: 0L); meu + THUMB_GAP_MS }
+        while (true) {
+            checkCancelled()
+            val falta = meu - System.nanoTime() / 1_000_000
+            if (falta <= 0) return
+            Thread.sleep(minOf(falta, 100L))
+        }
+    }
     fun allowThumbnailLanes(host: String) {
         if (limitsPerUser(host)) return
         if (extraHosts.add(host.lowercase())) Log.i("nuvio-http-budget", "[http-budget] own thumbnail slots for ${host.lowercase()}: +$EXTRA")
@@ -69,6 +89,7 @@ internal object MediaHttpBudget {
         var sem = if (own) extra else permits
         var isBorrowed = false
         try {
+            ritmoDebrid(url.host, owner, checkCancelled)
             while (true) {
                 checkCancelled()
                 if (own) {

@@ -159,4 +159,17 @@ class MediaHttpBudgetTest {
         assertFalse(MediaHttpBudget.limitsPerUser("pub-1.r2.dev"))
         assertFalse(MediaHttpBudget.limitsPerUser("notb-cdn.st"))
     }
+    @Test fun thumbnailRequestsToADebridHostAreSpacedApart() {
+        val h = "nexus-1.test.tb-cdn.st"
+        MediaHttpBudget.ritmoDebrid(h, "thumbnail-1", {})          // takes the first slot
+        val t0 = System.nanoTime()
+        MediaHttpBudget.ritmoDebrid(h, "thumbnail-1", {})          // waits for the next one
+        val ms = (System.nanoTime() - t0) / 1_000_000
+        assertTrue("waited $ms ms", ms >= MediaHttpBudget.THUMB_GAP_MS - 60)
+        val t1 = System.nanoTime()
+        MediaHttpBudget.ritmoDebrid(h, "player", {})               // the player is never held
+        MediaHttpBudget.ritmoDebrid("cdn.example.com", "thumbnail-1", {})   // nor other hosts
+        MediaHttpBudget.ritmoDebrid("cdn.example.com", "thumbnail-1", {})
+        assertTrue((System.nanoTime() - t1) / 1_000_000 < 50)
+    }
 }

@@ -647,6 +647,9 @@ static long long mPerdidos(void) {
   return r;
 }
 static int mSeekRecente(void) {
+  // the engine class is looked up when the first thumbnail job starts: before that there is nothing to ask, and a
+  // NULL jclass aborts the app (17/11/2026, Quest: a bundled test video with no thumbnail job)
+  if (!cls || !jSeekRecente) return 0;
   JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
   jint r = (*env)->CallStaticIntMethod(env, cls, jSeekRecente);
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 0; }

@@ -86,8 +86,16 @@ internal class ThumbnailHostMemory(private val file: File?, private val retryMs:
             caps ?: NvPlayer.contexto()?.filesDir?.let { ThumbnailHostMemory(File(it, "thumbnail-lane-caps.txt"), LANE_CAP_MS) }
                 ?.also { caps = it }
         }
-        fun refuses(host: String?) = refusals()?.refuses(host, System.currentTimeMillis()) == true
-        fun recordRefusal(host: String?) { refusals()?.recordRefusal(host, System.currentTimeMillis()) }
+        // NOT FOR DEBRID CDNs (17/11/2026, Quest 3): one TorBox server's non-206 answer was stored under "tb-cdn.st"
+        // for 7 days, so EVERY TorBox server got single ranges (one keyframe per request, ~4 requests/s instead of
+        // ~10 keyframes per request at <1/s) and TorBox blocked the IP at ~250 requests/min. A debrid host is probed
+        // again each session; a real refusal still turns multi-range off for that file.
+        fun refuses(host: String?) = host != null && !MediaHttpBudget.limitsPerUser(host) &&
+            refusals()?.refuses(host, System.currentTimeMillis()) == true
+        fun recordRefusal(host: String?) {
+            if (host == null || MediaHttpBudget.limitsPerUser(host)) return
+            refusals()?.recordRefusal(host, System.currentTimeMillis())
+        }
         fun laneCap(host: String?): Int? = caps()?.value(host, System.currentTimeMillis())
         fun recordLaneCap(host: String?, cap: Int) {
             caps()?.record(host, System.currentTimeMillis(), cap, "allows $cap thumbnail lanes")
