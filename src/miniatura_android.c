@@ -1132,12 +1132,14 @@ static int conferirTela(Job *j, long long hB, long durB, Mapa *mapa) {
   long ultimo = -1000000;
   double b = 0, lo = 0, hi = 0;
   float sa[SIG_N], sb[SIG_N];
-  Uint32 ini = SDL_GetTicks();
+  Uint32 ini = SDL_GetTicks(), pausado = 0;
+  // the deadline counts playing time only (16/11/2026, Quest: paused for screenshots, a good copy ran out of time)
   while (consenso < TELA_ANCORAS && !parou(j) && provas < TELA_PROVAS &&
-         SDL_GetTicks() - ini < (consenso >= 2 ? TELA_PRAZO_BOM_MS : TELA_PRAZO_MS) &&
+         SDL_GetTicks() - ini - pausado < (consenso >= 2 ? TELA_PRAZO_BOM_MS : TELA_PRAZO_MS) &&
          !(largasVazias >= MINI_LARGAS_REJEITA && consenso < 2)) {
     esperarPlayer(j);
     if (scrubbing) { dormir(j, 500); continue; }
+    if (!video_tocando()) { dormir(j, 500); pausado += 500; continue; }   // paused: no screen to read, no time lost
     long pA; int ok;
     if (!mTela(&pA, sa, &ok)) { if (++falhasTela >= 10 && !telas) return MINI_TELA_SEM_QUADROS; dormir(j, 1000); continue; }
     telas++;
@@ -2622,17 +2624,24 @@ static void *checarCopia(void *u) {
   return NULL;
 }
 // Everything the direct engine made, gone (a copy the check rejected): the playing file starts from nothing.
+// A discarded copy's tiles go; a SAVED set's stay, with its file (16/11/2026, Quest, Fight Club: an inconclusive
+// check deleted 835 good saved thumbnails and their file). Saved = loaded from disk: a copy pass never saves while
+// its check runs, so it has none.
 static void limparDireto(Job *j) {
+  int mantidos = 0;
   pthread_mutex_lock(&mu);
   for (int k = 0; k < j->n; k++) {
+    if (j->tiles[k].jpg && j->tiles[k].salvo) { mantidos++; continue; }
     free(j->tiles[k].jpg); j->tiles[k].jpg = NULL; j->tiles[k].n = 0; j->tiles[k].pts = 0;
     j->tiles[k].prov = 0; j->tiles[k].salvo = 0; j->tiles[k].revision++;
     j->tentado[k] = 0; j->slotKey[k] = -1; j->framePts[k] = -1;
   }
-  j->feitos = 0; j->primeiro = 0; j->cob60 = j->cob30 = 0; j->appendPronto = 0;
+  j->feitos = mantidos; j->primeiro = 0; j->cob60 = j->cob30 = 0; j->appendPronto = 0;
   mini_coverage_init(&j->coverage, j->n, j->dur, j->slotFrame, j->slotState);
+  if (mantidos) diretoRebuildCoverage(j);
   pthread_mutex_unlock(&mu);
-  if (j->arq[0]) remove(j->arq);
+  if (mantidos) { printf("[miniatura] direct: kept %d saved images\n", mantidos); fflush(stdout); }
+  else if (j->arq[0]) remove(j->arq);
 }
 
 // ---- copy sources that keep failing (06/11/2026) ----
