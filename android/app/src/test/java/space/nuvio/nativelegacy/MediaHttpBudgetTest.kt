@@ -150,4 +150,13 @@ class MediaHttpBudgetTest {
         }
         assertEquals(4, MediaHttpBudget.available())
     }
+    @Test fun debridServersNeverGetTheExtraThumbnailLanes() {
+        for (h in listOf("nexus-378.neur.tb-cdn.st", "store-1.torbox.app", "abc.download.real-debrid.com", "x.rdeb.io")) {
+            assertTrue(h, MediaHttpBudget.limitsPerUser(h))
+            MediaHttpBudget.allowThumbnailLanes(h)
+            assertFalse(h, MediaHttpBudget.hasOwnLanes(h))
+        }
+        assertFalse(MediaHttpBudget.limitsPerUser("pub-1.r2.dev"))
+        assertFalse(MediaHttpBudget.limitsPerUser("notb-cdn.st"))
+    }
 }

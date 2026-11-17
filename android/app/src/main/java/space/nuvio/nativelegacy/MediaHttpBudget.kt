@@ -24,7 +24,14 @@ internal object MediaHttpBudget {
     const val EXTRA = 6
     private val extra = Semaphore(EXTRA, true)
     private val extraHosts: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    // NEVER FOR DEBRID CDNs (17/11/2026, Quest 3, Dune 4K): TorBox's servers also refuse multi-range, so they got
+    // these lanes too; player + thumbnails reached 10-14 connections to one server, and each time (nexus-254 15:29,
+    // nexus-040 16:09, nexus-378 16:11) that server stopped answering this IP within a minute and stayed shut for
+    // 45+ min (the PC on the same network timed out too, while servers we used with <= 5 still answered).
+    private val PER_USER_LIMIT = Regex("""(^|\.)(tb-cdn\.st|torbox\.app|real-debrid\.com|rdeb\.io|alldebrid\.com|debrid\.it|premiumize\.me|debrid-link\.(com|fr)|offcloud\.com|easydebrid\.com)$""")
+    internal fun limitsPerUser(host: String) = PER_USER_LIMIT.containsMatchIn(host.lowercase())
     fun allowThumbnailLanes(host: String) {
+        if (limitsPerUser(host)) return
         if (extraHosts.add(host.lowercase())) Log.i("nuvio-http-budget", "[http-budget] own thumbnail slots for ${host.lowercase()}: +$EXTRA")
     }
     internal fun hasOwnLanes(host: String?) = host != null && host.lowercase() in extraHosts
