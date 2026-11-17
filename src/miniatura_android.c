@@ -140,6 +140,9 @@ typedef struct {
   // Optimistic copy-first: thumbnails start at offset 0 while the screen check runs on its own thread.
   // dCheck 0 none, 1 running, 2 accepted (tiles relabelled to the measured offset), 3 rejected (all discarded).
   volatile int dCheck; pthread_t dCheckT; int dCheckRodando;
+  // A copy of another length waits for the check's FIRST matching vote, then starts at that measured offset
+  // (11/11/2026: Se7en's copy, 126.8 vs 126.9 min, left the bar empty for 39-79 s of blocking check).
+  volatile int dEsperaVoto, dVotoPronto;
   // The copy hunt across attempts: the next candidate, time lost on copies that would not open, rejected copies.
   int huntProx, huntRejeitadas; long huntMs; unsigned char huntSemAbrir[TENTATIVAS];
   char dFonte[FONTEFALHA_CHAVE];           // the chosen copy's source (its verdict is remembered)
@@ -1184,6 +1187,14 @@ static int conferirTela(Job *j, long long hB, long durB, Mapa *mapa) {
     }
     semVoto = 0;
     m[nm].pa = pA; m[nm].pb = t; offs[nm] = t - pA; nm++;
+    if (j->dEsperaVoto && !j->dVotoPronto) {   // the engine starts now, at this vote's offset; accept relabels by the difference
+      pthread_mutex_lock(&mu);
+      j->dB = t - pA; j->dVotoPronto = 1;
+      pthread_mutex_unlock(&mu);
+      printf("[miniatura] screen check: first matching vote %+.2fs after %.1f s: thumbnails start at that offset\n",
+             (t - pA) / 1000.0, (SDL_GetTicks() - ini) / 1000.0);
+      fflush(stdout);
+    }
     consenso = mini_votos_consenso(offs, nm, TELA_ACORDO_MS, &lo, &hi);
     double grupo[TELA_PROVAS];
     int ng = 0;
@@ -1488,6 +1499,7 @@ static int carregar0(Job *j) {
     pthread_mutex_lock(&mu);
     if (!j->tiles[k].jpg) {
       j->tiles[k].jpg = b; j->tiles[k].n = (int)len; j->tiles[k].pts = pts; j->tiles[k].revision++; j->feitos++; lidos++; b = NULL;
+      j->tiles[k].salvo = 1;          // already on disk, at its true time: a copy check never relabels it
       if (j->direto) j->framePts[k] = pts;
     }
     // A direct record index owns an image; it is not a nominal time slot.
@@ -2585,7 +2597,9 @@ static void *checarCopia(void *u) {
     int n = 0;
     for (int k = 0; k < j->n; k++) {
       Tile *t = &j->tiles[k];
-      if (!t->jpg) continue;
+      // only this pass's tiles: a saved set's are already at their true time (16/11/2026, Quest, Fight Club: the
+      // whole saved set of 835 was moved by +1.95 s, and that wrong set would have been saved again)
+      if (!t->jpg || t->salvo) continue;
       t->pts = (long)(t->pts + antigo - m.b); t->revision++; t->salvo = 0; n++;
     }
     j->dB = m.b; j->offset = m.b; j->appendPronto = 0;
@@ -2761,6 +2775,7 @@ static int escolherCopiaRapida(Job *j) {
         if (!j->dCheckRodando) { free(cc); j->dCheck = 0; }
       }
       if (j->dCheckRodando) {
+        j->dEsperaVoto = 0; j->dVotoPronto = 0;
         snprintf(j->dFonte, sizeof j->dFonte, "%s", j->copias[c].fonte);   // the check thread notes the verdict
         j->dCopia = 1; j->dA = 1.0; j->dB = 0.0; j->dAltura = j->copias[c].altura;
         snprintf(j->dUrl, sizeof j->dUrl, "%s", alvo[0] ? alvo : j->copias[c].url);
@@ -2776,6 +2791,42 @@ static int escolherCopiaRapida(Job *j) {
       anotar = mini_tela_anota(tela);
       if (tela != MINI_TELA_ACEITA) por = tela == MINI_TELA_REJEITADA ? "screen-rejected" : tela == MINI_TELA_SEM_QUADROS ? "no-screen-frames" : "screen-inconclusive";
     } else {
+      // Another length (4-30 s): the check runs on its own thread and the engine waits only for its FIRST matching
+      // vote, then starts at that measured offset. The check's accept relabels by the difference (checarCopia).
+      CheckCopia *cc = malloc(sizeof *cc);
+      j->dEsperaVoto = 1; j->dVotoPronto = 0; j->dB = 0.0;
+      if (cc) {
+        cc->j = j; cc->hB = hB; cc->durB = (long)ib[0];
+        j->dCheck = 1;
+        j->dCheckRodando = pthread_create(&j->dCheckT, NULL, checarCopia, cc) == 0;
+        if (!j->dCheckRodando) { free(cc); j->dCheck = 0; }
+      }
+      if (j->dCheckRodando) {
+        snprintf(j->dFonte, sizeof j->dFonte, "%s", j->copias[c].fonte);   // the check thread notes the verdict
+        while (j->dCheck == 1 && !j->dVotoPronto && !parou(j)) dormir(j, 100);
+        j->dEsperaVoto = 0;
+        if (!j->dVotoPronto) {                    // no vote: the check ended (rejected, inconclusive, no frames) or we left
+          pthread_join(j->dCheckT, NULL);         // it noted the verdict and closed the copy
+          j->dCheckRodando = 0; j->dCheck = 0;
+          if (parou(j)) return 0;
+          snprintf(j->motivos + o, sizeof j->motivos - o, " | c%d:screen-no-vote", c + 1);
+          printf("[miniatura] copy-first: copy %d gave no matching vote in %.1f s\n", c + 1, (SDL_GetTicks() - c0) / 1000.0);
+          fflush(stdout);
+          continue;
+        }
+        pthread_mutex_lock(&mu);
+        j->dCopia = 1; j->dA = 1.0; j->dAltura = j->copias[c].altura;   // dB: the first vote's offset
+        pthread_mutex_unlock(&mu);
+        snprintf(j->dUrl, sizeof j->dUrl, "%s", alvo[0] ? alvo : j->copias[c].url);
+        snprintf(j->dCab, sizeof j->dCab, "%s", j->copias[c].cab);
+        snprintf(j->escolhida, sizeof j->escolhida, "%dp %.0f MB %s (copy-first, first vote %+.2fs)", j->copias[c].altura,
+                 j->copias[c].tamanho / 1048576.0, j->copias[c].nome, j->dB / 1000);
+        printf("[miniatura] copy-first: copy %d (%+.1f s long): thumbnails start at the first vote (%.1f s in), check alongside\n",
+               c + 1, (ib[0] - j->dur) / 1000.0, (SDL_GetTicks() - c0) / 1000.0);
+        fflush(stdout);
+        return 1;
+      }
+      j->dEsperaVoto = 0;
       int tela = conferirTela(j, hB, (long)ib[0], &mapa);
       anotar = mini_tela_anota(tela);
       if (tela != MINI_TELA_ACEITA) por = tela == MINI_TELA_REJEITADA ? "screen-rejected" : tela == MINI_TELA_SEM_QUADROS ? "no-screen-frames" : "screen-inconclusive";
