@@ -2760,7 +2760,10 @@ static int escolherCopiaRapida(Job *j) {
       j->huntSemAbrir[c] = 1;
       printf("[miniatura] copy-first: copy %d (%dp) would not open (%.1f s, %ld s lost so far)\n", c + 1, j->copias[c].altura, perdeu / 1000.0, j->huntMs / 1000); fflush(stdout);
       snprintf(j->motivos + o, sizeof j->motivos - o, " | c%d:no-open", c + 1);
-      fonteAnotar(j->copias[c].fonte, 0);
+      // A copy that will not open counts against its add-on only while the playing file itself streams normally:
+      // when the network or the debrid service is failing (17/11/2026, Quest: TorBox had blocked the IP) every copy
+      // fails to open and the add-on was wrongly skipped for 3 days.
+      if (!video_falhou() && video_bufferando_ms() <= 0) fonteAnotar(j->copias[c].fonte, 0);
       continue;
     }
     long long ib[6];
@@ -2775,7 +2778,7 @@ static int escolherCopiaRapida(Job *j) {
     Mapa mapa = {1.0, 0.0, 0.0, 0};
     if (!ib[5]) por = "codec";
     else if (ib[0] <= 0) por = "no-duration";
-    else if (labs((long)ib[0] - j->dur) > TELA_DUR_IGUAL_MS) por = "runtime";
+    else if (labs((long)ib[0] - j->dur) > TELA_DUR_IGUAL_MS) { por = "runtime"; anotar = 0; }   // another cut, not a dead copy
     else if (labs((long)ib[0] - j->dur) <= OTIMISTA_DUR_MS) {
       // (nearly) the same length: start NOW at offset 0, the check runs alongside (06/11/2026: the blocking check left
       // the bar empty for the first 46 s on TorBox Dune)
